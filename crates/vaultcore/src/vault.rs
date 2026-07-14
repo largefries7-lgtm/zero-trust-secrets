@@ -118,18 +118,27 @@ impl VaultHeader {
         h.to_bytes()
     }
 
-    pub fn compute_mac(&self, dek: &SecretBytes) -> [u8; 32] {
+    pub fn compute_mac(&self, dek: &SecretBytes, records: &[Record]) -> [u8; 32] {
         let mk = crypto::hkdf_subkey(dek, b"header-mac", KEY_LEN);
         use hkdf::hmac::{Hmac, Mac};
         use sha2::Sha256;
         let mut m = <Hmac<Sha256>>::new_from_slice(mk.expose()).expect("hmac accepts any key len");
         m.update(&self.mac_input());
+        // authenticate the record set: count, then each record in order
+        m.update(&(records.len() as u32).to_le_bytes());
+        for r in records {
+            m.update(&r.id.to_le_bytes());
+            m.update(&(r.name.len() as u32).to_le_bytes());
+            m.update(r.name.as_bytes());
+            m.update(&(r.ciphertext.len() as u32).to_le_bytes());
+            m.update(&r.ciphertext);
+        }
         m.finalize().into_bytes().into()
     }
 
-    pub fn verify_mac(&self, dek: &SecretBytes) -> bool {
+    pub fn verify_mac(&self, dek: &SecretBytes, records: &[Record]) -> bool {
         use subtle::ConstantTimeEq;
-        self.compute_mac(dek).ct_eq(&self.header_mac).into()
+        self.compute_mac(dek, records).ct_eq(&self.header_mac).into()
     }
 }
 
@@ -226,7 +235,7 @@ impl LockedVault {
     /// return an unlocked `Vault`. Fails closed: on MAC mismatch this
     /// returns `Error::AuthFailed` and no usable vault is produced.
     pub fn unlock_with_dek(self, dek: SecretBytes) -> Result<Vault> {
-        if !self.header.verify_mac(&dek) {
+        if !self.header.verify_mac(&dek, &self.records) {
             return Err(Error::AuthFailed);
         }
         Ok(Vault {
@@ -267,10 +276,11 @@ impl Vault {
         info.extend_from_slice(&id.to_le_bytes());
         crypto::hkdf_subkey(dek, &info, KEY_LEN)
     }
-    fn aad(id: u128, version: u16) -> Vec<u8> {
-        let mut a = Vec::with_capacity(18);
+    fn aad(id: u128, version: u16, name: &str) -> Vec<u8> {
+        let mut a = Vec::with_capacity(18 + name.len());
         a.extend_from_slice(&id.to_le_bytes());
         a.extend_from_slice(&version.to_le_bytes());
+        a.extend_from_slice(name.as_bytes());
         a
     }
 
@@ -282,7 +292,7 @@ impl Vault {
         let rk = Self::record_key(dek, id);
         let ct = crypto::aead_seal(
             &rk,
-            &Self::aad(id, self.header.format_version),
+            &Self::aad(id, self.header.format_version, name),
             value.expose_str().as_bytes(),
         )?;
         self.records.push(Record { id, name: name.to_string(), ciphertext: ct });
@@ -297,7 +307,11 @@ impl Vault {
             .find(|r| r.name == name)
             .ok_or_else(|| Error::Format("no such record".into()))?;
         let rk = Self::record_key(dek, rec.id);
-        let pt = crypto::aead_open(&rk, &Self::aad(rec.id, self.header.format_version), &rec.ciphertext)?;
+        let pt = crypto::aead_open(
+            &rk,
+            &Self::aad(rec.id, self.header.format_version, &rec.name),
+            &rec.ciphertext,
+        )?;
         // pt is SecretBytes; wrap as SecretString
         let s = String::from_utf8(pt.expose().to_vec()).map_err(|_| Error::Format("utf8".into()))?;
         Ok(SecretString::from_string(s))
@@ -332,7 +346,7 @@ impl Vault {
         let dek = self.dek()?;
 
         let mut header = self.header.clone();
-        header.header_mac = header.compute_mac(dek);
+        header.header_mac = header.compute_mac(dek, &self.records);
         let header_bytes = header.to_bytes();
 
         let mut out = Vec::new();
@@ -370,25 +384,54 @@ mod tests {
     fn header_roundtrips() {
         let mut h = test_header();
         let dek = SecretBytes::from_exact(&[4u8; 32]);
-        h.header_mac = h.compute_mac(&dek);
+        h.header_mac = h.compute_mac(&dek, &[]);
         let bytes = h.to_bytes();
         let back = VaultHeader::from_bytes(&bytes).unwrap();
         assert_eq!(back.magic, *b"ZTSV");
         assert_eq!(back.recovery_wrap, vec![1, 2, 3]);
-        assert!(back.verify_mac(&dek));
+        assert!(back.verify_mac(&dek, &[]));
     }
 
     #[test]
     fn header_mac_detects_tamper() {
         let mut h = test_header();
         let dek = SecretBytes::from_exact(&[4u8; 32]);
-        h.header_mac = h.compute_mac(&dek);
+        h.header_mac = h.compute_mac(&dek, &[]);
         let mut bytes = h.to_bytes();
         // flip hardware_bound byte region -> MAC must fail
         let idx = 6;
         bytes[idx] ^= 0x01;
         let back = VaultHeader::from_bytes(&bytes).unwrap();
-        assert!(!back.verify_mac(&dek));
+        assert!(!back.verify_mac(&dek, &[]));
+    }
+
+    #[test]
+    fn header_mac_detects_record_relabel_delete_and_reorder() {
+        let dek = SecretBytes::from_exact(&[4u8; 32]);
+        let mut h = test_header();
+        let recs = vec![Record { id: 1, name: "email".into(), ciphertext: vec![9, 9] }];
+        h.header_mac = h.compute_mac(&dek, &recs);
+
+        // relabel same (id, ciphertext) under a new name -> fails
+        let relabeled = vec![Record { id: 1, name: "other".into(), ciphertext: vec![9, 9] }];
+        assert!(!h.verify_mac(&dek, &relabeled));
+        // delete the record -> fails
+        assert!(!h.verify_mac(&dek, &[]));
+        // unchanged set still verifies
+        assert!(h.verify_mac(&dek, &recs));
+
+        // reorder two records -> fails
+        let two = vec![
+            Record { id: 1, name: "a".into(), ciphertext: vec![1] },
+            Record { id: 2, name: "b".into(), ciphertext: vec![2] },
+        ];
+        h.header_mac = h.compute_mac(&dek, &two);
+        let swapped = vec![
+            Record { id: 2, name: "b".into(), ciphertext: vec![2] },
+            Record { id: 1, name: "a".into(), ciphertext: vec![1] },
+        ];
+        assert!(!h.verify_mac(&dek, &swapped));
+        assert!(h.verify_mac(&dek, &two));
     }
 
     #[test]
@@ -419,7 +462,9 @@ mod tests {
 
         let dek2 = SecretBytes::from_exact(&[6u8; 32]);
         let unlocked = locked.unlock_with_dek(dek2).unwrap();
-        assert!(unlocked.header().verify_mac(&SecretBytes::from_exact(&[6u8; 32])));
+        assert!(unlocked
+            .header()
+            .verify_mac(&SecretBytes::from_exact(&[6u8; 32]), unlocked.records()));
         assert_eq!(unlocked.records().len(), 2);
         assert_eq!(unlocked.get("email").unwrap().expose_str(), "hunter2");
         assert_eq!(unlocked.get("bank_pin").unwrap().expose_str(), "1234");
