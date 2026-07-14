@@ -334,3 +334,43 @@ Every feature is written test-first per the TDD skill.
 
 Slice 2 (separate spec): Slint GUI, anti-capture window flags, Windows Hello, fuzzy search,
 entropy visualizer, native secret-reveal surface.
+
+---
+
+## 15. As-built notes & slice-1 deltas (added post-implementation, 2026-07-14)
+
+The core was built and verified. The following decisions/deltas emerged during implementation
+and supersede or refine the design above:
+
+- **Record-set authentication added (strengthens §6).** Review found the header MAC authenticated
+  only the header, leaving record framing (count/order/plaintext `name`) unauthenticated. Hardened:
+  each record's ciphertext is bound to its `name` via the AEAD AAD (`id‖version‖name`), and the
+  header MAC (HMAC-SHA256, HKDF-keyed) now covers the full record set (`count` + per record
+  `id‖len(name)‖name‖len(ct)‖ct`). Relabel, delete, reorder, and inject now fail closed at unlock.
+- **TPM backend = CNG Platform Crypto Provider; device-bound, NOT PCR-policy-bound (realizes §13).**
+  `CngPcpProvider` wraps the DEK with a persisted, non-exportable RSA-2048 TPM key via NCrypt.
+  This defeats drive theft (the wrap is inaccessible off the original TPM) but CNG does not expose
+  PCR-policy sealing at this granularity. `status()` reports `Degraded("PCR-policy sealing not
+  available via CNG…")` — honest, not overstated. **The TPM path was exercised for real on this
+  machine** (create → seal → unseal → equality). Full PCR-bound sealing remains a `tss-esapi`
+  hardening slice. A persisted key `ZeroTrustSecretsDEKWrap` now exists per-user; a future
+  `deprovision` command should `NCryptDeleteKey` it.
+- **`vaultctl` is STATELESS (supersedes §11's session concept).** The plan's persisted "session
+  token" would have cached the DEK (or an unwrapping of it) at rest during the unlocked window,
+  violating the core "plaintext never persists at rest" requirement. Instead every command obtains
+  the DEK fresh (TPM unseal, or `--recovery-passphrase`) and zeroizes it before exit; only wrapped
+  key material and encrypted records touch disk. The long-running in-RAM DEK holder is the future
+  GUI/agent (slice 2).
+- **Threat-model addition (extends §3):** the `--recovery-passphrase` and `--value` CLI inputs
+  travel on the process command line (argv), which is world-readable in process listings. This is a
+  property of the stateless *CLI* used for testing/harnessing, not of the vault at rest; the GUI
+  slice avoids argv entirely.
+- **Verification harness self-validates (strengthens §10).** Beyond the S3 positive control, each
+  clean scenario (S1 locked, S2 post-clip) plants a non-secret `SENTINEL-<hex>` record name that
+  MUST be found in that scenario's own dump — proving the dump+scan pipeline is live for that dump
+  while the canary is absent. Empirical result: **S1 = 0, S2 = 0, S3 ≥ 1 → PASS**, via real
+  `OpenProcess`+`MiniDumpWriteDump` without elevation.
+- **Known slice-1 limitations (carried forward):** record *names* are stored as plaintext-but-
+  authenticated metadata (values encrypted; names not) — a "encrypt metadata" hardening is future
+  work; `VirtualLock` is page-granular/non-nesting; the `add` stdin prompt echoes (a no-echo input
+  is a GUI-slice concern); `save` is non-atomic (temp-then-rename is future hardening).
