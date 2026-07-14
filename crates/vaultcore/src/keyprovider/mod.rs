@@ -21,6 +21,11 @@ pub trait KeyProvider {
 pub use recovery::RecoveryProvider;
 pub use stubs::{LinuxStub, MacStub};
 
+#[cfg(windows)]
+pub mod cng_pcp;
+#[cfg(windows)]
+pub use cng_pcp::CngPcpProvider;
+
 #[cfg(test)]
 mod tests {
     use super::*;
