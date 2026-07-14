@@ -370,15 +370,32 @@ fn obtain_dek(
 }
 
 /// Describe the active key provider for `seal-status` (no DEK needed).
+///
+/// This must never claim TPM/hardware protection for a vault that isn't
+/// actually hardware-bound: only consult (and name) the CNG/TPM provider
+/// when `header.hardware_bound` is true. Otherwise the recovery passphrase
+/// (Argon2id escrow) is what actually protects the vault, so describe that
+/// instead -- without opening or naming the CNG provider at all.
 fn active_provider_describe(header: &VaultHeader) -> String {
-    #[cfg(windows)]
-    {
-        if let Ok(provider) = CngPcpProvider::open() {
-            return provider.describe();
+    if header.hardware_bound {
+        #[cfg(windows)]
+        {
+            if let Ok(provider) = CngPcpProvider::open() {
+                return provider.describe();
+            }
+            return "TPM-backed (hardware_bound is set, but the CNG provider could not be opened)"
+                .to_string();
+        }
+        #[cfg(not(windows))]
+        {
+            return "TPM-backed (hardware_bound is set, but this platform has no CNG provider)"
+                .to_string();
         }
     }
-    // Passphrase is not used by describe(); construct with an empty one.
-    RecoveryProvider::new(SecretString::from_string(String::new()), header.kdf).describe()
+    // Not hardware-bound: describe the recovery provider only. Passphrase is
+    // not used by describe(); construct with an empty one.
+    let recovery = RecoveryProvider::new(SecretString::from_string(String::new()), header.kdf).describe();
+    format!("{recovery} — NO hardware binding")
 }
 
 /// Prompt on stderr and read a line from stdin. No-echo is not available without

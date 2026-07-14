@@ -348,6 +348,14 @@ impl Vault {
     /// writing a fresh header MAC needs the DEK. On-disk layout:
     /// `u32 len(header) || header_bytes || u32 num_records ||
     ///  [ id(16 LE) || u32 len(name) || name_utf8 || u32 len(ct) || ct ]*`
+    ///
+    /// Writes are atomic: the serialized vault is written to a unique temp
+    /// file in the same directory as `path`, then renamed into place.
+    /// `std::fs::rename` replaces the destination atomically (on both
+    /// Windows and Unix, within a single filesystem), so a crash mid-write
+    /// leaves the previous vault file intact instead of a truncated/corrupt
+    /// one -- important here since the wrapped DEK lives only in this file's
+    /// header, so a partial write would otherwise be unrecoverable data loss.
     pub fn save(&self, path: &Path) -> Result<()> {
         let dek = self.dek()?;
 
@@ -361,8 +369,40 @@ impl Vault {
         for r in &self.records {
             r.to_bytes(&mut out);
         }
-        std::fs::write(path, out)?;
+
+        let tmp = Self::temp_path_for(path);
+        if let Err(e) = std::fs::write(&tmp, &out) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
+        }
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
+        }
         Ok(())
+    }
+
+    /// Build a unique temp-file path in the same directory as `path` (so the
+    /// final rename stays on one filesystem, which is required for it to be
+    /// atomic).
+    fn temp_path_for(path: &Path) -> std::path::PathBuf {
+        let mut rand_bytes = [0u8; 8];
+        rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut rand_bytes);
+        let mut suffix = String::with_capacity(16);
+        for b in rand_bytes {
+            suffix.push_str(&format!("{b:02x}"));
+        }
+
+        let mut file_name = path
+            .file_name()
+            .map(|f| f.to_os_string())
+            .unwrap_or_else(|| std::ffi::OsString::from("vault"));
+        file_name.push(format!(".tmp-{}-{}", std::process::id(), suffix));
+
+        match path.parent() {
+            Some(dir) => dir.join(&file_name),
+            None => std::path::PathBuf::from(&file_name),
+        }
     }
 }
 
@@ -502,5 +542,60 @@ mod tests {
         let mut path = std::env::temp_dir();
         path.push(format!("vaultcore_test_locked_{}.ztsv", std::process::id()));
         assert!(matches!(v.save(&path), Err(crate::Error::Locked)));
+    }
+
+    /// Helper: list `*.tmp-*` entries left behind in `dir` by `save`'s
+    /// temp-file-then-rename dance. Should always be empty after `save`
+    /// returns (success or failure).
+    fn leftover_tmp_files(dir: &std::path::Path, stem: &str) -> Vec<std::path::PathBuf> {
+        let mut leftovers = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with(stem) && name.contains(".tmp-") {
+                    leftovers.push(entry.path());
+                }
+            }
+        }
+        leftovers
+    }
+
+    #[test]
+    fn save_is_atomic_and_leaves_no_temp() {
+        let dek = SecretBytes::from_exact(&[10u8; 32]);
+        let mut v = Vault::new_unlocked(dek, test_header());
+        v.add("email", SecretString::from_string("hunter2".into())).unwrap();
+
+        let dir = std::env::temp_dir();
+        let stem = format!("vaultcore_test_atomic_{}", std::process::id());
+        let mut path = dir.clone();
+        path.push(format!("{stem}.ztsv"));
+        // Clean up any stray file from a previous failed run.
+        let _ = std::fs::remove_file(&path);
+
+        // First save: creates the vault file.
+        v.save(&path).unwrap();
+        assert!(path.exists());
+        assert!(leftover_tmp_files(&dir, &stem).is_empty());
+
+        // Second save (overwrite of an existing vault): rename-over-existing
+        // must succeed and still leave no temp residue.
+        v.add("bank_pin", SecretString::from_string("1234".into())).unwrap();
+        v.save(&path).unwrap();
+        assert!(leftover_tmp_files(&dir, &stem).is_empty());
+
+        // The file loads and verifies after the (second, overwriting) save.
+        let locked = LockedVault::load(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        let dek2 = SecretBytes::from_exact(&[10u8; 32]);
+        let unlocked = locked.unlock_with_dek(dek2).unwrap();
+        assert!(unlocked
+            .header()
+            .verify_mac(&SecretBytes::from_exact(&[10u8; 32]), unlocked.records()));
+        assert_eq!(unlocked.records().len(), 2);
+        assert_eq!(unlocked.get("email").unwrap().expose_str(), "hunter2");
+        assert_eq!(unlocked.get("bank_pin").unwrap().expose_str(), "1234");
     }
 }

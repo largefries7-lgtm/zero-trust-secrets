@@ -100,3 +100,42 @@ fn seal_status_reports_no_hardware_binding() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// A vault created with `--allow-no-tpm` is protected only by the recovery
+/// passphrase (Argon2id escrow); `seal-status` must not claim TPM/CNG
+/// protection for it, even on a TPM-equipped machine where the CNG provider
+/// would otherwise open successfully.
+#[test]
+fn seal_status_recovery_only_does_not_claim_tpm() {
+    let dir = unique_dir("sealstatus-recovery-only");
+    let v = dir.join("v.ztsv");
+    let vs = v.to_str().unwrap();
+
+    assert!(bin()
+        .args(["--vault", vs, "init", "--allow-no-tpm", "--recovery-passphrase", "pw"])
+        .status()
+        .unwrap()
+        .success());
+
+    let out = bin().args(["--vault", vs, "seal-status"]).output().unwrap();
+    assert!(out.status.success());
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !combined.contains("Platform Crypto"),
+        "seal-status must not name the CNG provider for a non-hardware-bound vault: {combined}"
+    );
+    assert!(
+        !combined.contains("TPM-backed"),
+        "seal-status must not claim TPM-backed protection for a non-hardware-bound vault: {combined}"
+    );
+    assert!(
+        combined.contains("false") || combined.contains("NO hardware"),
+        "seal-status must indicate the vault is not hardware-bound: {combined}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
