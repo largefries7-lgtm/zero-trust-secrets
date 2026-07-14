@@ -1,0 +1,14 @@
+# Rust
+/target/
+**/target/
+Cargo.lock.orig
+
+# Verification artifacts (may contain canary/dump data)
+*.dmp
+verify/**/dumps/
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
