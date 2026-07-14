@@ -248,6 +248,12 @@ impl LockedVault {
     pub fn header(&self) -> &VaultHeader {
         &self.header
     }
+
+    /// Record names as stored (authenticated plaintext metadata). Read-only;
+    /// exposes no key material and does not require the DEK. Used by `list`.
+    pub fn record_names(&self) -> Vec<&str> {
+        self.records.iter().map(|r| r.name.as_str()).collect()
+    }
 }
 
 pub struct Vault {
