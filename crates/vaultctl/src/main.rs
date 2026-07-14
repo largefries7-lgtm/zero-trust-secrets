@@ -87,6 +87,35 @@ enum Cmd {
     },
     /// Report hardware-binding status of the vault (no DEK needed).
     SealStatus,
+
+    // --- Verification-harness-only subcommands (feature-gated) ---------------
+    // These are compiled ONLY under `--features leaktest`; a normal production
+    // build does not contain them. Each freezes the process in a precise state,
+    // prints `READY` to stdout, and blocks reading stdin so the memory-scraping
+    // harness (verify/dumper) can dump the process deterministically.
+    /// [leaktest] Load the still-locked vault (no DEK), print READY, then block.
+    #[cfg(feature = "leaktest")]
+    #[command(name = "__hold-locked")]
+    HoldLocked,
+    /// [leaktest] Get a secret, copy it to the clipboard, drop+zeroize it, then
+    /// (only after zeroization) print READY and block. Models "just after copy".
+    #[cfg(feature = "leaktest")]
+    #[command(name = "__hold-postclip")]
+    HoldPostclip {
+        /// Record name to fetch and copy.
+        name: String,
+        #[arg(long)]
+        recovery_passphrase: String,
+    },
+    /// [leaktest] Positive control: keep `<canary>` in a plain, never-zeroized
+    /// String alive across the dump, print READY, then block. Proves the
+    /// scanner actually finds the canary when it IS present.
+    #[cfg(feature = "leaktest")]
+    #[command(name = "__leak")]
+    Leak {
+        /// Canary string to hold in plaintext.
+        canary: String,
+    },
 }
 
 fn main() -> ExitCode {
@@ -170,7 +199,60 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         }
+
+        // --- Verification-harness-only subcommands (feature-gated) -----------
+        #[cfg(feature = "leaktest")]
+        Cmd::HoldLocked => {
+            // Locked state: parse the header + (still-encrypted) records only.
+            // No DEK is obtained, so no plaintext secret exists in this heap;
+            // only ciphertext does. The canary MUST NOT be findable.
+            let _locked = LockedVault::load(path)?;
+            hold_until_stdin_eof()?;
+            // _locked drops here (after the dump), carrying only ciphertext.
+        }
+        #[cfg(feature = "leaktest")]
+        Cmd::HoldPostclip { name, recovery_passphrase } => {
+            // Perform the whole get+clip inside an inner scope so the
+            // `SecretString` and the DEK (inside `Vault`) run their zeroizing
+            // `Drop` BEFORE we print READY. After this block the process heap
+            // must be clean: the plaintext lives on only in the OS clipboard
+            // (a separate process, out of scope for this assertion).
+            {
+                let locked = LockedVault::load(path)?;
+                let dek = obtain_dek(locked.header(), Some(&recovery_passphrase))?;
+                let vault = locked.unlock_with_dek(dek)?;
+                let secret = vault.get(&name)?;
+                clip::copy_with_autoclear(secret.expose_str(), 15)?;
+                // secret (SecretString) and vault (owning the DEK SecretBytes)
+                // both drop here -> zeroized -> heap clean before READY.
+            }
+            hold_until_stdin_eof()?;
+        }
+        #[cfg(feature = "leaktest")]
+        Cmd::Leak { canary } => {
+            // Positive control: keep the canary in a plain String that is NEVER
+            // zeroized and stays alive across the dump. black_box prevents the
+            // optimizer from eliding the live buffer. This MUST be findable.
+            let held = std::hint::black_box(canary);
+            hold_until_stdin_eof()?;
+            // Force `held` to remain live across the blocking dump window.
+            std::hint::black_box(&held);
+        }
     }
+    Ok(())
+}
+
+/// Verification-harness helper: signal readiness on stdout (so the dumper knows
+/// the process is in the target state), then block until the harness closes our
+/// stdin (EOF) to let the process exit. Not present in production builds.
+#[cfg(feature = "leaktest")]
+fn hold_until_stdin_eof() -> std::io::Result<()> {
+    let mut out = std::io::stdout();
+    out.write_all(b"READY\n")?;
+    out.flush()?;
+    // Blocks until a line arrives or stdin reaches EOF (harness drops the pipe).
+    let mut line = String::new();
+    let _ = std::io::stdin().read_line(&mut line)?;
     Ok(())
 }
 

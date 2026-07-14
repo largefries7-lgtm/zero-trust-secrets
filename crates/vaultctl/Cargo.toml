@@ -7,3 +7,9 @@ rust-version.workspace = true
 [dependencies]
 vaultcore = { path = "../vaultcore" }
 clap.workspace = true
+
+[features]
+# Enables hidden `__hold-*` / `__leak` subcommands used ONLY by the
+# verification harness (verify/dumper) to freeze the process in a precise
+# state for memory dumping. Never enabled in a production build.
+leaktest = []
