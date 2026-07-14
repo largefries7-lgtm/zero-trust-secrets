@@ -53,16 +53,19 @@ impl Scenario {
     /// Human-readable expectation.
     fn expected_str(self) -> &'static str {
         match self {
-            Scenario::Leak => ">= 1",
-            _ => "== 0",
+            // Self-validating: the non-secret sentinel (the record NAME, held in
+            // plaintext metadata) MUST be found in this very dump — proving the
+            // dump+scan pipeline works on IT — while the canary MUST be absent.
+            Scenario::Locked | Scenario::PostClip => "sent>=1 & can==0",
+            // Positive control loads no vault, so it has no sentinel; its own
+            // validity proof is that the canary IS found.
+            Scenario::Leak => "can>=1",
         }
     }
-    /// Does `hits` satisfy this scenario's expectation?
-    fn passes(self, hits: usize) -> bool {
-        match self {
-            Scenario::Leak => hits >= 1,
-            _ => hits == 0,
-        }
+    /// Whether this scenario loads the vault (and therefore carries the record
+    /// NAME / sentinel in its process heap). The positive control does not.
+    fn loads_vault(self) -> bool {
+        !matches!(self, Scenario::Leak)
     }
     fn parse(s: &str) -> Option<Scenario> {
         match s {
@@ -76,17 +79,35 @@ impl Scenario {
 
 struct ScenarioResult {
     scenario: Scenario,
+    /// The random record NAME planted for this run; doubles as a non-secret
+    /// sentinel that must appear in the dump of any vault-loading scenario.
+    sentinel: String,
+    /// The random secret VALUE; must NOT survive in the heap when not in use.
     canary: String,
-    utf8: usize,
-    utf16: usize,
+    /// Hits of the sentinel (record name) across UTF-8 + UTF-16LE. Only
+    /// meaningful for vault-loading scenarios.
+    sentinel_hits: usize,
+    canary_utf8: usize,
+    canary_utf16: usize,
 }
 
 impl ScenarioResult {
-    fn total(&self) -> usize {
-        self.utf8 + self.utf16
+    fn canary_total(&self) -> usize {
+        self.canary_utf8 + self.canary_utf16
     }
+    /// Pass criteria, per scenario:
+    ///   * locked / post-clip: sentinel MUST be found (dump+scan proven real for
+    ///     THIS dump) AND canary MUST be absent (no plaintext secret lingering).
+    ///   * leak (positive control): canary MUST be found.
+    /// A missing sentinel where one is expected is a FAILURE — the pipeline is
+    /// broken for that dump, so its canary==0 would be vacuous.
     fn passed(&self) -> bool {
-        self.scenario.passes(self.total())
+        match self.scenario {
+            Scenario::Locked | Scenario::PostClip => {
+                self.sentinel_hits >= 1 && self.canary_total() == 0
+            }
+            Scenario::Leak => self.canary_total() >= 1,
+        }
     }
 }
 
@@ -117,12 +138,16 @@ dumper — memory-scraping verification harness
 
 USAGE:
   dumper verify [--vaultctl <path>] [--keep-dumps]
-      Run all three scenarios (locked, post-clip, leak) and assert.
-      Exits 0 iff locked==0 AND post-clip==0 AND leak>=1.
+      Run all three scenarios (locked, post-clip, leak) and assert. Each
+      vault-loading scenario self-validates via a non-secret sentinel that MUST
+      appear in its own dump. Exits 0 iff:
+        locked   (sentinel>=1 AND canary==0)
+        post-clip(sentinel>=1 AND canary==0)
+        leak     (canary>=1)
 
   dumper <scenario> <out.dmp> [--vaultctl <path>]
       Run a single scenario (locked | post-clip | leak), write the dump to
-      <out.dmp> (kept), and print the canary + hit counts for manual use.
+      <out.dmp> (kept), and print the sentinel + canary hit counts for manual use.
 
 Default --vaultctl: target/release/vaultctl.exe (relative to the current dir;
 verify/run.sh cds to the repo root first).";
@@ -156,13 +181,24 @@ fn run_verify(rest: &[String]) -> Res<ExitCode> {
         let sdir = base.join(scen.name().replace(['(', ')'], ""));
         let dmp = sdir.join("dump.dmp");
         let res = run_scenario(&vaultctl, scen, &sdir, &dmp)?;
-        eprintln!(
-            "  {:<11} dumped -> utf8={} utf16={} total={}",
-            scen.name(),
-            res.utf8,
-            res.utf16,
-            res.total()
-        );
+        if scen.loads_vault() {
+            eprintln!(
+                "  {:<11} dumped -> sentinel={} canary(utf8={} utf16={} total={})",
+                scen.name(),
+                res.sentinel_hits,
+                res.canary_utf8,
+                res.canary_utf16,
+                res.canary_total()
+            );
+        } else {
+            eprintln!(
+                "  {:<11} dumped -> canary(utf8={} utf16={} total={})",
+                scen.name(),
+                res.canary_utf8,
+                res.canary_utf16,
+                res.canary_total()
+            );
+        }
         if !keep_dumps {
             let _ = fs::remove_file(&dmp);
         }
@@ -178,11 +214,22 @@ fn run_verify(rest: &[String]) -> Res<ExitCode> {
         .iter()
         .find(|r| r.scenario == Scenario::Leak)
         .expect("leak scenario always run");
-    if ctrl.total() == 0 {
+    if ctrl.canary_total() == 0 {
         println!(
             "\nHARD FAILURE: positive control found 0 hits -> the scanner is \
              not proving anything. A passing 'locked'/'post-clip' would be vacuous."
         );
+    }
+    // Each vault-loading scenario also self-validates via its sentinel: if the
+    // sentinel is missing, that dump/scan is broken and its canary==0 is vacuous.
+    for r in &results {
+        if r.scenario.loads_vault() && r.sentinel_hits == 0 {
+            println!(
+                "\nHARD FAILURE: scenario '{}' found 0 sentinel hits -> its \
+                 dump/scan pipeline is broken; a canary==0 there proves nothing.",
+                r.scenario.name()
+            );
+        }
     }
 
     if keep_dumps {
@@ -221,29 +268,62 @@ fn run_single(args: &[String]) -> Res<ExitCode> {
     let base = make_workdir()?;
     let sdir = base.join("single");
     let res = run_scenario(&vaultctl, scen, &sdir, &out)?;
-    println!(
-        "scenario={} dump={} canary={} utf8={} utf16={} total={} expected {} -> {}",
-        scen.name(),
-        out.display(),
-        res.canary,
-        res.utf8,
-        res.utf16,
-        res.total(),
-        scen.expected_str(),
-        if res.passed() { "PASS" } else { "FAIL" },
-    );
-    println!(
-        "manual cross-check: python verify/scan_dump.py {} {}",
-        out.display(),
-        res.canary,
-    );
+    if scen.loads_vault() {
+        println!(
+            "scenario={} dump={} sentinel={} (hits={}) canary={} (utf8={} utf16={} total={}) expected {} -> {}",
+            scen.name(),
+            out.display(),
+            res.sentinel,
+            res.sentinel_hits,
+            res.canary,
+            res.canary_utf8,
+            res.canary_utf16,
+            res.canary_total(),
+            scen.expected_str(),
+            if res.passed() { "PASS" } else { "FAIL" },
+        );
+        println!(
+            "manual cross-check: python verify/scan_dump.py {} {}   # canary: expect ABSENT (exit 0)",
+            out.display(),
+            res.canary,
+        );
+        println!(
+            "manual cross-check: python verify/scan_dump.py {} {}   # sentinel: expect PRESENT (exit 2)",
+            out.display(),
+            res.sentinel,
+        );
+    } else {
+        println!(
+            "scenario={} dump={} canary={} (utf8={} utf16={} total={}) expected {} -> {}",
+            scen.name(),
+            out.display(),
+            res.canary,
+            res.canary_utf8,
+            res.canary_utf16,
+            res.canary_total(),
+            scen.expected_str(),
+            if res.passed() { "PASS" } else { "FAIL" },
+        );
+        println!(
+            "manual cross-check: python verify/scan_dump.py {} {}   # canary: expect PRESENT (exit 2)",
+            out.display(),
+            res.canary,
+        );
+    }
     // Keep the requested dump; clean up only the throwaway vault dir.
     let _ = fs::remove_dir_all(&base);
     Ok(if res.passed() { ExitCode::SUCCESS } else { ExitCode::FAILURE })
 }
 
-/// Provision a fresh vault with a random canary, spawn the hold subcommand,
-/// dump the child's memory, and scan the dump for the canary.
+/// Provision a fresh vault whose record NAME is a random non-secret sentinel and
+/// whose VALUE is a random secret canary, spawn the hold subcommand, dump the
+/// child's memory, and scan the dump for BOTH markers.
+///
+/// The sentinel (record name) is stored as plaintext metadata and is loaded into
+/// the vaultctl heap by any vault-loading scenario, so it MUST appear in those
+/// dumps — self-validating that the dump+scan pipeline works on that very dump.
+/// The canary (secret value) is encrypted at rest and zeroized after use, so it
+/// MUST NOT appear in the locked/post-clip heaps.
 fn run_scenario(
     vaultctl: &Path,
     scen: Scenario,
@@ -255,9 +335,10 @@ fn run_scenario(
         fs::create_dir_all(parent)?;
     }
     let vault = sdir.join("vault.ztsv");
+    let sentinel = generate_sentinel()?;
     let canary = generate_canary()?;
 
-    provision(vaultctl, &vault, &canary)?;
+    provision(vaultctl, &vault, &sentinel, &canary)?;
 
     // Build the hold subcommand for this scenario.
     let mut cmd = Command::new(vaultctl);
@@ -267,7 +348,8 @@ fn run_scenario(
             cmd.arg("__hold-locked");
         }
         Scenario::PostClip => {
-            cmd.args(["__hold-postclip", "secret", "--recovery-passphrase", "pw"]);
+            // Fetch by the sentinel record name.
+            cmd.args(["__hold-postclip", &sentinel, "--recovery-passphrase", "pw"]);
         }
         Scenario::Leak => {
             cmd.arg("__leak").arg(&canary);
@@ -292,8 +374,22 @@ fn run_scenario(
     drop(child.stdin.take());
     let _ = child.wait();
 
-    let (utf8, utf16) = count_canary_in_dump(dmp, &canary)?;
-    Ok(ScenarioResult { scenario: scen, canary, utf8, utf16 })
+    let (canary_utf8, canary_utf16) = count_canary_in_dump(dmp, &canary)?;
+    // The sentinel proof only applies to scenarios that actually load the vault.
+    let sentinel_hits = if scen.loads_vault() {
+        let (s8, s16) = count_canary_in_dump(dmp, &sentinel)?;
+        s8 + s16
+    } else {
+        0
+    };
+    Ok(ScenarioResult {
+        scenario: scen,
+        sentinel,
+        canary,
+        sentinel_hits,
+        canary_utf8,
+        canary_utf16,
+    })
 }
 
 /// Read the child's stdout until a line equal to `READY`. Errors if the child
@@ -314,8 +410,9 @@ fn wait_for_ready(stdout: std::process::ChildStdout) -> Res<()> {
     }
 }
 
-/// Run `vaultctl init` then `vaultctl add secret --value <canary>`.
-fn provision(vaultctl: &Path, vault: &Path, canary: &str) -> Res<()> {
+/// Run `vaultctl init` then `vaultctl add <sentinel-name> --value <canary>`.
+/// The record NAME is the non-secret sentinel; the VALUE is the secret canary.
+fn provision(vaultctl: &Path, vault: &Path, name: &str, canary: &str) -> Res<()> {
     run_checked(
         Command::new(vaultctl)
             .arg("--vault")
@@ -327,7 +424,7 @@ fn provision(vaultctl: &Path, vault: &Path, canary: &str) -> Res<()> {
         Command::new(vaultctl)
             .arg("--vault")
             .arg(vault)
-            .args(["add", "secret", "--value", canary, "--recovery-passphrase", "pw"]),
+            .args(["add", name, "--value", canary, "--recovery-passphrase", "pw"]),
         "vaultctl add",
     )?;
     Ok(())
@@ -347,12 +444,23 @@ fn run_checked(cmd: &mut Command, what: &str) -> Res<()> {
 }
 
 /// Generate a random canary of the form `CANARY-<16 hex><16 hex>` from the OS RNG.
+/// This is the SECRET value; it must not linger in the heap when not in use.
 fn generate_canary() -> Res<String> {
     let mut bytes = [0u8; 16];
     getrandom::getrandom(&mut bytes).map_err(|e| format!("OsRng (getrandom) failed: {e}"))?;
     let r1 = u64::from_le_bytes(bytes[..8].try_into().unwrap());
     let r2 = u64::from_le_bytes(bytes[8..].try_into().unwrap());
     Ok(format!("CANARY-{r1:016x}{r2:016x}"))
+}
+
+/// Generate a random sentinel of the form `SENTINEL-<16 hex>` from the OS RNG.
+/// This is a NON-SECRET record name (plaintext metadata) that MUST show up in a
+/// vault-loading scenario's dump — proving that dump+scan works on that dump.
+fn generate_sentinel() -> Res<String> {
+    let mut bytes = [0u8; 8];
+    getrandom::getrandom(&mut bytes).map_err(|e| format!("OsRng (getrandom) failed: {e}"))?;
+    let r = u64::from_le_bytes(bytes);
+    Ok(format!("SENTINEL-{r:016x}"))
 }
 
 /// Count occurrences of the canary in the dump, as UTF-8 and as UTF-16LE.
@@ -519,15 +627,26 @@ fn make_workdir() -> Res<PathBuf> {
 }
 
 fn print_table(results: &[ScenarioResult]) {
-    println!("{:<12} {:>5} {:>6} {:>6} {:>9}  {}", "scenario", "utf8", "utf16", "total", "expected", "result");
-    println!("{}", "-".repeat(56));
+    // sentinel = non-secret record-name marker that MUST be in the dump (proves
+    // the scan pipeline works on THAT dump); canary = secret value that must not
+    // linger. "-" for sentinel means the scenario loads no vault (positive control).
+    println!(
+        "{:<12} {:>8} {:>10} {:>11} {:>16}  {}",
+        "scenario", "sentinel", "canary_u8", "canary_u16", "expected", "result"
+    );
+    println!("{}", "-".repeat(68));
     for r in results {
+        let sentinel = if r.scenario.loads_vault() {
+            r.sentinel_hits.to_string()
+        } else {
+            "-".to_string()
+        };
         println!(
-            "{:<12} {:>5} {:>6} {:>6} {:>9}  {}",
+            "{:<12} {:>8} {:>10} {:>11} {:>16}  {}",
             r.scenario.name(),
-            r.utf8,
-            r.utf16,
-            r.total(),
+            sentinel,
+            r.canary_utf8,
+            r.canary_utf16,
             r.scenario.expected_str(),
             if r.passed() { "PASS" } else { "FAIL" },
         );
