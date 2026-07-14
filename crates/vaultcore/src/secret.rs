@@ -59,6 +59,11 @@ impl Drop for SecretBytes {
     }
 }
 
+impl zeroize::Zeroize for SecretBytes {
+    fn zeroize(&mut self) { self.buf.zeroize(); }
+}
+impl zeroize::ZeroizeOnDrop for SecretBytes {}
+
 impl fmt::Debug for SecretBytes {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "SecretBytes(***{} bytes***)", self.buf.len())
@@ -82,6 +87,11 @@ impl SecretString {
     }
     pub fn into_bytes(self) -> SecretBytes { self.inner }
 }
+
+impl zeroize::Zeroize for SecretString {
+    fn zeroize(&mut self) { self.inner.zeroize(); }
+}
+impl zeroize::ZeroizeOnDrop for SecretString {}
 
 impl fmt::Debug for SecretString {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -121,5 +131,12 @@ mod tests {
         let src = String::from("passphrase");
         let ss = SecretString::from_string(src);
         assert_eq!(ss.expose_str(), "passphrase");
+    }
+
+    #[test]
+    fn secret_types_impl_zeroize_on_drop() {
+        fn assert_zod<T: zeroize::ZeroizeOnDrop>() {}
+        assert_zod::<SecretBytes>();
+        assert_zod::<SecretString>();
     }
 }
