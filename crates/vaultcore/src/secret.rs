@@ -81,6 +81,18 @@ impl SecretString {
         s.zeroize(); // scrub the source String's buffer
         SecretString { inner }
     }
+    /// Wrap an already page-locked, zeroize-on-drop `SecretBytes` as a UTF-8
+    /// secret WITHOUT copying the plaintext into an intermediate (unlocked,
+    /// un-scrubbed) buffer. Returns `None` if the bytes are not valid UTF-8; in
+    /// that case `b` is consumed and dropped here (zeroized), leaving no
+    /// un-scrubbed plaintext copy behind.
+    pub fn from_secret_bytes(b: SecretBytes) -> Option<SecretString> {
+        if std::str::from_utf8(b.expose()).is_ok() {
+            Some(SecretString { inner: b })
+        } else {
+            None // b drops -> zeroized
+        }
+    }
     pub fn expose_str(&self) -> &str {
         // Constructed from a valid String, so bytes are valid UTF-8.
         std::str::from_utf8(self.inner.expose()).expect("secret utf8 invariant")
@@ -138,5 +150,14 @@ mod tests {
         fn assert_zod<T: zeroize::ZeroizeOnDrop>() {}
         assert_zod::<SecretBytes>();
         assert_zod::<SecretString>();
+    }
+
+    #[test]
+    fn from_secret_bytes_wraps_valid_utf8_and_rejects_invalid() {
+        let ok = SecretString::from_secret_bytes(SecretBytes::from_exact(b"hello")).unwrap();
+        assert_eq!(ok.expose_str(), "hello");
+        // Invalid UTF-8 -> None; the SecretBytes is consumed and zeroized on drop,
+        // so no un-scrubbed plaintext copy is left behind.
+        assert!(SecretString::from_secret_bytes(SecretBytes::from_exact(&[0xff, 0xfe])).is_none());
     }
 }

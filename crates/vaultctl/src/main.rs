@@ -139,7 +139,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         Cmd::Unlock { recovery_passphrase } => {
             let locked = LockedVault::load(path)?;
-            let dek = obtain_dek(locked.header(), recovery_passphrase.as_deref())?;
+            let dek = obtain_dek(
+                locked.header(),
+                recovery_passphrase.map(SecretString::from_string),
+            )?;
             // unlock_with_dek verifies the header MAC and fails closed.
             let _vault = locked.unlock_with_dek(dek)?;
             println!("unlock OK");
@@ -150,7 +153,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         Cmd::Add { name, value, recovery_passphrase } => {
             let locked = LockedVault::load(path)?;
-            let dek = obtain_dek(locked.header(), recovery_passphrase.as_deref())?;
+            let dek = obtain_dek(
+                locked.header(),
+                recovery_passphrase.map(SecretString::from_string),
+            )?;
             let mut vault = locked.unlock_with_dek(dek)?;
             let value = match value {
                 Some(v) => v,
@@ -162,7 +168,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         Cmd::Get { name, clip, recovery_passphrase } => {
             let locked = LockedVault::load(path)?;
-            let dek = obtain_dek(locked.header(), recovery_passphrase.as_deref())?;
+            let dek = obtain_dek(
+                locked.header(),
+                recovery_passphrase.map(SecretString::from_string),
+            )?;
             let vault = locked.unlock_with_dek(dek)?;
             let secret = vault.get(&name)?;
             if clip {
@@ -219,7 +228,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             // (a separate process, out of scope for this assertion).
             {
                 let locked = LockedVault::load(path)?;
-                let dek = obtain_dek(locked.header(), Some(&recovery_passphrase))?;
+                let dek = obtain_dek(
+                    locked.header(),
+                    Some(SecretString::from_string(recovery_passphrase)),
+                )?;
                 let vault = locked.unlock_with_dek(dek)?;
                 let secret = vault.get(&name)?;
                 clip::copy_with_autoclear(secret.expose_str(), 15)?;
@@ -341,9 +353,15 @@ fn cmd_init(
 /// Obtain the DEK without persisting it. TPM unseal for hardware-bound vaults,
 /// otherwise unwrap via the recovery passphrase. Returns an owned, page-locked,
 /// zeroize-on-drop `SecretBytes`.
+///
+/// The passphrase is taken as an owned `SecretString` (zeroize-on-drop) rather
+/// than a `&str` borrow of a clap-owned `String`: the caller moves the parsed
+/// argument straight into a `SecretString`, which scrubs the original heap
+/// buffer, so the passphrase does not linger un-zeroized in process memory.
+/// (Its presence in argv is a separate, documented exposure.)
 fn obtain_dek(
     header: &VaultHeader,
-    recovery_pw: Option<&str>,
+    recovery_pw: Option<SecretString>,
 ) -> vaultcore::Result<SecretBytes> {
     if header.hardware_bound {
         #[cfg(windows)]
@@ -365,7 +383,7 @@ fn obtain_dek(
     let pw = recovery_pw.ok_or_else(|| {
         Error::Provider("--recovery-passphrase required (vault is not hardware-bound)".into())
     })?;
-    let provider = RecoveryProvider::new(SecretString::from_string(pw.to_string()), header.kdf);
+    let provider = RecoveryProvider::new(pw, header.kdf);
     provider.unseal(&SealedBlob(header.recovery_wrap.clone()))
 }
 

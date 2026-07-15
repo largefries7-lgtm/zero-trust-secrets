@@ -224,7 +224,12 @@ impl LockedVault {
         let header = VaultHeader::from_bytes(header_bytes)?;
 
         let num_records = c.u32()? as usize;
-        let mut records = Vec::with_capacity(num_records.min(1 << 20));
+        // Do NOT pre-allocate from the untrusted `num_records`: a tiny file
+        // claiming a huge count would otherwise force a large up-front
+        // allocation (memory-amplification DoS) before parsing fails. Grow as
+        // records actually parse; each `from_cursor` is bounds-checked against
+        // the remaining bytes, so total work is bounded by the real file size.
+        let mut records = Vec::new();
         for _ in 0..num_records {
             records.push(Record::from_cursor(&mut c)?);
         }
@@ -318,9 +323,10 @@ impl Vault {
             &Self::aad(rec.id, self.header.format_version, &rec.name),
             &rec.ciphertext,
         )?;
-        // pt is SecretBytes; wrap as SecretString
-        let s = String::from_utf8(pt.expose().to_vec()).map_err(|_| Error::Format("utf8".into()))?;
-        Ok(SecretString::from_string(s))
+        // Wrap the already-locked plaintext in place: no `to_vec()` copy into
+        // ordinary heap, and on non-UTF-8 the buffer is zeroized on drop.
+        SecretString::from_secret_bytes(pt)
+            .ok_or_else(|| Error::Format("record value is not valid utf8".into()))
     }
 
     pub fn list(&self) -> Vec<&str> {
@@ -532,6 +538,26 @@ mod tests {
         let wrong_dek = SecretBytes::from_exact(&[8u8; 32]);
         let result = locked.unlock_with_dek(wrong_dek);
         assert!(matches!(result, Err(crate::Error::AuthFailed)));
+    }
+
+    #[test]
+    fn load_rejects_huge_record_count_without_huge_alloc() {
+        // A tiny file that claims ~4 billion records but provides no record
+        // bodies must fail cleanly (Format error) rather than pre-allocating a
+        // giant Vec. With the untrusted count no longer driving `with_capacity`,
+        // parsing bails on the first missing record.
+        let h = test_header();
+        let header_bytes = h.to_bytes();
+        let mut data = Vec::new();
+        put_bytes(&mut data, &header_bytes); // u32 len || header
+        put_u32(&mut data, u32::MAX); // claim ~4 billion records, provide none
+
+        let mut path = std::env::temp_dir();
+        path.push(format!("vaultcore_test_dos_{}.ztsv", std::process::id()));
+        std::fs::write(&path, &data).unwrap();
+        let r = LockedVault::load(&path);
+        std::fs::remove_file(&path).ok();
+        assert!(matches!(r, Err(crate::Error::Format(_))));
     }
 
     #[test]
