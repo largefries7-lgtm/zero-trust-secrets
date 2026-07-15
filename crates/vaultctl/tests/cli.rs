@@ -1,5 +1,5 @@
 //! Process-spawning integration tests for the stateless `vaultctl` CLI.
-//! The DEK is never persisted, so `add`/`get` are passed the recovery
+//! The DEK is never persisted, so `add`/`get` are passed the unlock
 //! passphrase on each invocation (non-TPM `--allow-no-tpm` vault).
 
 use std::process::Command;
@@ -21,18 +21,18 @@ fn init_add_get_list_roundtrip() {
     let vs = v.to_str().unwrap();
 
     assert!(bin()
-        .args(["--vault", vs, "init", "--allow-no-tpm", "--recovery-passphrase", "pw"])
+        .args(["--vault", vs, "init", "--allow-no-tpm", "--passphrase", "pw"])
         .status()
         .unwrap()
         .success());
     assert!(bin()
-        .args(["--vault", vs, "add", "email", "--value", "hunter2", "--recovery-passphrase", "pw"])
+        .args(["--vault", vs, "add", "email", "--value", "hunter2", "--passphrase", "pw"])
         .status()
         .unwrap()
         .success());
 
     let out = bin()
-        .args(["--vault", vs, "get", "email", "--recovery-passphrase", "pw"])
+        .args(["--vault", vs, "get", "email", "--passphrase", "pw"])
         .output()
         .unwrap();
     assert!(out.status.success());
@@ -44,10 +44,53 @@ fn init_add_get_list_roundtrip() {
 
     // wrong passphrase fails (non-zero exit).
     assert!(!bin()
-        .args(["--vault", vs, "get", "email", "--recovery-passphrase", "wrong"])
+        .args(["--vault", vs, "get", "email", "--passphrase", "wrong"])
         .status()
         .unwrap()
         .success());
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn recovery_escrow_unlocks_and_seal_status_reports_it() {
+    let dir = unique_dir("recovery");
+    let v = dir.join("v.ztsv");
+    let vs = v.to_str().unwrap();
+
+    // Vault with an opt-in recovery escrow (separate recovery passphrase).
+    assert!(bin()
+        .args([
+            "--vault", vs, "init", "--allow-no-tpm", "--passphrase", "unlockpw", "--recovery",
+            "--recovery-passphrase", "recpw",
+        ])
+        .status()
+        .unwrap()
+        .success());
+    assert!(bin()
+        .args(["--vault", vs, "add", "email", "--value", "hunter2", "--passphrase", "unlockpw"])
+        .status()
+        .unwrap()
+        .success());
+
+    // Unlock via the recovery escrow (single factor).
+    let out = bin()
+        .args(["--vault", vs, "get", "email", "--recovery", "--recovery-passphrase", "recpw"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("hunter2"));
+
+    // Wrong recovery passphrase fails.
+    assert!(!bin()
+        .args(["--vault", vs, "get", "email", "--recovery", "--recovery-passphrase", "wrong"])
+        .status()
+        .unwrap()
+        .success());
+
+    // seal-status reports the escrow.
+    let st = bin().args(["--vault", vs, "seal-status"]).output().unwrap();
+    assert!(String::from_utf8_lossy(&st.stdout).contains("recovery_escrow: true"));
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -59,13 +102,13 @@ fn init_refuses_to_clobber_existing_vault() {
     let vs = v.to_str().unwrap();
 
     assert!(bin()
-        .args(["--vault", vs, "init", "--allow-no-tpm", "--recovery-passphrase", "pw"])
+        .args(["--vault", vs, "init", "--allow-no-tpm", "--passphrase", "pw"])
         .status()
         .unwrap()
         .success());
     // second init on the same path must fail (do not overwrite).
     assert!(!bin()
-        .args(["--vault", vs, "init", "--allow-no-tpm", "--recovery-passphrase", "pw"])
+        .args(["--vault", vs, "init", "--allow-no-tpm", "--passphrase", "pw"])
         .status()
         .unwrap()
         .success());
@@ -88,7 +131,7 @@ fn seal_status_reports_no_hardware_binding() {
     let vs = v.to_str().unwrap();
 
     assert!(bin()
-        .args(["--vault", vs, "init", "--allow-no-tpm", "--recovery-passphrase", "pw"])
+        .args(["--vault", vs, "init", "--allow-no-tpm", "--passphrase", "pw"])
         .status()
         .unwrap()
         .success());
@@ -112,7 +155,7 @@ fn seal_status_recovery_only_does_not_claim_tpm() {
     let vs = v.to_str().unwrap();
 
     assert!(bin()
-        .args(["--vault", vs, "init", "--allow-no-tpm", "--recovery-passphrase", "pw"])
+        .args(["--vault", vs, "init", "--allow-no-tpm", "--passphrase", "pw"])
         .status()
         .unwrap()
         .success());

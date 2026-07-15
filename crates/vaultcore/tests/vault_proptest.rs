@@ -4,17 +4,15 @@ use vaultcore::secret::{SecretBytes, SecretString};
 use vaultcore::vault::{Vault, VaultHeader};
 
 fn test_header() -> VaultHeader {
-    VaultHeader {
-        magic: *b"ZTSV",
-        format_version: 1,
-        hardware_bound: false,
-        aead_id: 1,
-        kdf: Argon2Params { mem_kib: 8, time: 1, parallelism: 1, salt: [9u8; 16] },
-        pcr_selection: vec![],
-        tpm_wrap: None,
-        recovery_wrap: vec![1, 2, 3],
-        header_mac: [0u8; 32],
-    }
+    // Storage-layer test header (records are exercised via a directly-supplied
+    // DEK, so the envelope wraps here are placeholders).
+    VaultHeader::new_v2(
+        false,
+        Argon2Params { mem_kib: 8, time: 1, parallelism: 1, salt: [9u8; 16] },
+        None,
+        vec![1, 2, 3],
+        None,
+    )
 }
 
 proptest! {

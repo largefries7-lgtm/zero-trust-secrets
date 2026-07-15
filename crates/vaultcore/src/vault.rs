@@ -13,17 +13,34 @@ use crate::{Error, Result};
 use std::path::Path;
 
 const MAGIC: [u8; 4] = *b"ZTSV";
+/// Current on-disk format version. v2 = two-factor envelope (see `envelope.rs`).
+/// v1 (single-factor: TPM-wraps-DEK *or* passphrase-wraps-DEK) is no longer read
+/// by the hot path; `vaultctl migrate` upgrades a v1 file to v2.
+pub const FORMAT_VERSION: u16 = 2;
 
+/// Authenticated vault header (format v2).
+///
+/// The DEK is wrapped by `dek_wrap` under a two-factor KEK (see `envelope.rs`):
+/// `tpm_wrap` seals the random TPM secret factor (present iff `hardware_bound`),
+/// and `kdf` parameterizes the Argon2id passphrase factor. `recovery_wrap` /
+/// `recovery_kdf` are an OPTIONAL single-factor escrow.
 #[derive(Clone)]
 pub struct VaultHeader {
     pub magic: [u8; 4],
     pub format_version: u16,
     pub hardware_bound: bool,
     pub aead_id: u8,
+    /// Argon2id parameters/salt for the unlock passphrase factor.
     pub kdf: Argon2Params,
     pub pcr_selection: Vec<u32>,
+    /// RSA-OAEP-sealed 32-byte TPM secret factor. `Some` iff `hardware_bound`.
     pub tpm_wrap: Option<Vec<u8>>,
-    pub recovery_wrap: Vec<u8>,
+    /// Primary wrap: `AEAD(KEK, DEK)` where `KEK = HKDF([tpm_secret ‖] pass_key)`.
+    pub dek_wrap: Vec<u8>,
+    /// Optional single-factor recovery escrow: `AEAD(Argon2id(recovery_pass), DEK)`.
+    pub recovery_wrap: Option<Vec<u8>>,
+    /// Argon2id parameters/salt for the recovery passphrase. `Some` iff `recovery_wrap`.
+    pub recovery_kdf: Option<Argon2Params>,
     pub header_mac: [u8; 32],
 }
 
@@ -38,19 +55,23 @@ fn put_bytes(b: &mut Vec<u8>, v: &[u8]) {
     put_u32(b, v.len() as u32);
     b.extend_from_slice(v);
 }
+fn put_argon2(b: &mut Vec<u8>, p: &Argon2Params) {
+    put_u32(b, p.mem_kib);
+    put_u32(b, p.time);
+    put_u32(b, p.parallelism);
+    b.extend_from_slice(&p.salt);
+}
 
 impl VaultHeader {
-    /// Serialize with header_mac included as-is (callers zero it before MAC).
+    /// Serialize the v2 header. `header_mac` is written as-is (callers zero it
+    /// before computing the MAC over these bytes).
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut b = Vec::new();
         b.extend_from_slice(&self.magic);
         put_u16(&mut b, self.format_version);
         b.push(self.hardware_bound as u8);
         b.push(self.aead_id);
-        put_u32(&mut b, self.kdf.mem_kib);
-        put_u32(&mut b, self.kdf.time);
-        put_u32(&mut b, self.kdf.parallelism);
-        b.extend_from_slice(&self.kdf.salt);
+        put_argon2(&mut b, &self.kdf);
         put_u32(&mut b, self.pcr_selection.len() as u32);
         for p in &self.pcr_selection {
             put_u32(&mut b, *p);
@@ -62,7 +83,15 @@ impl VaultHeader {
             }
             None => b.push(0),
         }
-        put_bytes(&mut b, &self.recovery_wrap);
+        put_bytes(&mut b, &self.dek_wrap);
+        match (&self.recovery_wrap, &self.recovery_kdf) {
+            (Some(rw), Some(rk)) => {
+                b.push(1);
+                put_argon2(&mut b, rk);
+                put_bytes(&mut b, rw);
+            }
+            _ => b.push(0),
+        }
         b.extend_from_slice(&self.header_mac);
         b
     }
@@ -77,17 +106,16 @@ impl VaultHeader {
             return Err(Error::Format("bad magic".into()));
         }
         let format_version = c.u16()?;
+        if format_version != FORMAT_VERSION {
+            // v1 files are single-factor; they are not read by the hot path.
+            return Err(Error::Format(format!(
+                "unsupported vault format version {format_version} (expected {FORMAT_VERSION}); \
+                 if this is a v1 vault, run `vaultctl migrate`"
+            )));
+        }
         let hardware_bound = c.u8()? != 0;
         let aead_id = c.u8()?;
-        let kdf = Argon2Params {
-            mem_kib: c.u32()?,
-            time: c.u32()?,
-            parallelism: c.u32()?,
-            salt: c
-                .take(16)?
-                .try_into()
-                .map_err(|_| Error::Format("salt".into()))?,
-        };
+        let kdf = c.argon2()?;
         let npcr = c.u32()? as usize;
         // Do NOT pre-allocate from the untrusted `npcr`: like the record count,
         // a tiny file claiming a huge PCR count would otherwise force a large
@@ -98,7 +126,14 @@ impl VaultHeader {
             pcr_selection.push(c.u32()?);
         }
         let tpm_wrap = if c.u8()? == 1 { Some(c.bytes()?) } else { None };
-        let recovery_wrap = c.bytes()?;
+        let dek_wrap = c.bytes()?;
+        let (recovery_wrap, recovery_kdf) = if c.u8()? == 1 {
+            let rk = c.argon2()?;
+            let rw = c.bytes()?;
+            (Some(rw), Some(rk))
+        } else {
+            (None, None)
+        };
         let header_mac: [u8; 32] = c
             .take(32)?
             .try_into()
@@ -111,7 +146,9 @@ impl VaultHeader {
             kdf,
             pcr_selection,
             tpm_wrap,
+            dek_wrap,
             recovery_wrap,
+            recovery_kdf,
             header_mac,
         })
     }
@@ -144,6 +181,36 @@ impl VaultHeader {
         use subtle::ConstantTimeEq;
         self.compute_mac(dek, records).ct_eq(&self.header_mac).into()
     }
+
+    /// Build a fresh v2 header. `dek_wrap` is the primary two-factor wrap;
+    /// `tpm_wrap` seals the TPM secret factor (`Some` iff hardware-bound); the
+    /// recovery pair is the optional single-factor escrow. `header_mac` is filled
+    /// by `Vault::save`. `aead_id`/`pcr_selection` take their defaults.
+    pub fn new_v2(
+        hardware_bound: bool,
+        kdf: Argon2Params,
+        tpm_wrap: Option<Vec<u8>>,
+        dek_wrap: Vec<u8>,
+        recovery: Option<(Vec<u8>, Argon2Params)>,
+    ) -> Self {
+        let (recovery_wrap, recovery_kdf) = match recovery {
+            Some((rw, rk)) => (Some(rw), Some(rk)),
+            None => (None, None),
+        };
+        VaultHeader {
+            magic: MAGIC,
+            format_version: FORMAT_VERSION,
+            hardware_bound,
+            aead_id: 1,
+            kdf,
+            pcr_selection: vec![],
+            tpm_wrap,
+            dek_wrap,
+            recovery_wrap,
+            recovery_kdf,
+            header_mac: [0u8; 32],
+        }
+    }
 }
 
 struct Cursor<'a> {
@@ -175,6 +242,17 @@ impl<'a> Cursor<'a> {
     fn bytes(&mut self) -> Result<Vec<u8>> {
         let n = self.u32()? as usize;
         Ok(self.take(n)?.to_vec())
+    }
+    fn argon2(&mut self) -> Result<Argon2Params> {
+        Ok(Argon2Params {
+            mem_kib: self.u32()?,
+            time: self.u32()?,
+            parallelism: self.u32()?,
+            salt: self
+                .take(16)?
+                .try_into()
+                .map_err(|_| Error::Format("argon2 salt".into()))?,
+        })
     }
 }
 
@@ -262,6 +340,38 @@ impl LockedVault {
     /// exposes no key material and does not require the DEK. Used by `list`.
     pub fn record_names(&self) -> Vec<&str> {
         self.records.iter().map(|r| r.name.as_str()).collect()
+    }
+
+    /// v2 primary unlock: derive the DEK from the unlock passphrase (+ the TPM
+    /// secret factor, for a hardware-bound vault) via the two-factor envelope,
+    /// then verify the header MAC. Fails closed (`Error::AuthFailed`) on a wrong
+    /// passphrase, wrong/missing TPM secret, or a tampered header/record set.
+    pub fn unlock_two_factor(
+        self,
+        passphrase: &SecretString,
+        tpm_secret: Option<&SecretBytes>,
+    ) -> Result<Vault> {
+        let dek = crate::envelope::unwrap_dek(
+            &self.header.dek_wrap,
+            passphrase,
+            &self.header.kdf,
+            tpm_secret,
+        )?;
+        self.unlock_with_dek(dek)
+    }
+
+    /// v2 recovery unlock: derive the DEK from the recovery passphrase alone
+    /// (single factor). Errors if this vault has no recovery escrow.
+    pub fn unlock_recovery(self, recovery_pass: &SecretString) -> Result<Vault> {
+        let (rw, rk) = match (
+            self.header.recovery_wrap.as_ref(),
+            self.header.recovery_kdf.as_ref(),
+        ) {
+            (Some(rw), Some(rk)) => (rw.clone(), *rk),
+            _ => return Err(Error::Provider("this vault has no recovery escrow".into())),
+        };
+        let dek = crate::envelope::unwrap_dek_recovery(&rw, recovery_pass, &rk)?;
+        self.unlock_with_dek(dek)
     }
 }
 
@@ -423,13 +533,15 @@ mod tests {
     fn test_header() -> VaultHeader {
         VaultHeader {
             magic: *b"ZTSV",
-            format_version: 1,
+            format_version: FORMAT_VERSION,
             hardware_bound: false,
             aead_id: 1,
             kdf: Argon2Params { mem_kib: 8, time: 1, parallelism: 1, salt: [9u8; 16] },
             pcr_selection: vec![],
             tpm_wrap: None,
-            recovery_wrap: vec![1, 2, 3],
+            dek_wrap: vec![1, 2, 3],
+            recovery_wrap: None,
+            recovery_kdf: None,
             header_mac: [0u8; 32],
         }
     }
@@ -442,7 +554,7 @@ mod tests {
         let bytes = h.to_bytes();
         let back = VaultHeader::from_bytes(&bytes).unwrap();
         assert_eq!(back.magic, *b"ZTSV");
-        assert_eq!(back.recovery_wrap, vec![1, 2, 3]);
+        assert_eq!(back.dek_wrap, vec![1, 2, 3]);
         assert!(back.verify_mac(&dek, &[]));
     }
 
@@ -540,6 +652,56 @@ mod tests {
         let wrong_dek = SecretBytes::from_exact(&[8u8; 32]);
         let result = locked.unlock_with_dek(wrong_dek);
         assert!(matches!(result, Err(crate::Error::AuthFailed)));
+    }
+
+    #[test]
+    fn v2_two_factor_end_to_end_with_recovery() {
+        let dek = SecretBytes::generate(32);
+        let pass = SecretString::from_string("unlock".into());
+        let rec = SecretString::from_string("recovery".into());
+        let tpm = SecretBytes::from_exact(&[5u8; 32]); // stand-in for the TPM secret
+        let kdf = Argon2Params { mem_kib: 8, time: 1, parallelism: 1, salt: [1u8; 16] };
+        let rkdf = Argon2Params { mem_kib: 8, time: 1, parallelism: 1, salt: [2u8; 16] };
+
+        let dek_wrap = crate::envelope::wrap_dek(&dek, &pass, &kdf, Some(&tpm)).unwrap();
+        let rec_wrap = crate::envelope::wrap_dek_recovery(&dek, &rec, &rkdf).unwrap();
+        let header =
+            VaultHeader::new_v2(true, kdf, Some(vec![0xAA; 8]), dek_wrap, Some((rec_wrap, rkdf)));
+
+        let mut v = Vault::new_unlocked(SecretBytes::from_exact(dek.expose()), header);
+        v.add("email", SecretString::from_string("hunter2".into())).unwrap();
+
+        let mut path = std::env::temp_dir();
+        path.push(format!("vaultcore_v2_{}.ztsv", std::process::id()));
+        v.save(&path).unwrap();
+
+        // Primary two-factor unlock recovers the secret.
+        let locked = LockedVault::load(&path).unwrap();
+        let unlocked = locked.unlock_two_factor(&pass, Some(&tpm)).unwrap();
+        assert_eq!(unlocked.get("email").unwrap().expose_str(), "hunter2");
+
+        // Wrong passphrase -> fails closed.
+        let locked = LockedVault::load(&path).unwrap();
+        assert!(locked
+            .unlock_two_factor(&SecretString::from_string("wrong".into()), Some(&tpm))
+            .is_err());
+
+        // Missing TPM factor (e.g. drive moved to another machine) -> fails closed.
+        let locked = LockedVault::load(&path).unwrap();
+        assert!(locked.unlock_two_factor(&pass, None).is_err());
+
+        // Recovery path (single factor) recovers the secret.
+        let locked = LockedVault::load(&path).unwrap();
+        let unlocked = locked.unlock_recovery(&rec).unwrap();
+        assert_eq!(unlocked.get("email").unwrap().expose_str(), "hunter2");
+
+        // Recovery with the wrong passphrase -> fails closed.
+        let locked = LockedVault::load(&path).unwrap();
+        assert!(locked
+            .unlock_recovery(&SecretString::from_string("bad".into()))
+            .is_err());
+
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

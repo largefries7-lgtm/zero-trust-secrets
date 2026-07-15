@@ -349,7 +349,7 @@ fn run_scenario(
         }
         Scenario::PostClip => {
             // Fetch by the sentinel record name.
-            cmd.args(["__hold-postclip", &sentinel, "--recovery-passphrase", "pw"]);
+            cmd.args(["__hold-postclip", &sentinel, "--passphrase", "pw"]);
         }
         Scenario::Leak => {
             cmd.arg("__leak").arg(&canary);
@@ -417,14 +417,14 @@ fn provision(vaultctl: &Path, vault: &Path, name: &str, canary: &str) -> Res<()>
         Command::new(vaultctl)
             .arg("--vault")
             .arg(vault)
-            .args(["init", "--allow-no-tpm", "--recovery-passphrase", "pw"]),
+            .args(["init", "--allow-no-tpm", "--passphrase", "pw"]),
         "vaultctl init",
     )?;
     run_checked(
         Command::new(vaultctl)
             .arg("--vault")
             .arg(vault)
-            .args(["add", name, "--value", canary, "--recovery-passphrase", "pw"]),
+            .args(["add", name, "--value", canary, "--passphrase", "pw"]),
         "vaultctl add",
     )?;
     Ok(())
