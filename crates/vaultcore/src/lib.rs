@@ -13,6 +13,10 @@ use thiserror::Error;
 pub enum Error {
     #[error("authentication failed (tamper or wrong key)")]
     AuthFailed,
+    #[error("a record named {0:?} already exists")]
+    Duplicate(String),
+    #[error("no record named {0:?}")]
+    NotFound(String),
     #[error("vault format error: {0}")]
     Format(String),
     #[error("key provider: {0}")]

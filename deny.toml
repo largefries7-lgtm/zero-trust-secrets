@@ -1,8 +1,8 @@
 # cargo-deny supply-chain policy for the Zero-Trust Secrets Manager.
 #
-# Run locally / in CI:  cargo install cargo-deny && cargo deny check
-# (Not run in the dev environment where the tools weren't installed; wire it
-#  into CI so every dependency change is gated.)
+# Run locally:  cargo install cargo-deny && cargo deny check
+# Enforced in CI by .github/workflows/ci.yml (the `supply-chain` job) on every
+# push and pull request, so every dependency change is gated.
 
 [advisories]
 version = 2

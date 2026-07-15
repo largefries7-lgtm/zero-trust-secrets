@@ -96,6 +96,89 @@ fn recovery_escrow_unlocks_and_seal_status_reports_it() {
 }
 
 #[test]
+fn add_rejects_duplicate_force_replaces_and_rm_removes() {
+    let dir = unique_dir("dup-force-rm");
+    let v = dir.join("v.ztsv");
+    let vs = v.to_str().unwrap();
+
+    assert!(bin()
+        .args(["--vault", vs, "init", "--allow-no-tpm", "--passphrase", "pw"])
+        .status()
+        .unwrap()
+        .success());
+    assert!(bin()
+        .args(["--vault", vs, "add", "email", "--value", "old", "--passphrase", "pw"])
+        .status()
+        .unwrap()
+        .success());
+
+    // A second plain `add` of the same name must FAIL (no silent shadowing)...
+    assert!(!bin()
+        .args(["--vault", vs, "add", "email", "--value", "new", "--passphrase", "pw"])
+        .status()
+        .unwrap()
+        .success());
+    // ...and the original value is untouched.
+    let out = bin()
+        .args(["--vault", vs, "get", "email", "--passphrase", "pw"])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&out.stdout).contains("old"));
+
+    // `add --force` rotates the value in place.
+    assert!(bin()
+        .args(["--vault", vs, "add", "email", "--value", "new", "--force", "--passphrase", "pw"])
+        .status()
+        .unwrap()
+        .success());
+    let out = bin()
+        .args(["--vault", vs, "get", "email", "--passphrase", "pw"])
+        .output()
+        .unwrap();
+    let got = String::from_utf8_lossy(&out.stdout);
+    assert!(got.contains("new"), "expected rotated value, got: {got}");
+    // Exactly one record named `email` remains (no duplicate left behind).
+    let list = bin().args(["--vault", vs, "list"]).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&list.stdout).matches("email").count(), 1);
+
+    // `rm` deletes the record; a subsequent `get` fails.
+    assert!(bin()
+        .args(["--vault", vs, "rm", "email", "--passphrase", "pw"])
+        .status()
+        .unwrap()
+        .success());
+    assert!(!bin()
+        .args(["--vault", vs, "get", "email", "--passphrase", "pw"])
+        .status()
+        .unwrap()
+        .success());
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn init_recovery_passphrase_requires_recovery_flag() {
+    let dir = unique_dir("requires-recovery");
+    let v = dir.join("v.ztsv");
+    let vs = v.to_str().unwrap();
+
+    // Passing --recovery-passphrase without --recovery must be rejected, not
+    // silently ignored (which would leave the user believing they set up an
+    // escrow that does not exist).
+    assert!(!bin()
+        .args([
+            "--vault", vs, "init", "--allow-no-tpm", "--passphrase", "pw",
+            "--recovery-passphrase", "recpw",
+        ])
+        .status()
+        .unwrap()
+        .success());
+    assert!(!v.exists(), "no vault should be created on a rejected init");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn init_refuses_to_clobber_existing_vault() {
     let dir = unique_dir("clobber");
     let v = dir.join("v.ztsv");

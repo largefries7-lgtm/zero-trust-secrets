@@ -54,8 +54,8 @@ enum Cmd {
         /// reduces a STOLEN vault's security to the recovery passphrase's strength.
         #[arg(long)]
         recovery: bool,
-        /// Recovery passphrase (only with --recovery). Prompted if omitted.
-        #[arg(long)]
+        /// Recovery passphrase (requires --recovery). Prompted if omitted.
+        #[arg(long, requires = "recovery")]
         recovery_passphrase: Option<String>,
     },
     /// Stateless credential smoke-check: derive the DEK, verify the MAC, drop it.
@@ -66,25 +66,43 @@ enum Cmd {
         /// Unlock via the recovery escrow (single factor) instead of TPM+passphrase.
         #[arg(long)]
         recovery: bool,
-        #[arg(long)]
+        #[arg(long, requires = "recovery")]
         recovery_passphrase: Option<String>,
     },
     /// No-op (nothing is persisted); prints `locked` for CLI symmetry.
     Lock,
-    /// Add or append a secret record.
+    /// Add a secret record (fails if the name exists; use --force to replace).
     Add {
         /// Record name.
         name: String,
         /// Secret value. Prompted (no echo) if omitted.
         #[arg(long)]
         value: Option<String>,
+        /// Replace the value in place if the name already exists (rotation),
+        /// instead of failing. Without it, adding an existing name is refused so
+        /// a secret is never silently shadowed.
+        #[arg(long)]
+        force: bool,
         /// Unlock passphrase. Prompted if omitted.
         #[arg(long)]
         passphrase: Option<String>,
         /// Unlock via the recovery escrow instead of TPM+passphrase.
         #[arg(long)]
         recovery: bool,
+        #[arg(long, requires = "recovery")]
+        recovery_passphrase: Option<String>,
+    },
+    /// Remove a secret record.
+    Rm {
+        /// Record name to remove.
+        name: String,
+        /// Unlock passphrase. Prompted if omitted.
         #[arg(long)]
+        passphrase: Option<String>,
+        /// Unlock via the recovery escrow instead of TPM+passphrase.
+        #[arg(long)]
+        recovery: bool,
+        #[arg(long, requires = "recovery")]
         recovery_passphrase: Option<String>,
     },
     /// Retrieve a secret; prints to stdout, or copies to the clipboard with --clip.
@@ -99,7 +117,7 @@ enum Cmd {
         /// Unlock via the recovery escrow instead of TPM+passphrase.
         #[arg(long)]
         recovery: bool,
-        #[arg(long)]
+        #[arg(long, requires = "recovery")]
         recovery_passphrase: Option<String>,
     },
     /// List record names (no DEK needed).
@@ -187,7 +205,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             // Stateless: there is no on-disk session to clear.
             println!("locked");
         }
-        Cmd::Add { name, value, passphrase, recovery, recovery_passphrase } => {
+        Cmd::Add { name, value, force, passphrase, recovery, recovery_passphrase } => {
             let locked = LockedVault::load(path)?;
             let mut vault = unlock_vault(locked, passphrase, recovery, recovery_passphrase)?;
             let value = match value {
@@ -197,9 +215,26 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 None => prompt::read_secret_noecho("value: ")?,
             };
-            vault.add(&name, SecretString::from_string(value))?;
+            let secret = SecretString::from_string(value);
+            if force {
+                vault.upsert(&name, secret)?;
+            } else {
+                // Fails closed with Error::Duplicate if the name exists, so a
+                // second `add` can never silently shadow an existing secret.
+                vault.add(&name, secret)?;
+            }
             vault.save(path)?;
-            println!("added {name}");
+            println!("{} {name}", if force { "set" } else { "added" });
+        }
+        Cmd::Rm { name, passphrase, recovery, recovery_passphrase } => {
+            let locked = LockedVault::load(path)?;
+            let mut vault = unlock_vault(locked, passphrase, recovery, recovery_passphrase)?;
+            if vault.remove(&name) {
+                vault.save(path)?;
+                println!("removed {name}");
+            } else {
+                return Err(Box::new(Error::NotFound(name)));
+            }
         }
         Cmd::Get { name, clip, passphrase, recovery, recovery_passphrase } => {
             let locked = LockedVault::load(path)?;

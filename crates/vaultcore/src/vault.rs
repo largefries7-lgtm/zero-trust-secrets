@@ -13,6 +13,18 @@ use crate::{Error, Result};
 use std::path::Path;
 
 const MAGIC: [u8; 4] = *b"ZTSV";
+
+// Upper bounds on the Argon2id cost parameters accepted from a vault header.
+// These parameters are attacker-controllable (they live in the untrusted header
+// and MUST be consumed to derive the KEK *before* the header MAC can be checked),
+// so an unbounded `mem_kib`/`time` would let a hostile `.ztsv` force a
+// multi-hundred-GiB allocation or unbounded compute at unlock -- a pre-auth
+// memory/CPU DoS. The ceilings are generous versus `default_tuned` (64 MiB / t=3)
+// yet keep the worst case survivable. A header outside these bounds is rejected
+// at parse time, before any Argon2 work happens.
+const MAX_ARGON2_MEM_KIB: u32 = 1 << 20; // 1 GiB
+const MAX_ARGON2_TIME: u32 = 64;
+const MAX_ARGON2_PARALLELISM: u32 = 64;
 /// Current on-disk format version. v2 = two-factor envelope (see `envelope.rs`).
 /// v1 (single-factor: TPM-wraps-DEK *or* passphrase-wraps-DEK) is no longer read
 /// by the hot path; `vaultctl migrate` upgrades a v1 file to v2.
@@ -246,10 +258,24 @@ impl<'a> Cursor<'a> {
         Ok(self.take(n)?.to_vec())
     }
     fn argon2(&mut self) -> Result<Argon2Params> {
+        let mem_kib = self.u32()?;
+        let time = self.u32()?;
+        let parallelism = self.u32()?;
+        // Reject implausible cost parameters before they can drive an Argon2
+        // allocation/compute on the pre-authentication unlock path (DoS).
+        if mem_kib > MAX_ARGON2_MEM_KIB
+            || time > MAX_ARGON2_TIME
+            || parallelism > MAX_ARGON2_PARALLELISM
+        {
+            return Err(Error::Format(format!(
+                "argon2 parameters out of range (mem_kib={mem_kib}, time={time}, \
+                 parallelism={parallelism})"
+            )));
+        }
         Ok(Argon2Params {
-            mem_kib: self.u32()?,
-            time: self.u32()?,
-            parallelism: self.u32()?,
+            mem_kib,
+            time,
+            parallelism,
             salt: self
                 .take(16)?
                 .try_into()
@@ -411,7 +437,38 @@ impl Vault {
         a
     }
 
+    /// Add a NEW secret. Fails with [`Error::Duplicate`] if `name` already
+    /// exists, so a second `add` can never silently shadow an existing record
+    /// (the read path returns the first match, which would otherwise make the
+    /// new value permanently unreachable). Use [`Vault::upsert`] to rotate a
+    /// secret in place.
     pub fn add(&mut self, name: &str, value: SecretString) -> Result<()> {
+        if self.records.iter().any(|r| r.name == name) {
+            return Err(Error::Duplicate(name.to_string()));
+        }
+        self.insert_record(name, value)
+    }
+
+    /// Add `name`, or replace it in place if it already exists (rotation). Any
+    /// pre-existing record(s) with this name are removed first, so the result is
+    /// exactly one record for `name` holding the new value.
+    pub fn upsert(&mut self, name: &str, value: SecretString) -> Result<()> {
+        self.records.retain(|r| r.name != name);
+        self.insert_record(name, value)
+    }
+
+    /// Remove every record named `name`. Returns `true` if anything was removed.
+    /// The change is persisted (and the header MAC recomputed) by the next
+    /// [`Vault::save`].
+    pub fn remove(&mut self, name: &str) -> bool {
+        let before = self.records.len();
+        self.records.retain(|r| r.name != name);
+        self.records.len() != before
+    }
+
+    /// Encrypt `value` under a fresh per-record key and append it. Assumes the
+    /// caller has already enforced whatever name-uniqueness policy applies.
+    fn insert_record(&mut self, name: &str, value: SecretString) -> Result<()> {
         let dek = self.dek()?;
         let mut idb = [0u8; 16];
         rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut idb);
@@ -432,7 +489,7 @@ impl Vault {
             .records
             .iter()
             .find(|r| r.name == name)
-            .ok_or_else(|| Error::Format("no such record".into()))?;
+            .ok_or_else(|| Error::NotFound(name.to_string()))?;
         let rk = Self::record_key(dek, rec.id);
         let pt = crypto::aead_open(
             &rk,
@@ -469,13 +526,15 @@ impl Vault {
     /// `u32 len(header) || header_bytes || u32 num_records ||
     ///  [ id(16 LE) || u32 len(name) || name_utf8 || u32 len(ct) || ct ]*`
     ///
-    /// Writes are atomic: the serialized vault is written to a unique temp
-    /// file in the same directory as `path`, then renamed into place.
-    /// `std::fs::rename` replaces the destination atomically (on both
-    /// Windows and Unix, within a single filesystem), so a crash mid-write
-    /// leaves the previous vault file intact instead of a truncated/corrupt
-    /// one -- important here since the wrapped DEK lives only in this file's
-    /// header, so a partial write would otherwise be unrecoverable data loss.
+    /// Writes are atomic and durable: the serialized vault is written to a
+    /// unique temp file in the same directory as `path`, `fsync`ed, then renamed
+    /// into place. `std::fs::rename` replaces the destination atomically (on both
+    /// Windows and Unix, within a single filesystem), so the previous vault file
+    /// stays intact until the new one is fully on disk. The `sync_all` before the
+    /// rename is what makes this power-loss-safe and not merely crash-safe:
+    /// without it a power failure could commit the rename while the temp file's
+    /// data blocks were still unflushed, destroying the only copy of the wrapped
+    /// DEK (which lives solely in this file's header).
     pub fn save(&self, path: &Path) -> Result<()> {
         let dek = self.dek()?;
 
@@ -491,14 +550,24 @@ impl Vault {
         }
 
         let tmp = Self::temp_path_for(path);
-        if let Err(e) = std::fs::write(&tmp, &out) {
+        if let Err(e) = Self::write_synced(&tmp, &out) {
             let _ = std::fs::remove_file(&tmp);
-            return Err(e.into());
+            return Err(e);
         }
         if let Err(e) = std::fs::rename(&tmp, path) {
             let _ = std::fs::remove_file(&tmp);
             return Err(e.into());
         }
+        Ok(())
+    }
+
+    /// Write `bytes` to `path` and `fsync` the file (data + metadata) before
+    /// returning, so a following rename produces a durable, fully-written file.
+    fn write_synced(path: &Path, bytes: &[u8]) -> Result<()> {
+        use std::io::Write;
+        let mut f = std::fs::File::create(path)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
         Ok(())
     }
 
@@ -600,6 +669,72 @@ mod tests {
         ];
         assert!(!h.verify_mac(&dek, &swapped));
         assert!(h.verify_mac(&dek, &two));
+    }
+
+    #[test]
+    fn add_rejects_duplicate_name() {
+        // F1: adding an existing name must NOT silently shadow. The original
+        // value stays reachable; no duplicate is created.
+        let dek = SecretBytes::from_exact(&[5u8; 32]);
+        let mut v = Vault::new_unlocked(dek, test_header());
+        v.add("email", SecretString::from_string("first".into())).unwrap();
+        let dup = v.add("email", SecretString::from_string("second".into()));
+        assert!(matches!(dup, Err(crate::Error::Duplicate(_))));
+        assert_eq!(v.list(), vec!["email"]);
+        assert_eq!(v.get("email").unwrap().expose_str(), "first");
+    }
+
+    #[test]
+    fn upsert_replaces_existing_and_adds_new() {
+        // F1: upsert rotates a secret in place (get returns the new value, no
+        // duplicate) and also adds when the name is absent.
+        let dek = SecretBytes::from_exact(&[5u8; 32]);
+        let mut v = Vault::new_unlocked(dek, test_header());
+        v.add("email", SecretString::from_string("old".into())).unwrap();
+        v.upsert("email", SecretString::from_string("new".into())).unwrap();
+        assert_eq!(v.list(), vec!["email"]);
+        assert_eq!(v.get("email").unwrap().expose_str(), "new");
+
+        v.upsert("bank", SecretString::from_string("1234".into())).unwrap();
+        assert_eq!(v.get("bank").unwrap().expose_str(), "1234");
+    }
+
+    #[test]
+    fn remove_deletes_record_and_is_idempotent() {
+        // F1: removing a record makes it unreadable (NotFound); removing a
+        // missing name is a no-op that reports "nothing removed".
+        let dek = SecretBytes::from_exact(&[5u8; 32]);
+        let mut v = Vault::new_unlocked(dek, test_header());
+        v.add("email", SecretString::from_string("a".into())).unwrap();
+        assert!(v.remove("email"));
+        assert!(matches!(v.get("email"), Err(crate::Error::NotFound(_))));
+        assert!(!v.remove("email"));
+    }
+
+    #[test]
+    fn load_rejects_out_of_range_argon2_params() {
+        // F2: absurd KDF cost parameters from an untrusted header must be
+        // rejected at parse time, BEFORE they can be fed to Argon2 (which would
+        // otherwise attempt a multi-hundred-GiB allocation / unbounded compute
+        // pre-authentication -- a memory/CPU DoS).
+        let mut h = test_header();
+        h.kdf.mem_kib = u32::MAX;
+        assert!(matches!(
+            VaultHeader::from_bytes(&h.to_bytes()),
+            Err(crate::Error::Format(_))
+        ));
+
+        let mut h = test_header();
+        h.kdf.time = u32::MAX;
+        assert!(matches!(
+            VaultHeader::from_bytes(&h.to_bytes()),
+            Err(crate::Error::Format(_))
+        ));
+
+        // A normal, default-tuned parameter set still parses fine.
+        let mut h = test_header();
+        h.kdf = Argon2Params::default_tuned();
+        assert!(VaultHeader::from_bytes(&h.to_bytes()).is_ok());
     }
 
     #[test]
