@@ -89,7 +89,11 @@ impl VaultHeader {
                 .map_err(|_| Error::Format("salt".into()))?,
         };
         let npcr = c.u32()? as usize;
-        let mut pcr_selection = Vec::with_capacity(npcr.min(1 << 20));
+        // Do NOT pre-allocate from the untrusted `npcr`: like the record count,
+        // a tiny file claiming a huge PCR count would otherwise force a large
+        // up-front allocation before parsing fails. Grow as entries parse; each
+        // `c.u32()` is bounds-checked, so work is bounded by the real file size.
+        let mut pcr_selection = Vec::new();
         for _ in 0..npcr {
             pcr_selection.push(c.u32()?);
         }
