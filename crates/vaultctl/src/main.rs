@@ -7,6 +7,7 @@
 //! There is no on-disk session, so `lock` is a no-op for symmetry.
 
 mod clip;
+mod prompt;
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -44,9 +45,11 @@ enum Cmd {
         /// Skip TPM hardware binding; protect the vault by recovery passphrase only.
         #[arg(long)]
         allow_no_tpm: bool,
-        /// Recovery passphrase used to escrow the DEK (Argon2id).
+        /// Recovery passphrase used to escrow the DEK (Argon2id). If omitted, you
+        /// are prompted interactively (no echo). Passing it here exposes it via
+        /// the process list — prefer the prompt.
         #[arg(long)]
-        recovery_passphrase: String,
+        recovery_passphrase: Option<String>,
     },
     /// Stateless credential smoke-check: obtain the DEK, verify the MAC, drop it.
     Unlock {
@@ -141,14 +144,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.cmd {
         Cmd::Init { allow_no_tpm, recovery_passphrase } => {
-            cmd_init(path, allow_no_tpm, recovery_passphrase)?;
+            let pw = resolve_new_passphrase(recovery_passphrase)?;
+            cmd_init(path, allow_no_tpm, pw)?;
         }
         Cmd::Unlock { recovery_passphrase } => {
             let locked = LockedVault::load(path)?;
-            let dek = obtain_dek(
-                locked.header(),
-                recovery_passphrase.map(SecretString::from_string),
-            )?;
+            let pw = resolve_recovery_pw(locked.header().hardware_bound, recovery_passphrase)?;
+            let dek = obtain_dek(locked.header(), pw)?;
             // unlock_with_dek verifies the header MAC and fails closed.
             let _vault = locked.unlock_with_dek(dek)?;
             println!("unlock OK");
@@ -159,14 +161,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         Cmd::Add { name, value, recovery_passphrase } => {
             let locked = LockedVault::load(path)?;
-            let dek = obtain_dek(
-                locked.header(),
-                recovery_passphrase.map(SecretString::from_string),
-            )?;
+            let pw = resolve_recovery_pw(locked.header().hardware_bound, recovery_passphrase)?;
+            let dek = obtain_dek(locked.header(), pw)?;
             let mut vault = locked.unlock_with_dek(dek)?;
             let value = match value {
-                Some(v) => v,
-                None => read_secret_line("value: ")?,
+                Some(v) => {
+                    eprintln!("warning: passing --value on the command line exposes it via the process list; prefer interactive entry");
+                    v
+                }
+                None => prompt::read_secret_noecho("value: ")?,
             };
             vault.add(&name, SecretString::from_string(value))?;
             vault.save(path)?;
@@ -174,10 +177,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         Cmd::Get { name, clip, recovery_passphrase } => {
             let locked = LockedVault::load(path)?;
-            let dek = obtain_dek(
-                locked.header(),
-                recovery_passphrase.map(SecretString::from_string),
-            )?;
+            let pw = resolve_recovery_pw(locked.header().hardware_bound, recovery_passphrase)?;
+            let dek = obtain_dek(locked.header(), pw)?;
             let vault = locked.unlock_with_dek(dek)?;
             let secret = vault.get(&name)?;
             if clip {
@@ -458,18 +459,47 @@ fn active_provider_describe(header: &VaultHeader) -> String {
     format!("{recovery} — NO hardware binding")
 }
 
-/// Prompt on stderr and read a line from stdin. No-echo is not available without
-/// a new dependency, so this is a plain read for slice 1 (the primary path used
-/// by tests and scripts is `--value`).
-fn read_secret_line(prompt: &str) -> std::io::Result<String> {
-    eprint!("{prompt}");
-    std::io::stderr().flush()?;
-    let mut line = String::new();
-    std::io::stdin().read_line(&mut line)?;
-    while line.ends_with('\n') || line.ends_with('\r') {
-        line.pop();
+/// Resolve a NEW recovery passphrase for `init`. If supplied on argv, warn
+/// (argv is world-readable) and use it; otherwise prompt twice (no echo) and
+/// require the two entries to match. Rejects an empty passphrase.
+fn resolve_new_passphrase(
+    provided: Option<String>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    if let Some(v) = provided {
+        eprintln!("warning: passing --recovery-passphrase on the command line exposes it via the process list; prefer the interactive prompt");
+        if v.is_empty() {
+            return Err("recovery passphrase must not be empty".into());
+        }
+        return Ok(v);
     }
-    Ok(line)
+    let pw = prompt::read_secret_noecho("new recovery passphrase: ")?;
+    if pw.is_empty() {
+        return Err("recovery passphrase must not be empty".into());
+    }
+    let confirm = prompt::read_secret_noecho("confirm recovery passphrase: ")?;
+    if pw != confirm {
+        return Err("passphrases did not match".into());
+    }
+    Ok(pw)
+}
+
+/// Resolve the recovery passphrase for an unlock-path command (unlock/add/get).
+/// If supplied on argv, warn and use it. If absent and the vault is NOT
+/// hardware-bound, prompt for it without echo. If absent and hardware-bound,
+/// return `None` — the TPM path needs no passphrase.
+fn resolve_recovery_pw(
+    hardware_bound: bool,
+    provided: Option<String>,
+) -> std::io::Result<Option<SecretString>> {
+    if let Some(v) = provided {
+        eprintln!("warning: passing --recovery-passphrase on the command line exposes it via the process list; prefer interactive entry");
+        return Ok(Some(SecretString::from_string(v)));
+    }
+    if hardware_bound {
+        return Ok(None);
+    }
+    let pw = prompt::read_secret_noecho("recovery passphrase: ")?;
+    Ok(Some(SecretString::from_string(pw)))
 }
 
 /// Generate a password from a CSPRNG (via `SecretBytes::generate`, OsRng-backed).
