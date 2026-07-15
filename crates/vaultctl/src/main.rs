@@ -87,6 +87,12 @@ enum Cmd {
     },
     /// Report hardware-binding status of the vault (no DEK needed).
     SealStatus,
+    /// Delete the persisted TPM wrapping key (DESTRUCTIVE — see confirmation).
+    Deprovision {
+        /// Skip the interactive confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
 
     // --- Verification-harness-only subcommands (feature-gated) ---------------
     // These are compiled ONLY under `--features leaktest`; a normal production
@@ -195,6 +201,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let secret = SecretString::from_string(password);
             println!("{}", secret.expose_str());
             eprintln!("~{bits:.0} bits of entropy");
+        }
+        Cmd::Deprovision { yes } => {
+            cmd_deprovision(yes)?;
         }
         Cmd::SealStatus => {
             let locked = LockedVault::load(path)?;
@@ -348,6 +357,39 @@ fn cmd_init(
 
     println!("initialized vault at {}", path.display());
     Ok(())
+}
+
+/// Delete the persisted TPM wrapping key. Destructive: requires typed
+/// confirmation (or `--yes`), because it renders every TPM-bound vault on this
+/// machine undecryptable via the TPM (a vault's recovery passphrase still works).
+fn cmd_deprovision(yes: bool) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(windows)]
+    {
+        if !yes {
+            eprintln!("WARNING: this deletes the machine's TPM wrapping key.");
+            eprintln!("Every TPM-bound vault becomes undecryptable via the TPM afterward");
+            eprintln!("(a vault's recovery passphrase, if set, still works).");
+            eprint!("Type DELETE to confirm: ");
+            std::io::stderr().flush()?;
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line)?;
+            if line.trim() != "DELETE" {
+                println!("aborted");
+                return Ok(());
+            }
+        }
+        match CngPcpProvider::deprovision()? {
+            true => println!("TPM wrapping key deleted"),
+            false => println!("no TPM wrapping key present (nothing to delete)"),
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = yes;
+        println!("no TPM provider on this platform (nothing to deprovision)");
+        Ok(())
+    }
 }
 
 /// Obtain the DEK without persisting it. TPM unseal for hardware-bound vaults,

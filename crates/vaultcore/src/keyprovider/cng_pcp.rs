@@ -19,11 +19,11 @@ use zeroize::Zeroize;
 
 use windows::Win32::Foundation::NTE_EXISTS;
 use windows::Win32::Security::Cryptography::{
-    NCryptCreatePersistedKey, NCryptDecrypt, NCryptEncrypt, NCryptFinalizeKey, NCryptFreeObject,
-    NCryptOpenKey, NCryptOpenStorageProvider, NCryptSetProperty, BCRYPT_OAEP_PADDING_INFO,
-    BCRYPT_RSA_ALGORITHM, BCRYPT_SHA256_ALGORITHM, CERT_KEY_SPEC, MS_PLATFORM_CRYPTO_PROVIDER,
-    NCRYPT_FLAGS, NCRYPT_KEY_HANDLE, NCRYPT_LENGTH_PROPERTY, NCRYPT_PAD_OAEP_FLAG,
-    NCRYPT_PROV_HANDLE,
+    NCryptCreatePersistedKey, NCryptDecrypt, NCryptDeleteKey, NCryptEncrypt, NCryptFinalizeKey,
+    NCryptFreeObject, NCryptOpenKey, NCryptOpenStorageProvider, NCryptSetProperty,
+    BCRYPT_OAEP_PADDING_INFO, BCRYPT_RSA_ALGORITHM, BCRYPT_SHA256_ALGORITHM, CERT_KEY_SPEC,
+    MS_PLATFORM_CRYPTO_PROVIDER, NCRYPT_FLAGS, NCRYPT_KEY_HANDLE, NCRYPT_LENGTH_PROPERTY,
+    NCRYPT_PAD_OAEP_FLAG, NCRYPT_PROV_HANDLE,
 };
 
 /// Name of the persisted TPM-resident wrapping key.
@@ -116,6 +116,51 @@ impl CngPcpProvider {
         }
 
         Ok(key)
+    }
+
+    /// Delete the persisted TPM wrapping key from the platform key store.
+    ///
+    /// DESTRUCTIVE: every vault whose `tpm_wrap` was produced by this key becomes
+    /// undecryptable via the TPM afterwards (a vault's recovery passphrase, if
+    /// set, still works). Returns `Ok(true)` if a key was deleted, `Ok(false)` if
+    /// none was present (idempotent). A subsequent `open()`/`init` recreates a
+    /// FRESH keypair under the same name — it does not resurrect the old one.
+    pub fn deprovision() -> Result<bool> {
+        let mut prov = NCRYPT_PROV_HANDLE::default();
+        // SAFETY: `prov` is a valid out-pointer; provider name is a 'static wide
+        // string; flags are 0. Only `*prov` is written.
+        unsafe { NCryptOpenStorageProvider(&mut prov, MS_PLATFORM_CRYPTO_PROVIDER, 0) }
+            .map_err(|e| prov_err("NCryptOpenStorageProvider", &e))?;
+
+        let deleted = match Self::try_open_key(prov) {
+            Some(key) => {
+                // SAFETY: `key` is a live handle just opened by try_open_key.
+                // NCryptDeleteKey deletes the persisted key AND frees the handle,
+                // so we must NOT call NCryptFreeObject on `key` afterwards.
+                match unsafe { NCryptDeleteKey(key, 0) } {
+                    Ok(()) => true,
+                    Err(e) => {
+                        // On failure the handle may still be live; free it.
+                        // SAFETY: `key` is the live handle from try_open_key.
+                        unsafe {
+                            let _ = NCryptFreeObject(key);
+                        }
+                        // SAFETY: `prov` is the live provider handle from above.
+                        unsafe {
+                            let _ = NCryptFreeObject(prov);
+                        }
+                        return Err(prov_err("NCryptDeleteKey", &e));
+                    }
+                }
+            }
+            None => false,
+        };
+
+        // SAFETY: `prov` is the live provider handle from open; freed exactly once.
+        unsafe {
+            let _ = NCryptFreeObject(prov);
+        }
+        Ok(deleted)
     }
 
     /// Try to open the persisted key; `None` on any failure (e.g. not-found).
