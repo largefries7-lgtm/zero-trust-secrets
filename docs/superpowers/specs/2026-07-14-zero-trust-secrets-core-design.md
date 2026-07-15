@@ -433,3 +433,39 @@ defended/not-defended lists in §3 where they differ.
 - **PCR-policy sealing, encrypted metadata names, clipboard history/cloud-sync exclusion, key
   rotation, Argon2id auto-calibration, `save` orphan-temp reaper** — real improvements, tracked as
   future work; none is a currently-exploitable hole.
+
+---
+
+## 17. Audit-fix pass (2026-07-16)
+
+A read-only deep audit of this branch was followed by fixes for the findings it surfaced. As-built
+deltas below are authoritative and refine §§6, 9, 16:
+
+- **Record management (was: silent shadowing).** `add` now fails closed (`Error::Duplicate`) instead
+  of appending an unreachable same-name record; `vaultctl add --force` (→ `Vault::upsert`) rotates a
+  secret in place and `vaultctl rm` (→ `Vault::remove`) deletes one; `get` returns `Error::NotFound`.
+  Credential rotation now works — previously a re-add left the *old* value as the one `get` returned,
+  with no way to reach the new one or remove the old.
+- **KDF parameters bounded at parse (DoS).** Argon2 `mem_kib`/`time`/`parallelism` from the untrusted
+  header are range-checked in the codec (≤ 1 GiB / 64 / 64) before they can drive an allocation or
+  compute on the pre-authentication unlock path. They must be consumed to derive the KEK *before* the
+  DEK-keyed header MAC can be verified, so bounding at parse is the only place to stop a hostile file
+  from forcing an OOM/hang.
+- **`save` is durable, not merely crash-safe.** The temp file is `fsync`ed before the rename, closing
+  the power-loss window that could otherwise commit a rename over unflushed data and destroy the only
+  copy of the wrapped DEK.
+- **Optimistic concurrency.** A vault loaded from disk records a SHA-256 fingerprint; `save` refuses
+  (rather than silently clobbers) if the file changed since load — a concurrent lost-update becomes a
+  loud, recoverable error.
+- **`--recovery-passphrase` requires `--recovery`** (was silently ignored), so a user can no longer
+  believe an escrow exists when it does not.
+- **Unauthenticated-read commands say so.** `list`/`seal-status` read header metadata without the DEK
+  and cannot verify the MAC; they now print a note that the data is unauthenticated until unlock (a
+  real unlock still fails closed on tamper).
+- **Password-generator hygiene.** `gen` builds into a page-locked, zeroize-on-drop buffer instead of
+  an ordinary `String`.
+- **Supply-chain policy enforced.** `.github/workflows/ci.yml` runs the tests, `cargo deny check`, and
+  `cargo audit` on every push/PR, realizing SECURITY.md's "run in CI" intent.
+
+Still deferred: PCR-policy sealing, encrypted metadata names, KEK/recovery-key rotation, Argon2id
+auto-calibration, and the `save` orphan-temp reaper.

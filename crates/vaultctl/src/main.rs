@@ -253,12 +253,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             for name in locked.record_names() {
                 println!("{name}");
             }
+            // `list` reads names without the DEK, so the header MAC cannot be
+            // checked here: the names shown are unauthenticated until an unlock
+            // (get/unlock) verifies the MAC. Flag that on stderr so stdout stays
+            // pipe-clean but the trust boundary is never silently elided.
+            eprintln!(
+                "note: names are unauthenticated metadata read without unlocking; \
+                 tampering is detected only at unlock (get/unlock)"
+            );
         }
         Cmd::Gen { len, symbols } => {
-            let (password, charset_size) = gen_password(len, symbols);
+            let (secret, charset_size) = gen_password(len, symbols);
             let bits = (len as f64) * (charset_size as f64).log2();
-            // Wrap so the buffer zeroizes; print via expose_str().
-            let secret = SecretString::from_string(password);
             println!("{}", secret.expose_str());
             eprintln!("~{bits:.0} bits of entropy");
         }
@@ -291,6 +297,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     "warning: recovery escrow is enabled; a stolen vault is only as strong as the recovery passphrase"
                 );
             }
+            // These fields are read straight from the header without the DEK, so
+            // the header MAC is not verified here: on a tampered file they can be
+            // misleading. Any real unlock still fails closed on tamper.
+            eprintln!(
+                "note: the fields above are read without unlocking and are not \
+                 authenticated until unlock; a real unlock still fails closed on tamper"
+            );
         }
 
         // --- Verification-harness-only subcommands (feature-gated) -----------
@@ -419,7 +432,7 @@ fn cmd_init(
 
     let header = VaultHeader::new_v2(hardware_bound, kdf, tpm_wrap, dek_wrap, recovery_pair);
     // Zero records; save() computes and writes the header MAC, then the DEK drops.
-    let vault = Vault::new_unlocked(dek, header);
+    let mut vault = Vault::new_unlocked(dek, header);
     vault.save(path)?;
 
     if !hardware_bound {
@@ -598,8 +611,10 @@ fn resolve_unlock_pw(label: &str, provided: Option<String>) -> std::io::Result<S
 
 /// Generate a password from a CSPRNG (via `SecretBytes::generate`, OsRng-backed).
 /// Uses rejection sampling so each character is uniform over the charset, keeping
-/// the reported entropy honest. Returns the password and the charset size.
-fn gen_password(len: usize, symbols: bool) -> (String, usize) {
+/// the reported entropy honest. The password is built directly in a page-locked,
+/// zeroize-on-drop buffer (never an ordinary `String`), and returned as a
+/// `SecretString` alongside the charset size.
+fn gen_password(len: usize, symbols: bool) -> (SecretString, usize) {
     const LOWER: &[u8] = b"abcdefghijklmnopqrstuvwxyz";
     const UPPER: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ";
     const DIGITS: &[u8] = b"0123456789";
@@ -618,21 +633,28 @@ fn gen_password(len: usize, symbols: bool) -> (String, usize) {
     // avoid modulo bias.
     let threshold = (256 / n) * n;
 
-    let mut out = String::with_capacity(len);
-    while out.len() < len {
-        let need = len - out.len();
+    // Fill an exact-length, page-locked secret buffer in place -- no plaintext
+    // password ever lives in an unlocked, un-scrubbed heap allocation.
+    let mut out = SecretBytes::zeros(len);
+    let mut filled = 0usize;
+    while filled < len {
+        let need = len - filled;
         // Over-provision to reduce the number of CSPRNG draws.
         let batch = SecretBytes::generate(need.saturating_mul(2).max(16));
         for &b in batch.expose() {
-            if out.len() == len {
+            if filled == len {
                 break;
             }
             let b = b as usize;
             if b < threshold {
-                out.push(charset[b % n] as char);
+                out.expose_mut()[filled] = charset[b % n];
+                filled += 1;
             }
         }
         // batch (SecretBytes) drops here -> zeroized.
     }
-    (out, n)
+    // `out` is exactly `len` ASCII bytes, hence valid UTF-8; wrap it in place.
+    let secret = SecretString::from_secret_bytes(out)
+        .expect("generated password is ASCII (valid UTF-8)");
+    (secret, n)
 }

@@ -200,11 +200,58 @@ fn init_refuses_to_clobber_existing_vault() {
 }
 
 #[test]
+fn list_flags_names_as_unauthenticated_metadata() {
+    let dir = unique_dir("list-unauth");
+    let v = dir.join("v.ztsv");
+    let vs = v.to_str().unwrap();
+
+    assert!(bin()
+        .args(["--vault", vs, "init", "--allow-no-tpm", "--passphrase", "pw"])
+        .status()
+        .unwrap()
+        .success());
+    assert!(bin()
+        .args(["--vault", vs, "add", "email", "--value", "x", "--passphrase", "pw"])
+        .status()
+        .unwrap()
+        .success());
+
+    let out = bin().args(["--vault", vs, "list"]).output().unwrap();
+    assert!(out.status.success());
+    // Names stay on clean stdout (pipe-friendly)...
+    assert!(String::from_utf8_lossy(&out.stdout).contains("email"));
+    // ...and the trust-boundary advisory goes to stderr, so `list` never
+    // presents unauthenticated names as if they were verified.
+    let stderr = String::from_utf8_lossy(&out.stderr).to_lowercase();
+    assert!(
+        stderr.contains("unauthenticated"),
+        "list should flag names as unauthenticated; stderr was: {stderr:?}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn gen_produces_password_of_requested_length() {
     let out = bin().args(["gen", "--len", "24"]).output().unwrap();
     assert!(out.status.success());
     let pw = String::from_utf8_lossy(&out.stdout);
     assert_eq!(pw.trim().len(), 24);
+}
+
+#[test]
+fn gen_without_symbols_is_alphanumeric_and_exact_length() {
+    // Pins the observable behavior of `gen` (used to guard the F7 refactor that
+    // generates directly into a page-locked buffer instead of a plain String).
+    let out = bin().args(["gen", "--len", "48"]).output().unwrap();
+    assert!(out.status.success());
+    let pw = String::from_utf8_lossy(&out.stdout);
+    let pw = pw.trim();
+    assert_eq!(pw.chars().count(), 48);
+    assert!(
+        pw.chars().all(|c| c.is_ascii_alphanumeric()),
+        "default charset must be alphanumeric: {pw}"
+    );
 }
 
 #[test]

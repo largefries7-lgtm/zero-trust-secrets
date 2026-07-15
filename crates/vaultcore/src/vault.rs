@@ -74,6 +74,16 @@ fn put_argon2(b: &mut Vec<u8>, p: &Argon2Params) {
     b.extend_from_slice(&p.salt);
 }
 
+/// SHA-256 fingerprint of the raw vault-file bytes, used only for
+/// optimistic-concurrency detection in `save` (loud-fail on a concurrent
+/// overwrite). This is not a security control -- integrity is the header MAC.
+fn file_fingerprint(bytes: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(bytes);
+    h.finalize().into()
+}
+
 impl VaultHeader {
     /// Serialize the v2 header. `header_mac` is written as-is (callers zero it
     /// before computing the MAC over these bytes).
@@ -321,6 +331,9 @@ enum State {
 pub struct LockedVault {
     header: VaultHeader,
     records: Vec<Record>,
+    /// SHA-256 of the exact bytes read from disk, for optimistic-concurrency
+    /// detection when a derived `Vault` is later saved (see `Vault::save`).
+    fingerprint: [u8; 32],
 }
 
 impl LockedVault {
@@ -328,6 +341,7 @@ impl LockedVault {
     /// without authenticating or decrypting anything.
     pub fn load(path: &Path) -> Result<LockedVault> {
         let data = std::fs::read(path)?;
+        let fingerprint = file_fingerprint(&data);
         let mut c = Cursor { d: &data, i: 0 };
         let header_len = c.u32()? as usize;
         let header_bytes = c.take(header_len)?;
@@ -343,7 +357,7 @@ impl LockedVault {
         for _ in 0..num_records {
             records.push(Record::from_cursor(&mut c)?);
         }
-        Ok(LockedVault { header, records })
+        Ok(LockedVault { header, records, fingerprint })
     }
 
     /// Verify the header MAC against the supplied DEK and, on success,
@@ -357,6 +371,7 @@ impl LockedVault {
             header: self.header,
             records: self.records,
             state: State::Unlocked(dek),
+            loaded_fingerprint: Some(self.fingerprint),
         })
     }
 
@@ -407,11 +422,20 @@ pub struct Vault {
     header: VaultHeader,
     records: Vec<Record>,
     state: State,
+    /// SHA-256 of the file this vault was loaded from, or `None` for a vault
+    /// built in memory (`new_unlocked`). Drives the optimistic-concurrency
+    /// check in `save`.
+    loaded_fingerprint: Option<[u8; 32]>,
 }
 
 impl Vault {
     pub fn new_unlocked(dek: SecretBytes, header: VaultHeader) -> Self {
-        Vault { header, records: Vec::new(), state: State::Unlocked(dek) }
+        Vault {
+            header,
+            records: Vec::new(),
+            state: State::Unlocked(dek),
+            loaded_fingerprint: None,
+        }
     }
     fn dek(&self) -> Result<&SecretBytes> {
         match &self.state {
@@ -535,7 +559,7 @@ impl Vault {
     /// without it a power failure could commit the rename while the temp file's
     /// data blocks were still unflushed, destroying the only copy of the wrapped
     /// DEK (which lives solely in this file's header).
-    pub fn save(&self, path: &Path) -> Result<()> {
+    pub fn save(&mut self, path: &Path) -> Result<()> {
         let dek = self.dek()?;
 
         let mut header = self.header.clone();
@@ -549,6 +573,23 @@ impl Vault {
             r.to_bytes(&mut out);
         }
 
+        // Optimistic concurrency (F6): if this vault was loaded from disk and the
+        // file has since changed, another writer modified it after our load.
+        // Refuse rather than silently overwrite their change (a lost update).
+        // This narrows the race to the window between this check and the rename.
+        if let Some(expected) = self.loaded_fingerprint {
+            if let Ok(current) = std::fs::read(path) {
+                if file_fingerprint(&current) != expected {
+                    return Err(Error::Provider(
+                        "vault changed on disk since it was loaded; aborting to avoid \
+                         overwriting a concurrent modification"
+                            .into(),
+                    ));
+                }
+            }
+            // If the file is gone, there is nothing to clobber; proceed.
+        }
+
         let tmp = Self::temp_path_for(path);
         if let Err(e) = Self::write_synced(&tmp, &out) {
             let _ = std::fs::remove_file(&tmp);
@@ -558,6 +599,10 @@ impl Vault {
             let _ = std::fs::remove_file(&tmp);
             return Err(e.into());
         }
+        // The file now holds exactly `out`; refresh the fingerprint so a later
+        // save from this same (long-lived) vault compares against what we just
+        // wrote rather than the stale load-time contents.
+        self.loaded_fingerprint = Some(file_fingerprint(&out));
         Ok(())
     }
 
@@ -859,6 +904,34 @@ mod tests {
         let r = LockedVault::load(&path);
         std::fs::remove_file(&path).ok();
         assert!(matches!(r, Err(crate::Error::Format(_))));
+    }
+
+    #[test]
+    fn save_aborts_if_vault_changed_on_disk_since_load() {
+        // F6: optimistic concurrency. A vault loaded from disk records a
+        // fingerprint of what it read; if another writer changes the file before
+        // we save, `save` must refuse rather than silently clobber that change.
+        let dek = SecretBytes::from_exact(&[11u8; 32]);
+        let mut v = Vault::new_unlocked(dek, test_header());
+        v.add("email", SecretString::from_string("v1".into())).unwrap();
+
+        let mut path = std::env::temp_dir();
+        path.push(format!("vaultcore_test_optconc_{}.ztsv", std::process::id()));
+        v.save(&path).unwrap();
+
+        // Reopen from disk (captures the on-disk fingerprint).
+        let loaded = LockedVault::load(&path).unwrap();
+        let dek2 = SecretBytes::from_exact(&[11u8; 32]);
+        let mut reopened = loaded.unlock_with_dek(dek2).unwrap();
+
+        // A concurrent writer changes the file underneath us.
+        std::fs::write(&path, b"a concurrent writer got here first").unwrap();
+
+        // Our save must fail closed instead of overwriting that change.
+        reopened.add("bank", SecretString::from_string("v2".into())).unwrap();
+        let res = reopened.save(&path);
+        std::fs::remove_file(&path).ok();
+        assert!(res.is_err(), "save must abort when the file changed since load");
     }
 
     #[test]
