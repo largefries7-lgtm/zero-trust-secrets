@@ -374,3 +374,62 @@ and supersede or refine the design above:
   authenticated metadata (values encrypted; names not) — a "encrypt metadata" hardening is future
   work; `VirtualLock` is page-granular/non-nesting; the `add` stdin prompt echoes (a no-echo input
   is a GUI-slice concern); `save` is non-atomic (temp-then-rename is future hardening).
+
+---
+
+## 16. Hardening pass — two-factor + red-team fixes (2026-07-15)
+
+A dedicated hardening branch (`harden/security-ceiling`) pushed the core toward the achievable
+ceiling. This section is the **authoritative, as-built threat model** — it supersedes the
+defended/not-defended lists in §3 where they differ.
+
+### What changed
+- **Two-factor by default (format v2).** The DEK is wrapped under
+  `KEK = HKDF(tpm_secret ‖ Argon2id(unlock_passphrase))`. A hardware-bound vault now requires
+  **both** the TPM *and* the passphrase to unlock; the TPM seals a random secret, never the DEK.
+  `--allow-no-tpm` = passphrase-only (single factor). Verified on real hardware: `get` with a
+  wrong passphrase fails **even though the TPM is present**.
+- **Recovery escrow is opt-in and off by default** (`init --recovery`), with a loud warning that
+  it reduces a stolen vault to the recovery passphrase's strength. Default vaults have no escrow:
+  losing the TPM = losing the vault (strongest).
+- **Secret input hardened:** no-echo interactive entry; `--value`/`--recovery-passphrase`/
+  `--passphrase` on argv now warn (argv is world-readable and cannot be scrubbed from the PEB).
+- **Memory hygiene:** recovery/unlock passphrases move into zeroize-on-drop `SecretString`s
+  (clap copies scrubbed); `get` wraps the decrypted buffer in place (no `to_vec` transient).
+- **Parser:** DoS-safe (no pre-allocation from untrusted counts); property-fuzzed (~768 cases, no
+  panics); removed MAC-bypassing `header_mut`/`set_records`.
+- **`deprovision`** deletes the TPM wrapping key (typed confirmation). Supply-chain: `deny.toml`
+  policy + documented dependency trust ([`SECURITY.md`](../../../SECURITY.md)).
+
+### Defended (as-built)
+- **Drive theft / offline attack** — cold vault is inaccessible without the original TPM *and*
+  passphrase (default), or the recovery passphrase (if escrow was enabled).
+- **Smash-and-grab same-user malware** — a process running briefly as the user that copies the
+  vault file and drives the TPM **no longer gets the DEK**: it also needs the passphrase, which it
+  can only obtain by additionally keylogging/persisting. This is the key gain of two-factor over v1.
+- **Process RAM scraping while locked / post-operation** — empirically verified (no plaintext
+  canary in a full memory dump; positive control confirms the scanner works).
+- **Tamper** — header, record set (count/order/names/ciphertext), format version, and KDF params
+  are all authenticated; any modification fails closed at unlock.
+
+### NOT defended (honest ceiling — unchanged truths)
+- **A keylogger or debugger present while you unlock.** Two-factor raises the bar against
+  smash-and-grab, but an attacker with persistent user-level code execution can capture the
+  passphrase as you type it and read the DEK from the live unlocked process. **This is the ceiling
+  for a userspace app on a general-purpose OS and cannot be closed from userspace.**
+- **Compromised kernel / malicious OS / cold-boot on an unlocked machine.**
+- **argv exposure** of `--passphrase`/`--value` when passed on the command line (mitigated by
+  no-echo prompts + warnings; the GUI slice avoids argv entirely).
+- **Weak passphrases** — offline brute-force of the passphrase factor (or a recovery passphrase)
+  is bounded only by Argon2id cost + passphrase entropy. Two-factor means an offline attacker also
+  needs the TPM, but a recovery-enabled vault is brute-forceable to recovery-passphrase strength.
+- **Record *names*** remain plaintext-but-authenticated metadata.
+- **TPM binding is device-bound, not PCR-policy-bound** (CNG limitation) — does not defend against
+  evil-maid boot tampering; would require a `tss-esapi` backend.
+
+### Consciously deferred (with reason)
+- **v1→v2 migration:** not built — there are no persistent v1 vaults, and a v1 reader would
+  resurrect legacy single-factor crypto (more attack surface). v1 files must be recreated.
+- **PCR-policy sealing, encrypted metadata names, clipboard history/cloud-sync exclusion, key
+  rotation, Argon2id auto-calibration, `save` orphan-temp reaper** — real improvements, tracked as
+  future work; none is a currently-exploitable hole.

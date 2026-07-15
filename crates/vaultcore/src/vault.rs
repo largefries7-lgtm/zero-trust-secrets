@@ -107,10 +107,12 @@ impl VaultHeader {
         }
         let format_version = c.u16()?;
         if format_version != FORMAT_VERSION {
-            // v1 files are single-factor; they are not read by the hot path.
+            // Only the current two-factor format is read. A v1 file predates it
+            // and is single-factor; this build intentionally carries no legacy
+            // v1 crypto path (reduced attack surface), so it must be recreated.
             return Err(Error::Format(format!(
-                "unsupported vault format version {format_version} (expected {FORMAT_VERSION}); \
-                 if this is a v1 vault, run `vaultctl migrate`"
+                "unsupported vault format version {format_version} (this build reads v{FORMAT_VERSION}); \
+                 a pre-two-factor vault must be recreated with `vaultctl init`"
             )));
         }
         let hardware_bound = c.u8()? != 0;
