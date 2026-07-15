@@ -344,15 +344,13 @@ impl Vault {
     pub fn header(&self) -> &VaultHeader {
         &self.header
     }
-    pub fn header_mut(&mut self) -> &mut VaultHeader {
-        &mut self.header
-    }
     pub fn records(&self) -> &[Record] {
         &self.records
     }
-    pub fn set_records(&mut self, r: Vec<Record>) {
-        self.records = r;
-    }
+    // NB: no public `header_mut`/`set_records`. Authenticated state (header +
+    // record set) is only mutated through `add`/`save`, which recompute the MAC.
+    // Exposing raw mutators would let a caller desync the in-memory state from
+    // its MAC. Removed as a deliberate encapsulation boundary.
 
     /// Persist the vault to disk. Requires the vault to be unlocked, since
     /// writing a fresh header MAC needs the DEK. On-disk layout:
