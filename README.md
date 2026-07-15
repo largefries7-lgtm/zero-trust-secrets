@@ -29,56 +29,76 @@ cargo build --release -p vaultctl
 ```sh
 BIN=target/release/vaultctl.exe
 
-# Create a TPM-bound vault (recovery passphrase is the escrow if the TPM is ever lost)
-$BIN --vault my.ztsv init --recovery-passphrase "correct-horse-battery-staple"
+# Create a TPM-bound, two-factor vault. You are prompted (no echo) for an
+# UNLOCK passphrase; every unlock then needs the TPM *and* that passphrase.
+$BIN --vault my.ztsv init
+
+# Optional: also create a single-factor recovery escrow (survives TPM loss, but
+# a stolen vault file is then only as strong as this recovery passphrase):
+#   $BIN --vault my.ztsv init --recovery
 
 $BIN --vault my.ztsv seal-status
 #  hardware_bound: true
+#  factors: TPM + passphrase (two-factor)
 #  provider: Windows CNG Platform Crypto Provider (TPM-backed, non-exportable ...)
 
-# Add + read secrets. On a hardware-bound vault the DEK is unsealed from the TPM
-# automatically — no passphrase needed for day-to-day use.
-$BIN --vault my.ztsv add github --value "ghp_..."
-$BIN --vault my.ztsv get github            # prints the value
-$BIN --vault my.ztsv get github --clip     # copies to clipboard, auto-clears in 15s
-$BIN --vault my.ztsv list                  # names only
+# Add + read secrets (each command prompts for the unlock passphrase; the TPM
+# factor is unsealed automatically):
+$BIN --vault my.ztsv add github                 # prompts for the value (no echo)
+$BIN --vault my.ztsv add github --force         # rotate an existing name in place
+$BIN --vault my.ztsv get github                 # prints the value
+$BIN --vault my.ztsv get github --clip          # clipboard copy, auto-clears in 15s
+$BIN --vault my.ztsv list                       # names only
+$BIN --vault my.ztsv rm github                  # delete a record
 
-# The recovery passphrase always works too (survives TPM loss / PCR change):
-$BIN --vault my.ztsv get github --recovery-passphrase "correct-horse-battery-staple"
+# If the vault has a recovery escrow (init --recovery), unlock via it instead:
+$BIN --vault my.ztsv get github --recovery --recovery-passphrase "..."
 
 # Standalone password generator (OS CSPRNG, reports entropy):
 $BIN gen --len 24 --symbols
 ```
 
-No-TPM machine (e.g. a VM/CI): add `--allow-no-tpm` to `init`, and pass
-`--recovery-passphrase` to `add`/`get` (there is no TPM to auto-unseal).
+Note: a plain `add <name>` refuses to overwrite an existing name (so a secret is
+never silently shadowed); use `--force` to rotate it in place.
+
+No-TPM machine (e.g. a VM/CI): add `--allow-no-tpm` to `init`. The unlock
+passphrase becomes the sole factor; pass `--passphrase` (prompted if omitted) to
+`add`/`get`/`rm` — there is no TPM to auto-unseal.
 
 ## Commands
 
 | Command | Purpose |
 |---------|---------|
-| `init [--allow-no-tpm] --recovery-passphrase <pw>` | Create a vault; seal the DEK to the TPM and escrow it under the passphrase |
-| `unlock [--recovery-passphrase <pw>]` | Credential smoke-check (verifies you can obtain the DEK) |
+| `init [--allow-no-tpm] [--passphrase <pw>] [--recovery [--recovery-passphrase <pw>]]` | Create a vault; wrap the DEK under TPM + passphrase (two-factor), optionally add a single-factor recovery escrow |
+| `unlock [--passphrase <pw>] [--recovery --recovery-passphrase <pw>]` | Credential smoke-check (verifies you can obtain the DEK) |
 | `lock` | No-op by design — the CLI is stateless, nothing is cached to clear |
-| `add <name> [--value <v>] [--recovery-passphrase <pw>]` | Add a secret |
-| `get <name> [--clip] [--recovery-passphrase <pw>]` | Read a secret (stdout, or clipboard with auto-clear) |
+| `add <name> [--value <v>] [--force] [--passphrase <pw>]` | Add a secret; refuses an existing name unless `--force` (rotate in place) |
+| `rm <name> [--passphrase <pw>]` | Remove a secret record |
+| `get <name> [--clip] [--passphrase <pw>]` | Read a secret (stdout, or clipboard with auto-clear) |
 | `list` | List secret names (metadata only) |
 | `gen [--len N] [--symbols]` | Generate a password and report entropy |
-| `seal-status` | Show `hardware_bound`, the active key provider, and warnings |
+| `seal-status` | Show `hardware_bound`, factors, the active key provider, and warnings |
+| `deprovision [--yes]` | Delete the persisted TPM wrapping key (destructive) |
+
+`--recovery-passphrase` requires `--recovery`; passing it alone is rejected rather
+than silently ignored.
 
 `--vault <path>` is global (default `vault.ztsv`).
 
 ## How it protects your secrets
 
-- **Hardware-bound key.** A random 256-bit DEK encrypts every secret
-  (XChaCha20-Poly1305). The DEK is **dual-wrapped**: (1) sealed by a non-exportable
-  TPM key, and (2) escrowed under an Argon2id key derived from your recovery
-  passphrase. A stolen vault file is useless without the original TPM **or** the
-  passphrase.
+- **Hardware-bound, two-factor key.** A random 256-bit DEK encrypts every secret
+  (XChaCha20-Poly1305). On a hardware-bound vault the DEK is wrapped under
+  `KEK = HKDF(tpm_secret ‖ Argon2id(passphrase))`, so unlocking requires **both**
+  the original TPM **and** the passphrase — a stolen vault file, or same-user
+  malware that can drive the TPM, is useless without also capturing the passphrase.
+  An optional, off-by-default recovery escrow (`init --recovery`) additionally wraps
+  the DEK under a separate recovery passphrase alone, trading theft-resistance for
+  survivability if the TPM is lost.
 - **Tamper-evident.** The vault header and the whole record set (count, order,
   names, ciphertext) are authenticated by an HKDF-keyed HMAC; each secret is also
   bound to its name via AEAD AAD. Relabel / delete / reorder / inject all fail
-  closed at unlock. `save` is atomic (temp-then-rename).
+  closed at unlock. `save` is atomic and durable (temp file, `fsync`, then rename).
 - **Memory hygiene.** All secret material lives in `ZeroizeOnDrop`, page-locked
   (`VirtualLock`), exact-capacity buffers and is zeroized the moment it's dropped.
   The CLI is **stateless**: the DEK is never written to disk.

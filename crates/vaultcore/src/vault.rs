@@ -14,16 +14,45 @@ use std::path::Path;
 
 const MAGIC: [u8; 4] = *b"ZTSV";
 
+// Upper bounds on the Argon2id cost parameters accepted from a vault header.
+// These parameters are attacker-controllable (they live in the untrusted header
+// and MUST be consumed to derive the KEK *before* the header MAC can be checked),
+// so an unbounded `mem_kib`/`time` would let a hostile `.ztsv` force a
+// multi-hundred-GiB allocation or unbounded compute at unlock -- a pre-auth
+// memory/CPU DoS. The ceilings are generous versus `default_tuned` (64 MiB / t=3)
+// yet keep the worst case survivable. A header outside these bounds is rejected
+// at parse time, before any Argon2 work happens.
+const MAX_ARGON2_MEM_KIB: u32 = 1 << 20; // 1 GiB
+const MAX_ARGON2_TIME: u32 = 64;
+const MAX_ARGON2_PARALLELISM: u32 = 64;
+/// Current on-disk format version. v2 = two-factor envelope (see `envelope.rs`).
+/// v1 (single-factor: TPM-wraps-DEK *or* passphrase-wraps-DEK) is no longer read
+/// by the hot path; `vaultctl migrate` upgrades a v1 file to v2.
+pub const FORMAT_VERSION: u16 = 2;
+
+/// Authenticated vault header (format v2).
+///
+/// The DEK is wrapped by `dek_wrap` under a two-factor KEK (see `envelope.rs`):
+/// `tpm_wrap` seals the random TPM secret factor (present iff `hardware_bound`),
+/// and `kdf` parameterizes the Argon2id passphrase factor. `recovery_wrap` /
+/// `recovery_kdf` are an OPTIONAL single-factor escrow.
 #[derive(Clone)]
 pub struct VaultHeader {
     pub magic: [u8; 4],
     pub format_version: u16,
     pub hardware_bound: bool,
     pub aead_id: u8,
+    /// Argon2id parameters/salt for the unlock passphrase factor.
     pub kdf: Argon2Params,
     pub pcr_selection: Vec<u32>,
+    /// RSA-OAEP-sealed 32-byte TPM secret factor. `Some` iff `hardware_bound`.
     pub tpm_wrap: Option<Vec<u8>>,
-    pub recovery_wrap: Vec<u8>,
+    /// Primary wrap: `AEAD(KEK, DEK)` where `KEK = HKDF([tpm_secret ‖] pass_key)`.
+    pub dek_wrap: Vec<u8>,
+    /// Optional single-factor recovery escrow: `AEAD(Argon2id(recovery_pass), DEK)`.
+    pub recovery_wrap: Option<Vec<u8>>,
+    /// Argon2id parameters/salt for the recovery passphrase. `Some` iff `recovery_wrap`.
+    pub recovery_kdf: Option<Argon2Params>,
     pub header_mac: [u8; 32],
 }
 
@@ -38,19 +67,33 @@ fn put_bytes(b: &mut Vec<u8>, v: &[u8]) {
     put_u32(b, v.len() as u32);
     b.extend_from_slice(v);
 }
+fn put_argon2(b: &mut Vec<u8>, p: &Argon2Params) {
+    put_u32(b, p.mem_kib);
+    put_u32(b, p.time);
+    put_u32(b, p.parallelism);
+    b.extend_from_slice(&p.salt);
+}
+
+/// SHA-256 fingerprint of the raw vault-file bytes, used only for
+/// optimistic-concurrency detection in `save` (loud-fail on a concurrent
+/// overwrite). This is not a security control -- integrity is the header MAC.
+fn file_fingerprint(bytes: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(bytes);
+    h.finalize().into()
+}
 
 impl VaultHeader {
-    /// Serialize with header_mac included as-is (callers zero it before MAC).
+    /// Serialize the v2 header. `header_mac` is written as-is (callers zero it
+    /// before computing the MAC over these bytes).
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut b = Vec::new();
         b.extend_from_slice(&self.magic);
         put_u16(&mut b, self.format_version);
         b.push(self.hardware_bound as u8);
         b.push(self.aead_id);
-        put_u32(&mut b, self.kdf.mem_kib);
-        put_u32(&mut b, self.kdf.time);
-        put_u32(&mut b, self.kdf.parallelism);
-        b.extend_from_slice(&self.kdf.salt);
+        put_argon2(&mut b, &self.kdf);
         put_u32(&mut b, self.pcr_selection.len() as u32);
         for p in &self.pcr_selection {
             put_u32(&mut b, *p);
@@ -62,7 +105,15 @@ impl VaultHeader {
             }
             None => b.push(0),
         }
-        put_bytes(&mut b, &self.recovery_wrap);
+        put_bytes(&mut b, &self.dek_wrap);
+        match (&self.recovery_wrap, &self.recovery_kdf) {
+            (Some(rw), Some(rk)) => {
+                b.push(1);
+                put_argon2(&mut b, rk);
+                put_bytes(&mut b, rw);
+            }
+            _ => b.push(0),
+        }
         b.extend_from_slice(&self.header_mac);
         b
     }
@@ -77,24 +128,36 @@ impl VaultHeader {
             return Err(Error::Format("bad magic".into()));
         }
         let format_version = c.u16()?;
+        if format_version != FORMAT_VERSION {
+            // Only the current two-factor format is read. A v1 file predates it
+            // and is single-factor; this build intentionally carries no legacy
+            // v1 crypto path (reduced attack surface), so it must be recreated.
+            return Err(Error::Format(format!(
+                "unsupported vault format version {format_version} (this build reads v{FORMAT_VERSION}); \
+                 a pre-two-factor vault must be recreated with `vaultctl init`"
+            )));
+        }
         let hardware_bound = c.u8()? != 0;
         let aead_id = c.u8()?;
-        let kdf = Argon2Params {
-            mem_kib: c.u32()?,
-            time: c.u32()?,
-            parallelism: c.u32()?,
-            salt: c
-                .take(16)?
-                .try_into()
-                .map_err(|_| Error::Format("salt".into()))?,
-        };
+        let kdf = c.argon2()?;
         let npcr = c.u32()? as usize;
-        let mut pcr_selection = Vec::with_capacity(npcr.min(1 << 20));
+        // Do NOT pre-allocate from the untrusted `npcr`: like the record count,
+        // a tiny file claiming a huge PCR count would otherwise force a large
+        // up-front allocation before parsing fails. Grow as entries parse; each
+        // `c.u32()` is bounds-checked, so work is bounded by the real file size.
+        let mut pcr_selection = Vec::new();
         for _ in 0..npcr {
             pcr_selection.push(c.u32()?);
         }
         let tpm_wrap = if c.u8()? == 1 { Some(c.bytes()?) } else { None };
-        let recovery_wrap = c.bytes()?;
+        let dek_wrap = c.bytes()?;
+        let (recovery_wrap, recovery_kdf) = if c.u8()? == 1 {
+            let rk = c.argon2()?;
+            let rw = c.bytes()?;
+            (Some(rw), Some(rk))
+        } else {
+            (None, None)
+        };
         let header_mac: [u8; 32] = c
             .take(32)?
             .try_into()
@@ -107,7 +170,9 @@ impl VaultHeader {
             kdf,
             pcr_selection,
             tpm_wrap,
+            dek_wrap,
             recovery_wrap,
+            recovery_kdf,
             header_mac,
         })
     }
@@ -140,6 +205,36 @@ impl VaultHeader {
         use subtle::ConstantTimeEq;
         self.compute_mac(dek, records).ct_eq(&self.header_mac).into()
     }
+
+    /// Build a fresh v2 header. `dek_wrap` is the primary two-factor wrap;
+    /// `tpm_wrap` seals the TPM secret factor (`Some` iff hardware-bound); the
+    /// recovery pair is the optional single-factor escrow. `header_mac` is filled
+    /// by `Vault::save`. `aead_id`/`pcr_selection` take their defaults.
+    pub fn new_v2(
+        hardware_bound: bool,
+        kdf: Argon2Params,
+        tpm_wrap: Option<Vec<u8>>,
+        dek_wrap: Vec<u8>,
+        recovery: Option<(Vec<u8>, Argon2Params)>,
+    ) -> Self {
+        let (recovery_wrap, recovery_kdf) = match recovery {
+            Some((rw, rk)) => (Some(rw), Some(rk)),
+            None => (None, None),
+        };
+        VaultHeader {
+            magic: MAGIC,
+            format_version: FORMAT_VERSION,
+            hardware_bound,
+            aead_id: 1,
+            kdf,
+            pcr_selection: vec![],
+            tpm_wrap,
+            dek_wrap,
+            recovery_wrap,
+            recovery_kdf,
+            header_mac: [0u8; 32],
+        }
+    }
 }
 
 struct Cursor<'a> {
@@ -171,6 +266,31 @@ impl<'a> Cursor<'a> {
     fn bytes(&mut self) -> Result<Vec<u8>> {
         let n = self.u32()? as usize;
         Ok(self.take(n)?.to_vec())
+    }
+    fn argon2(&mut self) -> Result<Argon2Params> {
+        let mem_kib = self.u32()?;
+        let time = self.u32()?;
+        let parallelism = self.u32()?;
+        // Reject implausible cost parameters before they can drive an Argon2
+        // allocation/compute on the pre-authentication unlock path (DoS).
+        if mem_kib > MAX_ARGON2_MEM_KIB
+            || time > MAX_ARGON2_TIME
+            || parallelism > MAX_ARGON2_PARALLELISM
+        {
+            return Err(Error::Format(format!(
+                "argon2 parameters out of range (mem_kib={mem_kib}, time={time}, \
+                 parallelism={parallelism})"
+            )));
+        }
+        Ok(Argon2Params {
+            mem_kib,
+            time,
+            parallelism,
+            salt: self
+                .take(16)?
+                .try_into()
+                .map_err(|_| Error::Format("argon2 salt".into()))?,
+        })
     }
 }
 
@@ -211,6 +331,9 @@ enum State {
 pub struct LockedVault {
     header: VaultHeader,
     records: Vec<Record>,
+    /// SHA-256 of the exact bytes read from disk, for optimistic-concurrency
+    /// detection when a derived `Vault` is later saved (see `Vault::save`).
+    fingerprint: [u8; 32],
 }
 
 impl LockedVault {
@@ -218,6 +341,7 @@ impl LockedVault {
     /// without authenticating or decrypting anything.
     pub fn load(path: &Path) -> Result<LockedVault> {
         let data = std::fs::read(path)?;
+        let fingerprint = file_fingerprint(&data);
         let mut c = Cursor { d: &data, i: 0 };
         let header_len = c.u32()? as usize;
         let header_bytes = c.take(header_len)?;
@@ -233,7 +357,7 @@ impl LockedVault {
         for _ in 0..num_records {
             records.push(Record::from_cursor(&mut c)?);
         }
-        Ok(LockedVault { header, records })
+        Ok(LockedVault { header, records, fingerprint })
     }
 
     /// Verify the header MAC against the supplied DEK and, on success,
@@ -247,6 +371,7 @@ impl LockedVault {
             header: self.header,
             records: self.records,
             state: State::Unlocked(dek),
+            loaded_fingerprint: Some(self.fingerprint),
         })
     }
 
@@ -259,17 +384,58 @@ impl LockedVault {
     pub fn record_names(&self) -> Vec<&str> {
         self.records.iter().map(|r| r.name.as_str()).collect()
     }
+
+    /// v2 primary unlock: derive the DEK from the unlock passphrase (+ the TPM
+    /// secret factor, for a hardware-bound vault) via the two-factor envelope,
+    /// then verify the header MAC. Fails closed (`Error::AuthFailed`) on a wrong
+    /// passphrase, wrong/missing TPM secret, or a tampered header/record set.
+    pub fn unlock_two_factor(
+        self,
+        passphrase: &SecretString,
+        tpm_secret: Option<&SecretBytes>,
+    ) -> Result<Vault> {
+        let dek = crate::envelope::unwrap_dek(
+            &self.header.dek_wrap,
+            passphrase,
+            &self.header.kdf,
+            tpm_secret,
+        )?;
+        self.unlock_with_dek(dek)
+    }
+
+    /// v2 recovery unlock: derive the DEK from the recovery passphrase alone
+    /// (single factor). Errors if this vault has no recovery escrow.
+    pub fn unlock_recovery(self, recovery_pass: &SecretString) -> Result<Vault> {
+        let (rw, rk) = match (
+            self.header.recovery_wrap.as_ref(),
+            self.header.recovery_kdf.as_ref(),
+        ) {
+            (Some(rw), Some(rk)) => (rw.clone(), *rk),
+            _ => return Err(Error::Provider("this vault has no recovery escrow".into())),
+        };
+        let dek = crate::envelope::unwrap_dek_recovery(&rw, recovery_pass, &rk)?;
+        self.unlock_with_dek(dek)
+    }
 }
 
 pub struct Vault {
     header: VaultHeader,
     records: Vec<Record>,
     state: State,
+    /// SHA-256 of the file this vault was loaded from, or `None` for a vault
+    /// built in memory (`new_unlocked`). Drives the optimistic-concurrency
+    /// check in `save`.
+    loaded_fingerprint: Option<[u8; 32]>,
 }
 
 impl Vault {
     pub fn new_unlocked(dek: SecretBytes, header: VaultHeader) -> Self {
-        Vault { header, records: Vec::new(), state: State::Unlocked(dek) }
+        Vault {
+            header,
+            records: Vec::new(),
+            state: State::Unlocked(dek),
+            loaded_fingerprint: None,
+        }
     }
     fn dek(&self) -> Result<&SecretBytes> {
         match &self.state {
@@ -295,7 +461,38 @@ impl Vault {
         a
     }
 
+    /// Add a NEW secret. Fails with [`Error::Duplicate`] if `name` already
+    /// exists, so a second `add` can never silently shadow an existing record
+    /// (the read path returns the first match, which would otherwise make the
+    /// new value permanently unreachable). Use [`Vault::upsert`] to rotate a
+    /// secret in place.
     pub fn add(&mut self, name: &str, value: SecretString) -> Result<()> {
+        if self.records.iter().any(|r| r.name == name) {
+            return Err(Error::Duplicate(name.to_string()));
+        }
+        self.insert_record(name, value)
+    }
+
+    /// Add `name`, or replace it in place if it already exists (rotation). Any
+    /// pre-existing record(s) with this name are removed first, so the result is
+    /// exactly one record for `name` holding the new value.
+    pub fn upsert(&mut self, name: &str, value: SecretString) -> Result<()> {
+        self.records.retain(|r| r.name != name);
+        self.insert_record(name, value)
+    }
+
+    /// Remove every record named `name`. Returns `true` if anything was removed.
+    /// The change is persisted (and the header MAC recomputed) by the next
+    /// [`Vault::save`].
+    pub fn remove(&mut self, name: &str) -> bool {
+        let before = self.records.len();
+        self.records.retain(|r| r.name != name);
+        self.records.len() != before
+    }
+
+    /// Encrypt `value` under a fresh per-record key and append it. Assumes the
+    /// caller has already enforced whatever name-uniqueness policy applies.
+    fn insert_record(&mut self, name: &str, value: SecretString) -> Result<()> {
         let dek = self.dek()?;
         let mut idb = [0u8; 16];
         rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut idb);
@@ -316,7 +513,7 @@ impl Vault {
             .records
             .iter()
             .find(|r| r.name == name)
-            .ok_or_else(|| Error::Format("no such record".into()))?;
+            .ok_or_else(|| Error::NotFound(name.to_string()))?;
         let rk = Self::record_key(dek, rec.id);
         let pt = crypto::aead_open(
             &rk,
@@ -340,29 +537,29 @@ impl Vault {
     pub fn header(&self) -> &VaultHeader {
         &self.header
     }
-    pub fn header_mut(&mut self) -> &mut VaultHeader {
-        &mut self.header
-    }
     pub fn records(&self) -> &[Record] {
         &self.records
     }
-    pub fn set_records(&mut self, r: Vec<Record>) {
-        self.records = r;
-    }
+    // NB: no public `header_mut`/`set_records`. Authenticated state (header +
+    // record set) is only mutated through `add`/`save`, which recompute the MAC.
+    // Exposing raw mutators would let a caller desync the in-memory state from
+    // its MAC. Removed as a deliberate encapsulation boundary.
 
     /// Persist the vault to disk. Requires the vault to be unlocked, since
     /// writing a fresh header MAC needs the DEK. On-disk layout:
     /// `u32 len(header) || header_bytes || u32 num_records ||
     ///  [ id(16 LE) || u32 len(name) || name_utf8 || u32 len(ct) || ct ]*`
     ///
-    /// Writes are atomic: the serialized vault is written to a unique temp
-    /// file in the same directory as `path`, then renamed into place.
-    /// `std::fs::rename` replaces the destination atomically (on both
-    /// Windows and Unix, within a single filesystem), so a crash mid-write
-    /// leaves the previous vault file intact instead of a truncated/corrupt
-    /// one -- important here since the wrapped DEK lives only in this file's
-    /// header, so a partial write would otherwise be unrecoverable data loss.
-    pub fn save(&self, path: &Path) -> Result<()> {
+    /// Writes are atomic and durable: the serialized vault is written to a
+    /// unique temp file in the same directory as `path`, `fsync`ed, then renamed
+    /// into place. `std::fs::rename` replaces the destination atomically (on both
+    /// Windows and Unix, within a single filesystem), so the previous vault file
+    /// stays intact until the new one is fully on disk. The `sync_all` before the
+    /// rename is what makes this power-loss-safe and not merely crash-safe:
+    /// without it a power failure could commit the rename while the temp file's
+    /// data blocks were still unflushed, destroying the only copy of the wrapped
+    /// DEK (which lives solely in this file's header).
+    pub fn save(&mut self, path: &Path) -> Result<()> {
         let dek = self.dek()?;
 
         let mut header = self.header.clone();
@@ -376,15 +573,46 @@ impl Vault {
             r.to_bytes(&mut out);
         }
 
+        // Optimistic concurrency (F6): if this vault was loaded from disk and the
+        // file has since changed, another writer modified it after our load.
+        // Refuse rather than silently overwrite their change (a lost update).
+        // This narrows the race to the window between this check and the rename.
+        if let Some(expected) = self.loaded_fingerprint {
+            if let Ok(current) = std::fs::read(path) {
+                if file_fingerprint(&current) != expected {
+                    return Err(Error::Provider(
+                        "vault changed on disk since it was loaded; aborting to avoid \
+                         overwriting a concurrent modification"
+                            .into(),
+                    ));
+                }
+            }
+            // If the file is gone, there is nothing to clobber; proceed.
+        }
+
         let tmp = Self::temp_path_for(path);
-        if let Err(e) = std::fs::write(&tmp, &out) {
+        if let Err(e) = Self::write_synced(&tmp, &out) {
             let _ = std::fs::remove_file(&tmp);
-            return Err(e.into());
+            return Err(e);
         }
         if let Err(e) = std::fs::rename(&tmp, path) {
             let _ = std::fs::remove_file(&tmp);
             return Err(e.into());
         }
+        // The file now holds exactly `out`; refresh the fingerprint so a later
+        // save from this same (long-lived) vault compares against what we just
+        // wrote rather than the stale load-time contents.
+        self.loaded_fingerprint = Some(file_fingerprint(&out));
+        Ok(())
+    }
+
+    /// Write `bytes` to `path` and `fsync` the file (data + metadata) before
+    /// returning, so a following rename produces a durable, fully-written file.
+    fn write_synced(path: &Path, bytes: &[u8]) -> Result<()> {
+        use std::io::Write;
+        let mut f = std::fs::File::create(path)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
         Ok(())
     }
 
@@ -421,13 +649,15 @@ mod tests {
     fn test_header() -> VaultHeader {
         VaultHeader {
             magic: *b"ZTSV",
-            format_version: 1,
+            format_version: FORMAT_VERSION,
             hardware_bound: false,
             aead_id: 1,
             kdf: Argon2Params { mem_kib: 8, time: 1, parallelism: 1, salt: [9u8; 16] },
             pcr_selection: vec![],
             tpm_wrap: None,
-            recovery_wrap: vec![1, 2, 3],
+            dek_wrap: vec![1, 2, 3],
+            recovery_wrap: None,
+            recovery_kdf: None,
             header_mac: [0u8; 32],
         }
     }
@@ -440,7 +670,7 @@ mod tests {
         let bytes = h.to_bytes();
         let back = VaultHeader::from_bytes(&bytes).unwrap();
         assert_eq!(back.magic, *b"ZTSV");
-        assert_eq!(back.recovery_wrap, vec![1, 2, 3]);
+        assert_eq!(back.dek_wrap, vec![1, 2, 3]);
         assert!(back.verify_mac(&dek, &[]));
     }
 
@@ -484,6 +714,72 @@ mod tests {
         ];
         assert!(!h.verify_mac(&dek, &swapped));
         assert!(h.verify_mac(&dek, &two));
+    }
+
+    #[test]
+    fn add_rejects_duplicate_name() {
+        // F1: adding an existing name must NOT silently shadow. The original
+        // value stays reachable; no duplicate is created.
+        let dek = SecretBytes::from_exact(&[5u8; 32]);
+        let mut v = Vault::new_unlocked(dek, test_header());
+        v.add("email", SecretString::from_string("first".into())).unwrap();
+        let dup = v.add("email", SecretString::from_string("second".into()));
+        assert!(matches!(dup, Err(crate::Error::Duplicate(_))));
+        assert_eq!(v.list(), vec!["email"]);
+        assert_eq!(v.get("email").unwrap().expose_str(), "first");
+    }
+
+    #[test]
+    fn upsert_replaces_existing_and_adds_new() {
+        // F1: upsert rotates a secret in place (get returns the new value, no
+        // duplicate) and also adds when the name is absent.
+        let dek = SecretBytes::from_exact(&[5u8; 32]);
+        let mut v = Vault::new_unlocked(dek, test_header());
+        v.add("email", SecretString::from_string("old".into())).unwrap();
+        v.upsert("email", SecretString::from_string("new".into())).unwrap();
+        assert_eq!(v.list(), vec!["email"]);
+        assert_eq!(v.get("email").unwrap().expose_str(), "new");
+
+        v.upsert("bank", SecretString::from_string("1234".into())).unwrap();
+        assert_eq!(v.get("bank").unwrap().expose_str(), "1234");
+    }
+
+    #[test]
+    fn remove_deletes_record_and_is_idempotent() {
+        // F1: removing a record makes it unreadable (NotFound); removing a
+        // missing name is a no-op that reports "nothing removed".
+        let dek = SecretBytes::from_exact(&[5u8; 32]);
+        let mut v = Vault::new_unlocked(dek, test_header());
+        v.add("email", SecretString::from_string("a".into())).unwrap();
+        assert!(v.remove("email"));
+        assert!(matches!(v.get("email"), Err(crate::Error::NotFound(_))));
+        assert!(!v.remove("email"));
+    }
+
+    #[test]
+    fn load_rejects_out_of_range_argon2_params() {
+        // F2: absurd KDF cost parameters from an untrusted header must be
+        // rejected at parse time, BEFORE they can be fed to Argon2 (which would
+        // otherwise attempt a multi-hundred-GiB allocation / unbounded compute
+        // pre-authentication -- a memory/CPU DoS).
+        let mut h = test_header();
+        h.kdf.mem_kib = u32::MAX;
+        assert!(matches!(
+            VaultHeader::from_bytes(&h.to_bytes()),
+            Err(crate::Error::Format(_))
+        ));
+
+        let mut h = test_header();
+        h.kdf.time = u32::MAX;
+        assert!(matches!(
+            VaultHeader::from_bytes(&h.to_bytes()),
+            Err(crate::Error::Format(_))
+        ));
+
+        // A normal, default-tuned parameter set still parses fine.
+        let mut h = test_header();
+        h.kdf = Argon2Params::default_tuned();
+        assert!(VaultHeader::from_bytes(&h.to_bytes()).is_ok());
     }
 
     #[test]
@@ -541,6 +837,56 @@ mod tests {
     }
 
     #[test]
+    fn v2_two_factor_end_to_end_with_recovery() {
+        let dek = SecretBytes::generate(32);
+        let pass = SecretString::from_string("unlock".into());
+        let rec = SecretString::from_string("recovery".into());
+        let tpm = SecretBytes::from_exact(&[5u8; 32]); // stand-in for the TPM secret
+        let kdf = Argon2Params { mem_kib: 8, time: 1, parallelism: 1, salt: [1u8; 16] };
+        let rkdf = Argon2Params { mem_kib: 8, time: 1, parallelism: 1, salt: [2u8; 16] };
+
+        let dek_wrap = crate::envelope::wrap_dek(&dek, &pass, &kdf, Some(&tpm)).unwrap();
+        let rec_wrap = crate::envelope::wrap_dek_recovery(&dek, &rec, &rkdf).unwrap();
+        let header =
+            VaultHeader::new_v2(true, kdf, Some(vec![0xAA; 8]), dek_wrap, Some((rec_wrap, rkdf)));
+
+        let mut v = Vault::new_unlocked(SecretBytes::from_exact(dek.expose()), header);
+        v.add("email", SecretString::from_string("hunter2".into())).unwrap();
+
+        let mut path = std::env::temp_dir();
+        path.push(format!("vaultcore_v2_{}.ztsv", std::process::id()));
+        v.save(&path).unwrap();
+
+        // Primary two-factor unlock recovers the secret.
+        let locked = LockedVault::load(&path).unwrap();
+        let unlocked = locked.unlock_two_factor(&pass, Some(&tpm)).unwrap();
+        assert_eq!(unlocked.get("email").unwrap().expose_str(), "hunter2");
+
+        // Wrong passphrase -> fails closed.
+        let locked = LockedVault::load(&path).unwrap();
+        assert!(locked
+            .unlock_two_factor(&SecretString::from_string("wrong".into()), Some(&tpm))
+            .is_err());
+
+        // Missing TPM factor (e.g. drive moved to another machine) -> fails closed.
+        let locked = LockedVault::load(&path).unwrap();
+        assert!(locked.unlock_two_factor(&pass, None).is_err());
+
+        // Recovery path (single factor) recovers the secret.
+        let locked = LockedVault::load(&path).unwrap();
+        let unlocked = locked.unlock_recovery(&rec).unwrap();
+        assert_eq!(unlocked.get("email").unwrap().expose_str(), "hunter2");
+
+        // Recovery with the wrong passphrase -> fails closed.
+        let locked = LockedVault::load(&path).unwrap();
+        assert!(locked
+            .unlock_recovery(&SecretString::from_string("bad".into()))
+            .is_err());
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
     fn load_rejects_huge_record_count_without_huge_alloc() {
         // A tiny file that claims ~4 billion records but provides no record
         // bodies must fail cleanly (Format error) rather than pre-allocating a
@@ -558,6 +904,34 @@ mod tests {
         let r = LockedVault::load(&path);
         std::fs::remove_file(&path).ok();
         assert!(matches!(r, Err(crate::Error::Format(_))));
+    }
+
+    #[test]
+    fn save_aborts_if_vault_changed_on_disk_since_load() {
+        // F6: optimistic concurrency. A vault loaded from disk records a
+        // fingerprint of what it read; if another writer changes the file before
+        // we save, `save` must refuse rather than silently clobber that change.
+        let dek = SecretBytes::from_exact(&[11u8; 32]);
+        let mut v = Vault::new_unlocked(dek, test_header());
+        v.add("email", SecretString::from_string("v1".into())).unwrap();
+
+        let mut path = std::env::temp_dir();
+        path.push(format!("vaultcore_test_optconc_{}.ztsv", std::process::id()));
+        v.save(&path).unwrap();
+
+        // Reopen from disk (captures the on-disk fingerprint).
+        let loaded = LockedVault::load(&path).unwrap();
+        let dek2 = SecretBytes::from_exact(&[11u8; 32]);
+        let mut reopened = loaded.unlock_with_dek(dek2).unwrap();
+
+        // A concurrent writer changes the file underneath us.
+        std::fs::write(&path, b"a concurrent writer got here first").unwrap();
+
+        // Our save must fail closed instead of overwriting that change.
+        reopened.add("bank", SecretString::from_string("v2".into())).unwrap();
+        let res = reopened.save(&path);
+        std::fs::remove_file(&path).ok();
+        assert!(res.is_err(), "save must abort when the file changed since load");
     }
 
     #[test]

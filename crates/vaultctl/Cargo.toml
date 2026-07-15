@@ -8,6 +8,12 @@ rust-version.workspace = true
 vaultcore = { path = "../vaultcore" }
 clap.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+# Console API for no-echo secret entry. Reuses the workspace `windows` crate
+# (already vetted for vaultcore); adds only the Console feature. No new external
+# dependency enters the tree.
+windows = { workspace = true, features = ["Win32_System_Console"] }
+
 [features]
 # Enables hidden `__hold-*` / `__leak` subcommands used ONLY by the
 # verification harness (verify/dumper) to freeze the process in a precise

@@ -1,0 +1,45 @@
+name: CI
+
+# Enforces what SECURITY.md promises: tests plus the supply-chain policy
+# (cargo-deny + cargo-audit) run on every push and pull request, so a new or
+# yanked/advisory-bearing dependency fails the build instead of slipping in.
+#
+# The memory-scraping proof (`bash verify/run.sh`) is Windows-only and needs
+# MiniDump access, so it stays a documented manual step rather than a CI gate.
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: build & test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (stable, pinned by rust-version)
+        run: rustup toolchain install stable --profile minimal
+      # --locked: fail if Cargo.lock is out of date, preserving the committed pins.
+      - name: Build
+        run: cargo build --workspace --locked
+      - name: Test
+        run: cargo test --workspace --locked
+
+  supply-chain:
+    name: cargo-deny + cargo-audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (stable)
+        run: rustup toolchain install stable --profile minimal
+      - name: Install cargo-deny and cargo-audit
+        run: cargo install cargo-deny cargo-audit --locked
+      # Advisories, license allow-list, wildcard bans, and registry restrictions
+      # are all defined in deny.toml.
+      - name: cargo deny check
+        run: cargo deny check
+      - name: cargo audit
+        run: cargo audit

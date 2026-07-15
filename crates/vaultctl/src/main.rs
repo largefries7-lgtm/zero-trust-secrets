@@ -7,6 +7,7 @@
 //! There is no on-disk session, so `lock` is a no-op for symmetry.
 
 mod clip;
+mod prompt;
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -15,6 +16,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 
 use vaultcore::crypto::Argon2Params;
+use vaultcore::envelope;
 use vaultcore::keyprovider::{KeyProvider, RecoveryProvider, SealedBlob};
 use vaultcore::secret::{SecretBytes, SecretString};
 use vaultcore::vault::{LockedVault, Vault, VaultHeader};
@@ -41,28 +43,66 @@ struct Cli {
 enum Cmd {
     /// Create a new vault (refuses to clobber an existing file).
     Init {
-        /// Skip TPM hardware binding; protect the vault by recovery passphrase only.
+        /// Skip TPM hardware binding; protect the vault by the passphrase only.
         #[arg(long)]
         allow_no_tpm: bool,
-        /// Recovery passphrase used to escrow the DEK (Argon2id).
+        /// Unlock passphrase: the second factor (combined with the TPM), or the
+        /// sole factor with --allow-no-tpm. Prompted (no echo) if omitted.
         #[arg(long)]
-        recovery_passphrase: String,
+        passphrase: Option<String>,
+        /// Also create a single-factor recovery escrow. Survives TPM loss, but
+        /// reduces a STOLEN vault's security to the recovery passphrase's strength.
+        #[arg(long)]
+        recovery: bool,
+        /// Recovery passphrase (requires --recovery). Prompted if omitted.
+        #[arg(long, requires = "recovery")]
+        recovery_passphrase: Option<String>,
     },
-    /// Stateless credential smoke-check: obtain the DEK, verify the MAC, drop it.
+    /// Stateless credential smoke-check: derive the DEK, verify the MAC, drop it.
     Unlock {
+        /// Unlock passphrase. Prompted if omitted.
         #[arg(long)]
+        passphrase: Option<String>,
+        /// Unlock via the recovery escrow (single factor) instead of TPM+passphrase.
+        #[arg(long)]
+        recovery: bool,
+        #[arg(long, requires = "recovery")]
         recovery_passphrase: Option<String>,
     },
     /// No-op (nothing is persisted); prints `locked` for CLI symmetry.
     Lock,
-    /// Add or append a secret record.
+    /// Add a secret record (fails if the name exists; use --force to replace).
     Add {
         /// Record name.
         name: String,
-        /// Secret value. If omitted, read from stdin (see notes).
+        /// Secret value. Prompted (no echo) if omitted.
         #[arg(long)]
         value: Option<String>,
+        /// Replace the value in place if the name already exists (rotation),
+        /// instead of failing. Without it, adding an existing name is refused so
+        /// a secret is never silently shadowed.
         #[arg(long)]
+        force: bool,
+        /// Unlock passphrase. Prompted if omitted.
+        #[arg(long)]
+        passphrase: Option<String>,
+        /// Unlock via the recovery escrow instead of TPM+passphrase.
+        #[arg(long)]
+        recovery: bool,
+        #[arg(long, requires = "recovery")]
+        recovery_passphrase: Option<String>,
+    },
+    /// Remove a secret record.
+    Rm {
+        /// Record name to remove.
+        name: String,
+        /// Unlock passphrase. Prompted if omitted.
+        #[arg(long)]
+        passphrase: Option<String>,
+        /// Unlock via the recovery escrow instead of TPM+passphrase.
+        #[arg(long)]
+        recovery: bool,
+        #[arg(long, requires = "recovery")]
         recovery_passphrase: Option<String>,
     },
     /// Retrieve a secret; prints to stdout, or copies to the clipboard with --clip.
@@ -71,7 +111,13 @@ enum Cmd {
         /// Copy to clipboard (auto-clears in 15s) instead of printing.
         #[arg(long)]
         clip: bool,
+        /// Unlock passphrase. Prompted if omitted.
         #[arg(long)]
+        passphrase: Option<String>,
+        /// Unlock via the recovery escrow instead of TPM+passphrase.
+        #[arg(long)]
+        recovery: bool,
+        #[arg(long, requires = "recovery")]
         recovery_passphrase: Option<String>,
     },
     /// List record names (no DEK needed).
@@ -87,6 +133,12 @@ enum Cmd {
     },
     /// Report hardware-binding status of the vault (no DEK needed).
     SealStatus,
+    /// Delete the persisted TPM wrapping key (DESTRUCTIVE — see confirmation).
+    Deprovision {
+        /// Skip the interactive confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
 
     // --- Verification-harness-only subcommands (feature-gated) ---------------
     // These are compiled ONLY under `--features leaktest`; a normal production
@@ -105,7 +157,7 @@ enum Cmd {
         /// Record name to fetch and copy.
         name: String,
         #[arg(long)]
-        recovery_passphrase: String,
+        passphrase: String,
     },
     /// [leaktest] Positive control: keep `<canary>` in a plain, never-zeroized
     /// String alive across the dump, print READY, then block. Proves the
@@ -134,45 +186,59 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let path = cli.vault.as_path();
 
     match cli.cmd {
-        Cmd::Init { allow_no_tpm, recovery_passphrase } => {
-            cmd_init(path, allow_no_tpm, recovery_passphrase)?;
+        Cmd::Init { allow_no_tpm, passphrase, recovery, recovery_passphrase } => {
+            let pass = resolve_new_passphrase("unlock passphrase", passphrase)?;
+            let recovery_pw = if recovery {
+                Some(resolve_new_passphrase("recovery passphrase", recovery_passphrase)?)
+            } else {
+                None
+            };
+            cmd_init(path, allow_no_tpm, pass, recovery_pw)?;
         }
-        Cmd::Unlock { recovery_passphrase } => {
+        Cmd::Unlock { passphrase, recovery, recovery_passphrase } => {
             let locked = LockedVault::load(path)?;
-            let dek = obtain_dek(
-                locked.header(),
-                recovery_passphrase.map(SecretString::from_string),
-            )?;
-            // unlock_with_dek verifies the header MAC and fails closed.
-            let _vault = locked.unlock_with_dek(dek)?;
+            // unlock_* verify the header MAC and fail closed.
+            let _vault = unlock_vault(locked, passphrase, recovery, recovery_passphrase)?;
             println!("unlock OK");
         }
         Cmd::Lock => {
             // Stateless: there is no on-disk session to clear.
             println!("locked");
         }
-        Cmd::Add { name, value, recovery_passphrase } => {
+        Cmd::Add { name, value, force, passphrase, recovery, recovery_passphrase } => {
             let locked = LockedVault::load(path)?;
-            let dek = obtain_dek(
-                locked.header(),
-                recovery_passphrase.map(SecretString::from_string),
-            )?;
-            let mut vault = locked.unlock_with_dek(dek)?;
+            let mut vault = unlock_vault(locked, passphrase, recovery, recovery_passphrase)?;
             let value = match value {
-                Some(v) => v,
-                None => read_secret_line("value: ")?,
+                Some(v) => {
+                    eprintln!("warning: passing --value on the command line exposes it via the process list; prefer interactive entry");
+                    v
+                }
+                None => prompt::read_secret_noecho("value: ")?,
             };
-            vault.add(&name, SecretString::from_string(value))?;
+            let secret = SecretString::from_string(value);
+            if force {
+                vault.upsert(&name, secret)?;
+            } else {
+                // Fails closed with Error::Duplicate if the name exists, so a
+                // second `add` can never silently shadow an existing secret.
+                vault.add(&name, secret)?;
+            }
             vault.save(path)?;
-            println!("added {name}");
+            println!("{} {name}", if force { "set" } else { "added" });
         }
-        Cmd::Get { name, clip, recovery_passphrase } => {
+        Cmd::Rm { name, passphrase, recovery, recovery_passphrase } => {
             let locked = LockedVault::load(path)?;
-            let dek = obtain_dek(
-                locked.header(),
-                recovery_passphrase.map(SecretString::from_string),
-            )?;
-            let vault = locked.unlock_with_dek(dek)?;
+            let mut vault = unlock_vault(locked, passphrase, recovery, recovery_passphrase)?;
+            if vault.remove(&name) {
+                vault.save(path)?;
+                println!("removed {name}");
+            } else {
+                return Err(Box::new(Error::NotFound(name)));
+            }
+        }
+        Cmd::Get { name, clip, passphrase, recovery, recovery_passphrase } => {
+            let locked = LockedVault::load(path)?;
+            let vault = unlock_vault(locked, passphrase, recovery, recovery_passphrase)?;
             let secret = vault.get(&name)?;
             if clip {
                 clip::copy_with_autoclear(secret.expose_str(), 15)?;
@@ -187,26 +253,57 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             for name in locked.record_names() {
                 println!("{name}");
             }
+            // `list` reads names without the DEK, so the header MAC cannot be
+            // checked here: the names shown are unauthenticated until an unlock
+            // (get/unlock) verifies the MAC. Flag that on stderr so stdout stays
+            // pipe-clean but the trust boundary is never silently elided.
+            eprintln!(
+                "note: names are unauthenticated metadata read without unlocking; \
+                 tampering is detected only at unlock (get/unlock)"
+            );
         }
         Cmd::Gen { len, symbols } => {
-            let (password, charset_size) = gen_password(len, symbols);
+            let (secret, charset_size) = gen_password(len, symbols);
             let bits = (len as f64) * (charset_size as f64).log2();
-            // Wrap so the buffer zeroizes; print via expose_str().
-            let secret = SecretString::from_string(password);
             println!("{}", secret.expose_str());
             eprintln!("~{bits:.0} bits of entropy");
+        }
+        Cmd::Deprovision { yes } => {
+            cmd_deprovision(yes)?;
         }
         Cmd::SealStatus => {
             let locked = LockedVault::load(path)?;
             let header = locked.header();
+            println!("format_version: {}", header.format_version);
             println!("hardware_bound: {}", header.hardware_bound);
+            println!(
+                "factors: {}",
+                if header.hardware_bound {
+                    "TPM + passphrase (two-factor)"
+                } else {
+                    "passphrase only"
+                }
+            );
+            println!("recovery_escrow: {}", header.recovery_wrap.is_some());
             println!("provider: {}", active_provider_describe(header));
             println!("pcr_selection: {:?}", header.pcr_selection);
             if !header.hardware_bound {
                 println!(
-                    "warning: hardware binding is OFF; vault is protected by the recovery passphrase only"
+                    "warning: hardware binding is OFF; vault is protected by the passphrase only"
                 );
             }
+            if header.recovery_wrap.is_some() {
+                println!(
+                    "warning: recovery escrow is enabled; a stolen vault is only as strong as the recovery passphrase"
+                );
+            }
+            // These fields are read straight from the header without the DEK, so
+            // the header MAC is not verified here: on a tampered file they can be
+            // misleading. Any real unlock still fails closed on tamper.
+            eprintln!(
+                "note: the fields above are read without unlocking and are not \
+                 authenticated until unlock; a real unlock still fails closed on tamper"
+            );
         }
 
         // --- Verification-harness-only subcommands (feature-gated) -----------
@@ -220,23 +317,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             // _locked drops here (after the dump), carrying only ciphertext.
         }
         #[cfg(feature = "leaktest")]
-        Cmd::HoldPostclip { name, recovery_passphrase } => {
-            // Perform the whole get+clip inside an inner scope so the
-            // `SecretString` and the DEK (inside `Vault`) run their zeroizing
-            // `Drop` BEFORE we print READY. After this block the process heap
-            // must be clean: the plaintext lives on only in the OS clipboard
-            // (a separate process, out of scope for this assertion).
+        Cmd::HoldPostclip { name, passphrase } => {
+            // Perform the whole unlock+get+clip inside an inner scope so the
+            // `SecretString`, the DEK, the passphrase, and the TPM secret all run
+            // their zeroizing `Drop` BEFORE we print READY. After this block the
+            // process heap must be clean: the plaintext lives on only in the OS
+            // clipboard (a separate process, out of scope for this assertion).
             {
                 let locked = LockedVault::load(path)?;
-                let dek = obtain_dek(
-                    locked.header(),
-                    Some(SecretString::from_string(recovery_passphrase)),
-                )?;
-                let vault = locked.unlock_with_dek(dek)?;
+                let vault = unlock_vault(locked, Some(passphrase), false, None)?;
                 let secret = vault.get(&name)?;
                 clip::copy_with_autoclear(secret.expose_str(), 15)?;
-                // secret (SecretString) and vault (owning the DEK SecretBytes)
-                // both drop here -> zeroized -> heap clean before READY.
             }
             hold_until_stdin_eof()?;
         }
@@ -268,11 +359,17 @@ fn hold_until_stdin_eof() -> std::io::Result<()> {
     Ok(())
 }
 
-/// Create a new vault. Refuses to overwrite an existing file.
+/// Create a new v2 (two-factor) vault. Refuses to overwrite an existing file.
+///
+/// Default: DEK wrapped under `HKDF(tpm_secret ‖ Argon2id(passphrase))` — both
+/// the TPM and the passphrase are required to unlock. `--allow-no-tpm` drops the
+/// TPM factor (passphrase-only). `recovery = Some` adds an optional single-factor
+/// escrow that survives TPM loss but weakens theft resistance.
 fn cmd_init(
     path: &std::path::Path,
     allow_no_tpm: bool,
-    recovery_passphrase: String,
+    passphrase: String,
+    recovery: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if path.exists() {
         return Err(Box::new(Error::Provider(format!(
@@ -282,109 +379,168 @@ fn cmd_init(
     }
 
     let dek = SecretBytes::generate(32);
-    let params = Argon2Params::default_tuned();
+    let kdf = Argon2Params::default_tuned();
 
-    // Recovery escrow (always present).
-    let recovery_wrap = RecoveryProvider::new(
-        SecretString::from_string(recovery_passphrase),
-        params,
-    )
-    .seal(&dek, &[])?
-    .0;
-
-    // TPM hardware binding (best effort unless opted out).
+    // TPM secret factor (best effort unless opted out). We seal a fresh RANDOM
+    // 32-byte secret (not the DEK) so the TPM alone can never yield the DEK.
     let mut tpm_wrap: Option<Vec<u8>> = None;
+    let mut tpm_secret: Option<SecretBytes> = None;
     let mut hardware_bound = false;
     if !allow_no_tpm {
         #[cfg(windows)]
         {
             match CngPcpProvider::open() {
-                Ok(provider) => match provider.seal(&dek, &[]) {
-                    Ok(blob) => {
-                        tpm_wrap = Some(blob.0);
-                        hardware_bound = true;
+                Ok(provider) => {
+                    let secret = SecretBytes::generate(32);
+                    match provider.seal(&secret, &[]) {
+                        Ok(blob) => {
+                            tpm_wrap = Some(blob.0);
+                            tpm_secret = Some(secret);
+                            hardware_bound = true;
+                        }
+                        Err(e) => eprintln!(
+                            "warning: TPM seal failed ({e}); using passphrase-only protection"
+                        ),
                     }
-                    Err(e) => {
-                        eprintln!("warning: TPM seal failed ({e}); using recovery-only protection");
-                    }
-                },
+                }
                 Err(e) => {
-                    eprintln!("warning: TPM unavailable ({e}); using recovery-only protection");
+                    eprintln!("warning: TPM unavailable ({e}); using passphrase-only protection")
                 }
             }
         }
         #[cfg(not(windows))]
         {
             eprintln!(
-                "warning: TPM binding unavailable on this platform; using recovery-only protection"
+                "warning: TPM binding unavailable on this platform; using passphrase-only protection"
             );
         }
     }
 
-    let header = VaultHeader {
-        magic: *b"ZTSV",
-        format_version: 1,
-        hardware_bound,
-        aead_id: 1,
-        kdf: params,
-        pcr_selection: vec![],
-        tpm_wrap,
-        recovery_wrap,
-        header_mac: [0u8; 32],
+    let pass = SecretString::from_string(passphrase);
+    let dek_wrap = envelope::wrap_dek(&dek, &pass, &kdf, tpm_secret.as_ref())?;
+
+    let has_recovery = recovery.is_some();
+    let recovery_pair = match recovery {
+        Some(rp) => {
+            let rkdf = Argon2Params::default_tuned();
+            let rpass = SecretString::from_string(rp);
+            let rw = envelope::wrap_dek_recovery(&dek, &rpass, &rkdf)?;
+            Some((rw, rkdf))
+        }
+        None => None,
     };
 
+    let header = VaultHeader::new_v2(hardware_bound, kdf, tpm_wrap, dek_wrap, recovery_pair);
     // Zero records; save() computes and writes the header MAC, then the DEK drops.
-    let vault = Vault::new_unlocked(dek, header);
+    let mut vault = Vault::new_unlocked(dek, header);
     vault.save(path)?;
 
     if !hardware_bound {
         eprintln!("******************************************************************");
         eprintln!("** WARNING: HARDWARE BINDING IS OFF                             **");
-        eprintln!("** This vault is NOT bound to the TPM. It is protected ONLY by  **");
-        eprintln!("** the recovery passphrase. Anyone with the vault file and the  **");
-        eprintln!("** passphrase can decrypt it on any machine.                    **");
+        eprintln!("** This vault is protected by the PASSPHRASE ONLY (single       **");
+        eprintln!("** factor). Anyone with the file and the passphrase can decrypt **");
+        eprintln!("** it on any machine.                                           **");
         eprintln!("******************************************************************");
+    } else if !has_recovery {
+        eprintln!("NOTE: two-factor (TPM + passphrase), no recovery escrow. If the TPM is");
+        eprintln!("reset/lost (or you run `deprovision`), this vault CANNOT be recovered.");
+        eprintln!("Re-init with --recovery to add a passphrase-only escrow (weaker vs. theft).");
+    }
+    if has_recovery {
+        eprintln!("WARNING: recovery escrow enabled. A STOLEN vault is only as strong as the");
+        eprintln!("recovery passphrase (it bypasses the TPM second factor by design).");
     }
 
-    println!("initialized vault at {}", path.display());
+    let factors = if hardware_bound {
+        "TPM + passphrase"
+    } else {
+        "passphrase only"
+    };
+    println!("initialized vault at {} (factors: {factors})", path.display());
     Ok(())
+}
+
+/// Delete the persisted TPM wrapping key. Destructive: requires typed
+/// confirmation (or `--yes`), because it renders every TPM-bound vault on this
+/// machine undecryptable via the TPM (a vault's recovery passphrase still works).
+fn cmd_deprovision(yes: bool) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(windows)]
+    {
+        if !yes {
+            eprintln!("WARNING: this deletes the machine's TPM wrapping key.");
+            eprintln!("Every TPM-bound vault becomes undecryptable via the TPM afterward");
+            eprintln!("(a vault's recovery passphrase, if set, still works).");
+            eprint!("Type DELETE to confirm: ");
+            std::io::stderr().flush()?;
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line)?;
+            if line.trim() != "DELETE" {
+                println!("aborted");
+                return Ok(());
+            }
+        }
+        match CngPcpProvider::deprovision()? {
+            true => println!("TPM wrapping key deleted"),
+            false => println!("no TPM wrapping key present (nothing to delete)"),
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = yes;
+        println!("no TPM provider on this platform (nothing to deprovision)");
+        Ok(())
+    }
 }
 
 /// Obtain the DEK without persisting it. TPM unseal for hardware-bound vaults,
 /// otherwise unwrap via the recovery passphrase. Returns an owned, page-locked,
 /// zeroize-on-drop `SecretBytes`.
+/// Unlock a loaded vault. Default path is two-factor: for a hardware-bound vault
+/// the TPM secret is unsealed (silently) AND the unlock passphrase is required;
+/// for a `--allow-no-tpm` vault the passphrase is the sole factor. With
+/// `recovery`, the single-factor recovery escrow is used instead. All paths
+/// verify the header MAC and fail closed.
 ///
-/// The passphrase is taken as an owned `SecretString` (zeroize-on-drop) rather
-/// than a `&str` borrow of a clap-owned `String`: the caller moves the parsed
-/// argument straight into a `SecretString`, which scrubs the original heap
-/// buffer, so the passphrase does not linger un-zeroized in process memory.
-/// (Its presence in argv is a separate, documented exposure.)
-fn obtain_dek(
-    header: &VaultHeader,
-    recovery_pw: Option<SecretString>,
-) -> vaultcore::Result<SecretBytes> {
-    if header.hardware_bound {
+/// Passphrases are moved straight into zeroize-on-drop `SecretString`s (scrubbing
+/// the clap-owned copies); the TPM secret is a page-locked `SecretBytes` that
+/// drops before this returns.
+fn unlock_vault(
+    locked: LockedVault,
+    passphrase: Option<String>,
+    recovery: bool,
+    recovery_passphrase: Option<String>,
+) -> Result<Vault, Box<dyn std::error::Error>> {
+    if recovery {
+        let pw = resolve_unlock_pw("recovery passphrase", recovery_passphrase)?;
+        return Ok(locked.unlock_recovery(&pw)?);
+    }
+
+    let hardware_bound = locked.header().hardware_bound;
+    let tpm_wrap = locked.header().tpm_wrap.clone();
+
+    let tpm_secret = if hardware_bound {
         #[cfg(windows)]
         {
             let provider = CngPcpProvider::open()?;
-            let wrap = header
-                .tpm_wrap
-                .clone()
-                .ok_or_else(|| Error::Provider("hardware_bound vault has no tpm_wrap".into()))?;
-            return provider.unseal(&SealedBlob(wrap));
+            let wrap = tpm_wrap.ok_or_else(|| {
+                Box::new(Error::Provider("hardware_bound vault has no tpm_wrap".into()))
+                    as Box<dyn std::error::Error>
+            })?;
+            Some(provider.unseal(&SealedBlob(wrap))?)
         }
         #[cfg(not(windows))]
         {
-            return Err(Error::Provider(
-                "TPM path unavailable on this platform".into(),
-            ));
+            let _ = tpm_wrap;
+            return Err("TPM path unavailable on this platform".into());
         }
-    }
-    let pw = recovery_pw.ok_or_else(|| {
-        Error::Provider("--recovery-passphrase required (vault is not hardware-bound)".into())
-    })?;
-    let provider = RecoveryProvider::new(pw, header.kdf);
-    provider.unseal(&SealedBlob(header.recovery_wrap.clone()))
+    } else {
+        None
+    };
+
+    let pw = resolve_unlock_pw("unlock passphrase", passphrase)?;
+    Ok(locked.unlock_two_factor(&pw, tpm_secret.as_ref())?)
 }
 
 /// Describe the active key provider for `seal-status` (no DEK needed).
@@ -416,24 +572,49 @@ fn active_provider_describe(header: &VaultHeader) -> String {
     format!("{recovery} — NO hardware binding")
 }
 
-/// Prompt on stderr and read a line from stdin. No-echo is not available without
-/// a new dependency, so this is a plain read for slice 1 (the primary path used
-/// by tests and scripts is `--value`).
-fn read_secret_line(prompt: &str) -> std::io::Result<String> {
-    eprint!("{prompt}");
-    std::io::stderr().flush()?;
-    let mut line = String::new();
-    std::io::stdin().read_line(&mut line)?;
-    while line.ends_with('\n') || line.ends_with('\r') {
-        line.pop();
+/// Resolve a NEW passphrase for `init` (labelled "unlock passphrase" or
+/// "recovery passphrase"). If supplied on argv, warn and use it; otherwise
+/// prompt twice (no echo) and require the entries to match. Rejects empty.
+fn resolve_new_passphrase(
+    label: &str,
+    provided: Option<String>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    if let Some(v) = provided {
+        eprintln!("warning: passing a passphrase on the command line exposes it via the process list; prefer the interactive prompt");
+        if v.is_empty() {
+            return Err(format!("{label} must not be empty").into());
+        }
+        return Ok(v);
     }
-    Ok(line)
+    let pw = prompt::read_secret_noecho(&format!("new {label}: "))?;
+    if pw.is_empty() {
+        return Err(format!("{label} must not be empty").into());
+    }
+    let confirm = prompt::read_secret_noecho(&format!("confirm {label}: "))?;
+    if pw != confirm {
+        return Err("passphrases did not match".into());
+    }
+    Ok(pw)
+}
+
+/// Resolve an existing passphrase for an unlock-path command. If supplied on
+/// argv, warn and use it; otherwise prompt once without echo. The result moves
+/// into a zeroize-on-drop `SecretString`.
+fn resolve_unlock_pw(label: &str, provided: Option<String>) -> std::io::Result<SecretString> {
+    if let Some(v) = provided {
+        eprintln!("warning: passing a passphrase on the command line exposes it via the process list; prefer interactive entry");
+        return Ok(SecretString::from_string(v));
+    }
+    let pw = prompt::read_secret_noecho(&format!("{label}: "))?;
+    Ok(SecretString::from_string(pw))
 }
 
 /// Generate a password from a CSPRNG (via `SecretBytes::generate`, OsRng-backed).
 /// Uses rejection sampling so each character is uniform over the charset, keeping
-/// the reported entropy honest. Returns the password and the charset size.
-fn gen_password(len: usize, symbols: bool) -> (String, usize) {
+/// the reported entropy honest. The password is built directly in a page-locked,
+/// zeroize-on-drop buffer (never an ordinary `String`), and returned as a
+/// `SecretString` alongside the charset size.
+fn gen_password(len: usize, symbols: bool) -> (SecretString, usize) {
     const LOWER: &[u8] = b"abcdefghijklmnopqrstuvwxyz";
     const UPPER: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ";
     const DIGITS: &[u8] = b"0123456789";
@@ -452,21 +633,28 @@ fn gen_password(len: usize, symbols: bool) -> (String, usize) {
     // avoid modulo bias.
     let threshold = (256 / n) * n;
 
-    let mut out = String::with_capacity(len);
-    while out.len() < len {
-        let need = len - out.len();
+    // Fill an exact-length, page-locked secret buffer in place -- no plaintext
+    // password ever lives in an unlocked, un-scrubbed heap allocation.
+    let mut out = SecretBytes::zeros(len);
+    let mut filled = 0usize;
+    while filled < len {
+        let need = len - filled;
         // Over-provision to reduce the number of CSPRNG draws.
         let batch = SecretBytes::generate(need.saturating_mul(2).max(16));
         for &b in batch.expose() {
-            if out.len() == len {
+            if filled == len {
                 break;
             }
             let b = b as usize;
             if b < threshold {
-                out.push(charset[b % n] as char);
+                out.expose_mut()[filled] = charset[b % n];
+                filled += 1;
             }
         }
         // batch (SecretBytes) drops here -> zeroized.
     }
-    (out, n)
+    // `out` is exactly `len` ASCII bytes, hence valid UTF-8; wrap it in place.
+    let secret = SecretString::from_secret_bytes(out)
+        .expect("generated password is ASCII (valid UTF-8)");
+    (secret, n)
 }
