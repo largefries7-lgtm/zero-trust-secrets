@@ -48,6 +48,30 @@ pub fn hkdf_subkey(dek: &SecretBytes, info: &[u8], out_len: usize) -> SecretByte
     out
 }
 
+/// Derive the key-encryption key (KEK) that wraps the DEK, from the available
+/// factors, for the two-factor (v2) envelope.
+///
+/// `pass_key` is the Argon2id output of the unlock passphrase. `tpm_secret`, when
+/// present (a hardware-bound vault), is the 32-byte secret unsealed from the TPM.
+/// When the TPM factor is present the KEK depends on BOTH inputs, so neither the
+/// TPM alone (which same-user malware can drive) nor the passphrase alone yields
+/// the KEK. The inputs are fixed-length (32 bytes each), so their concatenation
+/// as HKDF IKM is unambiguous; a distinct `info` label domain-separates this KEK.
+pub fn derive_kek_v2(pass_key: &SecretBytes, tpm_secret: Option<&SecretBytes>) -> SecretBytes {
+    use zeroize::Zeroize;
+    let mut ikm = Vec::with_capacity(2 * KEY_LEN);
+    if let Some(ts) = tpm_secret {
+        ikm.extend_from_slice(ts.expose());
+    }
+    ikm.extend_from_slice(pass_key.expose());
+    let hk = Hkdf::<Sha256>::new(None, &ikm);
+    let mut out = SecretBytes::zeros(KEY_LEN);
+    hk.expand(b"ztsv-kek-v2", out.expose_mut())
+        .expect("hkdf out_len == 32 <= 255*32");
+    ikm.zeroize(); // scrub the transient concatenation of secret factors
+    out
+}
+
 #[derive(Clone, Copy)]
 pub struct Argon2Params {
     pub mem_kib: u32,
@@ -116,6 +140,26 @@ mod tests {
         let b = hkdf_subkey(&dek, b"header-mac", KEY_LEN);
         assert!(a.ct_eq(&a2));
         assert!(!a.ct_eq(&b));
+    }
+
+    #[test]
+    fn kek_v2_requires_both_factors_and_is_deterministic() {
+        let pass = SecretBytes::from_exact(&[1u8; KEY_LEN]);
+        let tpm = SecretBytes::from_exact(&[2u8; KEY_LEN]);
+
+        let both = derive_kek_v2(&pass, Some(&tpm));
+        // Deterministic for the same factors.
+        assert!(both.ct_eq(&derive_kek_v2(&pass, Some(&tpm))));
+        // Passphrase alone (no TPM factor) yields a DIFFERENT KEK: a same-user
+        // attacker who can drive the TPM but lacks the passphrase cannot get it,
+        // and vice-versa.
+        assert!(!both.ct_eq(&derive_kek_v2(&pass, None)));
+        // Wrong TPM secret -> different KEK.
+        assert!(!both.ct_eq(&derive_kek_v2(&pass, Some(&SecretBytes::from_exact(&[9u8; KEY_LEN])))));
+        // Wrong passphrase -> different KEK.
+        let pass2 = SecretBytes::from_exact(&[7u8; KEY_LEN]);
+        assert!(!both.ct_eq(&derive_kek_v2(&pass2, Some(&tpm))));
+        assert_eq!(both.len(), KEY_LEN);
     }
 
     #[test]

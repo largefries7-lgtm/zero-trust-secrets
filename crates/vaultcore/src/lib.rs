@@ -1,6 +1,7 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 pub mod crypto;
+pub mod envelope;
 pub mod keyprovider;
 pub mod memlock;
 pub mod secret;
