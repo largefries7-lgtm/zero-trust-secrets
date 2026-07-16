@@ -15,11 +15,8 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
-use vaultcore::crypto::Argon2Params;
-use vaultcore::envelope;
-use vaultcore::keyprovider::{KeyProvider, RecoveryProvider, SealedBlob};
-use vaultcore::secret::{SecretBytes, SecretString};
-use vaultcore::vault::{LockedVault, Vault, VaultHeader};
+use vaultcore::secret::SecretString;
+use vaultcore::vault::{LockedVault, Vault};
 use vaultcore::Error;
 
 #[cfg(windows)]
@@ -285,7 +282,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             );
             println!("recovery_escrow: {}", header.recovery_wrap.is_some());
-            println!("provider: {}", active_provider_describe(header));
+            println!("provider: {}", vaultcore::flow::describe_provider(header));
             println!("pcr_selection: {:?}", header.pcr_selection);
             if !header.hardware_bound {
                 println!(
@@ -371,88 +368,45 @@ fn cmd_init(
     passphrase: String,
     recovery: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if path.exists() {
-        return Err(Box::new(Error::Provider(format!(
-            "vault already exists at {}; refusing to overwrite",
-            path.display()
-        ))));
+    use vaultcore::flow::{create_vault, CreateOptions, TpmBinding};
+
+    let outcome = create_vault(
+        path,
+        CreateOptions {
+            allow_no_tpm,
+            passphrase: SecretString::from_string(passphrase),
+            recovery_passphrase: recovery.map(SecretString::from_string),
+        },
+    )?;
+
+    match &outcome.tpm {
+        TpmBinding::Unavailable(msg) => {
+            eprintln!("warning: TPM unavailable ({msg}); using passphrase-only protection")
+        }
+        TpmBinding::SealFailed(msg) => {
+            eprintln!("warning: TPM seal failed ({msg}); using passphrase-only protection")
+        }
+        TpmBinding::Bound | TpmBinding::OptedOut => {}
     }
 
-    let dek = SecretBytes::generate(32);
-    let kdf = Argon2Params::default_tuned();
-
-    // TPM secret factor (best effort unless opted out). We seal a fresh RANDOM
-    // 32-byte secret (not the DEK) so the TPM alone can never yield the DEK.
-    let mut tpm_wrap: Option<Vec<u8>> = None;
-    let mut tpm_secret: Option<SecretBytes> = None;
-    let mut hardware_bound = false;
-    if !allow_no_tpm {
-        #[cfg(windows)]
-        {
-            match CngPcpProvider::open() {
-                Ok(provider) => {
-                    let secret = SecretBytes::generate(32);
-                    match provider.seal(&secret, &[]) {
-                        Ok(blob) => {
-                            tpm_wrap = Some(blob.0);
-                            tpm_secret = Some(secret);
-                            hardware_bound = true;
-                        }
-                        Err(e) => eprintln!(
-                            "warning: TPM seal failed ({e}); using passphrase-only protection"
-                        ),
-                    }
-                }
-                Err(e) => {
-                    eprintln!("warning: TPM unavailable ({e}); using passphrase-only protection")
-                }
-            }
-        }
-        #[cfg(not(windows))]
-        {
-            eprintln!(
-                "warning: TPM binding unavailable on this platform; using passphrase-only protection"
-            );
-        }
-    }
-
-    let pass = SecretString::from_string(passphrase);
-    let dek_wrap = envelope::wrap_dek(&dek, &pass, &kdf, tpm_secret.as_ref())?;
-
-    let has_recovery = recovery.is_some();
-    let recovery_pair = match recovery {
-        Some(rp) => {
-            let rkdf = Argon2Params::default_tuned();
-            let rpass = SecretString::from_string(rp);
-            let rw = envelope::wrap_dek_recovery(&dek, &rpass, &rkdf)?;
-            Some((rw, rkdf))
-        }
-        None => None,
-    };
-
-    let header = VaultHeader::new_v2(hardware_bound, kdf, tpm_wrap, dek_wrap, recovery_pair);
-    // Zero records; save() computes and writes the header MAC, then the DEK drops.
-    let mut vault = Vault::new_unlocked(dek, header);
-    vault.save(path)?;
-
-    if !hardware_bound {
+    if !outcome.hardware_bound {
         eprintln!("******************************************************************");
         eprintln!("** WARNING: HARDWARE BINDING IS OFF                             **");
         eprintln!("** This vault is protected by the PASSPHRASE ONLY (single       **");
         eprintln!("** factor). Anyone with the file and the passphrase can decrypt **");
         eprintln!("** it on any machine.                                           **");
         eprintln!("******************************************************************");
-    } else if !has_recovery {
+    } else if !outcome.has_recovery {
         eprintln!("NOTE: two-factor (TPM + passphrase), no recovery escrow. If the TPM is");
         eprintln!("reset/lost (or you run `deprovision`), this vault CANNOT be recovered.");
         eprintln!("Re-init with --recovery to add a passphrase-only escrow (weaker vs. theft).");
     }
-    if has_recovery {
+    if outcome.has_recovery {
         eprintln!("WARNING: recovery escrow enabled. A STOLEN vault is only as strong as the");
         eprintln!("recovery passphrase (it bypasses the TPM second factor by design).");
     }
 
-    let factors = if hardware_bound {
+    let factors = if outcome.hardware_bound {
         "TPM + passphrase"
     } else {
         "passphrase only"
@@ -512,64 +466,13 @@ fn unlock_vault(
     recovery: bool,
     recovery_passphrase: Option<String>,
 ) -> Result<Vault, Box<dyn std::error::Error>> {
+    use vaultcore::flow::{unlock, UnlockFactors};
     if recovery {
         let pw = resolve_unlock_pw("recovery passphrase", recovery_passphrase)?;
-        return Ok(locked.unlock_recovery(&pw)?);
+        return Ok(unlock(locked, UnlockFactors::Recovery { recovery_passphrase: &pw })?);
     }
-
-    let hardware_bound = locked.header().hardware_bound;
-    let tpm_wrap = locked.header().tpm_wrap.clone();
-
-    let tpm_secret = if hardware_bound {
-        #[cfg(windows)]
-        {
-            let provider = CngPcpProvider::open()?;
-            let wrap = tpm_wrap.ok_or_else(|| {
-                Box::new(Error::Provider("hardware_bound vault has no tpm_wrap".into()))
-                    as Box<dyn std::error::Error>
-            })?;
-            Some(provider.unseal(&SealedBlob(wrap))?)
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = tpm_wrap;
-            return Err("TPM path unavailable on this platform".into());
-        }
-    } else {
-        None
-    };
-
     let pw = resolve_unlock_pw("unlock passphrase", passphrase)?;
-    Ok(locked.unlock_two_factor(&pw, tpm_secret.as_ref())?)
-}
-
-/// Describe the active key provider for `seal-status` (no DEK needed).
-///
-/// This must never claim TPM/hardware protection for a vault that isn't
-/// actually hardware-bound: only consult (and name) the CNG/TPM provider
-/// when `header.hardware_bound` is true. Otherwise the recovery passphrase
-/// (Argon2id escrow) is what actually protects the vault, so describe that
-/// instead -- without opening or naming the CNG provider at all.
-fn active_provider_describe(header: &VaultHeader) -> String {
-    if header.hardware_bound {
-        #[cfg(windows)]
-        {
-            if let Ok(provider) = CngPcpProvider::open() {
-                return provider.describe();
-            }
-            return "TPM-backed (hardware_bound is set, but the CNG provider could not be opened)"
-                .to_string();
-        }
-        #[cfg(not(windows))]
-        {
-            return "TPM-backed (hardware_bound is set, but this platform has no CNG provider)"
-                .to_string();
-        }
-    }
-    // Not hardware-bound: describe the recovery provider only. Passphrase is
-    // not used by describe(); construct with an empty one.
-    let recovery = RecoveryProvider::new(SecretString::from_string(String::new()), header.kdf).describe();
-    format!("{recovery} — NO hardware binding")
+    Ok(unlock(locked, UnlockFactors::TwoFactor { passphrase: &pw })?)
 }
 
 /// Resolve a NEW passphrase for `init` (labelled "unlock passphrase" or
