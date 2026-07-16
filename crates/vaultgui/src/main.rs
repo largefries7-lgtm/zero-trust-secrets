@@ -1,11 +1,15 @@
 //! GUI entry point: builds the Slint `App`, loads non-secret prefs, populates
-//! startup UI state, and wires the NON-SECRET callback layer (lock, theme,
-//! idle-timeout, record selection/mask, navigation). No secret material is
-//! touched here: the secret-flow callbacks (`unlock`, `create_vault`,
-//! `reveal`, `copy`, `add_secret`, `rotate`, `remove`, `generate`,
-//! `deprovision`) and the OS watcher / anti-capture wiring are deferred to
-//! later tasks (D3a-2, D3b) and are simply left unregistered for now (an
-//! unregistered Slint callback is an inert no-op).
+//! startup UI state, and wires every `App` callback. D3a-1 wired the
+//! NON-SECRET layer (lock, theme, idle-timeout, record selection/mask,
+//! navigation); D3a-2 (this pass) wires the SECRET-FLOW layer (`unlock`,
+//! `create_vault`, `reveal`, `copy`, `copy_generated`, `add_secret`, `rotate`,
+//! `remove`, `generate`, `search`, `deprovision`) plus `pick_vault` (an
+//! intentional no-op — a native file-picker dialog is deferred).
+//!
+//! Still deferred to D3b: the OS watcher / auto-lock-on-idle wiring, the
+//! anti-capture wiring, and the ticking clipboard-countdown timer (the
+//! `clip_remaining` property is set on copy but does not yet count down on
+//! its own).
 slint::include_modules!();
 
 use std::cell::RefCell;
@@ -13,10 +17,11 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use slint::{ComponentHandle, SharedString, VecModel};
-use vaultcore::flow::describe_provider;
-use vaultcore::vault::LockedVault;
+use vaultcore::flow::{self, describe_provider, CreateOptions, UnlockFactors};
+use vaultcore::vault::{LockedVault, Vault};
 use vaultgui::prefs::{Prefs, Theme};
-use vaultgui::session::AppState;
+use vaultgui::session::{AppState, Session};
+use vaultgui::{clipboard, input};
 
 /// `%APPDATA%\ZeroTrustSecrets\` (falls back to the current dir if `APPDATA`
 /// is unset, e.g. under a stripped-down test environment).
@@ -33,9 +38,37 @@ fn persist_prefs(prefs: &Prefs, path: &Path) {
     let _ = std::fs::write(path, prefs.to_serialized());
 }
 
+/// Build a `[string]` model from an owned `Vec` (record-name list, filtered
+/// search results, etc.) for `App::set_record_names`.
+fn names_model(v: Vec<SharedString>) -> slint::ModelRc<SharedString> {
+    Rc::new(VecModel::from(v)).into()
+}
+
 /// An empty `[string]` model, for scrubbing `record_names` on lock.
 fn empty_names_model() -> slint::ModelRc<SharedString> {
-    Rc::new(VecModel::<SharedString>::from(vec![])).into()
+    names_model(vec![])
+}
+
+/// Renders the authenticated unlock-factor posture, once an unlock/create has
+/// actually verified it (never shown pre-auth -- see `posture_authenticated`).
+fn posture_string(hardware_bound: bool, has_recovery: bool) -> &'static str {
+    match (hardware_bound, has_recovery) {
+        (true, false) => "TWO-FACTOR · TPM + PASSPHRASE",
+        (true, true) => "TWO-FACTOR · TPM + PASSPHRASE · RECOVERY ESCROW",
+        (false, _) => "PASSPHRASE ONLY",
+    }
+}
+
+/// After a vault mutation (add/rotate/remove), recompute the full record-name
+/// list from the vault itself and push it both into `full_names` (the
+/// unfiltered source `search` filters against) and `record_names` (what's
+/// currently on screen). Called with an active search filter still in effect
+/// will transiently show the unfiltered list until the next keystroke -- an
+/// acceptable tradeoff since D3a-2 does not re-run the last filter here.
+fn refresh_names(app: &App, full_names: &Rc<RefCell<Vec<SharedString>>>, vault: &Vault) {
+    let names: Vec<SharedString> = vault.list().iter().map(|s| SharedString::from(*s)).collect();
+    *full_names.borrow_mut() = names.clone();
+    app.set_record_names(names_model(names));
 }
 
 /// Transition to locked and scrub every bit of UI state that could otherwise
@@ -162,6 +195,251 @@ fn main() -> Result<(), slint::PlatformError> {
             app.set_revealed_value("".into());
         });
     }
+
+    // ---- Secret-flow callbacks (D3a-2) ---------------------------------
+    // Every typed secret is drained into a `SecretString` via
+    // `input::drain_to_secret` immediately on entry to its callback -- no
+    // secret is held as a plain `String`/`SharedString` past that point. The
+    // sole documented exception is `revealed_value`/`generated_value`
+    // (transient plaintext for on-screen display; scrubbed by `mask`/
+    // `do_lock`). No `set_error` string below ever interpolates secret
+    // material -- vaultcore's `Error` messages carry only names/paths/reasons.
+
+    {
+        let w = app.as_weak();
+        let state = state.clone();
+        let full_names = full_names.clone();
+        let vault_path = vault_path.clone();
+        app.on_unlock(move |passphrase, recovery| {
+            let app = w.unwrap();
+            let pass = input::drain_to_secret(&mut passphrase.to_string());
+            match LockedVault::load(&vault_path) {
+                Ok(locked) => {
+                    let outcome = if recovery {
+                        flow::unlock(locked, UnlockFactors::Recovery { recovery_passphrase: &pass })
+                    } else {
+                        flow::unlock(locked, UnlockFactors::TwoFactor { passphrase: &pass })
+                    };
+                    match outcome {
+                        Ok(vault) => {
+                            // Read header-derived posture + the record list off
+                            // `vault` BEFORE it's moved into the Session below.
+                            let names: Vec<SharedString> =
+                                vault.list().iter().map(|s| SharedString::from(*s)).collect();
+                            let hardware_bound = vault.header().hardware_bound;
+                            let has_recovery = vault.header().recovery_wrap.is_some();
+                            let provider_desc = describe_provider(vault.header());
+
+                            *state.borrow_mut() = AppState::Unlocked(Session::new(vault));
+                            *full_names.borrow_mut() = names.clone();
+                            app.set_record_names(names_model(names));
+                            app.set_hardware_bound(hardware_bound);
+                            app.set_has_recovery(has_recovery);
+                            app.set_provider_desc(provider_desc.into());
+                            app.set_posture(posture_string(hardware_bound, has_recovery).into());
+                            app.set_posture_authenticated(true);
+                            app.set_error("".into());
+                            app.set_screen("vault".into());
+                        }
+                        Err(_) => app.set_error(
+                            "Unlock failed — wrong passphrase, or the vault/TPM is unavailable."
+                                .into(),
+                        ),
+                    }
+                }
+                Err(e) => app.set_error(format!("Could not open vault: {e}").into()),
+            }
+        });
+    }
+
+    {
+        let w = app.as_weak();
+        let vault_path = vault_path.clone();
+        app.on_create_vault(move |passphrase, confirm, allow_no_tpm, use_recovery, recovery_passphrase| {
+            let app = w.unwrap();
+            if passphrase != confirm {
+                app.set_error("Passphrases do not match.".into());
+                return;
+            }
+            let pass = input::drain_to_secret(&mut passphrase.to_string());
+            let rec = if use_recovery {
+                Some(input::drain_to_secret(&mut recovery_passphrase.to_string()))
+            } else {
+                None
+            };
+            match flow::create_vault(
+                &vault_path,
+                CreateOptions { allow_no_tpm, passphrase: pass, recovery_passphrase: rec },
+            ) {
+                Ok(outcome) => {
+                    app.set_error("".into());
+                    app.set_hardware_bound(outcome.hardware_bound);
+                    app.set_has_recovery(outcome.has_recovery);
+                    app.set_posture(
+                        posture_string(outcome.hardware_bound, outcome.has_recovery).into(),
+                    );
+                    app.set_posture_authenticated(false);
+                    app.set_screen("unlock".into());
+                }
+                Err(e) => app.set_error(format!("Could not create vault: {e}").into()),
+            }
+        });
+    }
+
+    {
+        let w = app.as_weak();
+        let state = state.clone();
+        app.on_reveal(move |name| {
+            let app = w.unwrap();
+            let st = state.borrow();
+            if let AppState::Unlocked(s) = &*st {
+                match s.vault().get(&name) {
+                    Ok(v) => app.set_revealed_value(v.expose_str().into()),
+                    Err(e) => app.set_error(format!("Could not read secret: {e}").into()),
+                }
+            }
+        });
+    }
+
+    {
+        let w = app.as_weak();
+        let state = state.clone();
+        app.on_copy(move |name| {
+            let app = w.unwrap();
+            let st = state.borrow();
+            if let AppState::Unlocked(s) = &*st {
+                if let Ok(v) = s.vault().get(&name) {
+                    let _ = clipboard::copy_with_autoclear(v.expose_str(), 15);
+                    app.set_clip_remaining(15);
+                }
+            }
+        });
+    }
+
+    {
+        let w = app.as_weak();
+        app.on_copy_generated(move || {
+            let app = w.unwrap();
+            let g = app.get_generated_value();
+            if !g.is_empty() {
+                let _ = clipboard::copy_with_autoclear(&g, 15);
+                app.set_clip_remaining(15);
+            }
+        });
+    }
+
+    {
+        let w = app.as_weak();
+        let state = state.clone();
+        let full_names = full_names.clone();
+        let vault_path = vault_path.clone();
+        app.on_add_secret(move |name, value| {
+            let app = w.unwrap();
+            let secret = input::drain_to_secret(&mut value.to_string());
+            let mut st = state.borrow_mut();
+            if let AppState::Unlocked(s) = &mut *st {
+                match s.vault_mut().add(&name, secret) {
+                    Ok(()) => {
+                        let _ = s.vault_mut().save(&vault_path);
+                        refresh_names(&app, &full_names, s.vault());
+                    }
+                    Err(vaultcore::Error::Duplicate(_)) => {
+                        app.set_error(format!("A secret named \"{name}\" already exists.").into());
+                    }
+                    Err(e) => app.set_error(format!("{e}").into()),
+                }
+            }
+        });
+    }
+
+    {
+        let w = app.as_weak();
+        let state = state.clone();
+        let full_names = full_names.clone();
+        let vault_path = vault_path.clone();
+        app.on_rotate(move |name, value| {
+            let app = w.unwrap();
+            let secret = input::drain_to_secret(&mut value.to_string());
+            let mut st = state.borrow_mut();
+            if let AppState::Unlocked(s) = &mut *st {
+                match s.vault_mut().upsert(&name, secret) {
+                    Ok(()) => {
+                        let _ = s.vault_mut().save(&vault_path);
+                        refresh_names(&app, &full_names, s.vault());
+                    }
+                    Err(e) => app.set_error(format!("{e}").into()),
+                }
+            }
+        });
+    }
+
+    {
+        let w = app.as_weak();
+        let state = state.clone();
+        let full_names = full_names.clone();
+        let vault_path = vault_path.clone();
+        app.on_remove(move |name| {
+            let app = w.unwrap();
+            let mut st = state.borrow_mut();
+            if let AppState::Unlocked(s) = &mut *st {
+                s.vault_mut().remove(&name);
+                let _ = s.vault_mut().save(&vault_path);
+                refresh_names(&app, &full_names, s.vault());
+            }
+            drop(st);
+            app.set_selected("".into());
+            app.set_revealed_value("".into());
+        });
+    }
+
+    {
+        let w = app.as_weak();
+        app.on_generate(move |length, symbols| {
+            let app = w.unwrap();
+            let (pw, _bits_n) = vaultcore::passgen::generate_password(length.max(1) as usize, symbols);
+            app.set_generated_value(pw.expose_str().into());
+        });
+    }
+
+    {
+        let w = app.as_weak();
+        let full_names = full_names.clone();
+        app.on_search(move |query| {
+            let app = w.unwrap();
+            let q = query.to_lowercase();
+            let filtered: Vec<SharedString> = full_names
+                .borrow()
+                .iter()
+                .filter(|n| n.to_lowercase().contains(q.as_str()))
+                .cloned()
+                .collect();
+            app.set_record_names(names_model(filtered));
+        });
+    }
+
+    {
+        let w = app.as_weak();
+        app.on_deprovision(move || {
+            let app = w.unwrap();
+            #[cfg(windows)]
+            {
+                match vaultcore::keyprovider::CngPcpProvider::deprovision() {
+                    Ok(true) => app.set_error("TPM wrapping key deleted.".into()),
+                    Ok(false) => app.set_error("No TPM wrapping key to delete.".into()),
+                    Err(e) => app.set_error(format!("Deprovision failed: {e}").into()),
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                app.set_error("TPM deprovisioning is not available on this platform.".into());
+            }
+        });
+    }
+
+    // A native file-picker dialog is deferred (post-D3). Registered as an
+    // explicit no-op rather than left unregistered, so the deferral is
+    // documented intent rather than an accidental gap.
+    app.on_pick_vault(move || {});
 
     app.run()
 }

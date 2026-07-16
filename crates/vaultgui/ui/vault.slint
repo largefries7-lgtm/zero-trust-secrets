@@ -6,12 +6,12 @@
 // "contains"/substring test and no array `.filter()` (only
 // to-lowercase/to-uppercase/is-empty/character-count on strings, per the
 // vendored i-slint-compiler sources). So this screen does NOT attempt
-// client-side substring matching in markup — `filter` is two-way bound to
-// the search box (so Rust can always read the live search text) and
-// `record_names` is rendered as-provided. Task D3 is expected to recompute
-// `record_names` to the filtered view whenever the live `filter` text
-// changes (e.g. a short polling timer), keeping the contract's property
-// names/types exactly as specified with no new callback invented.
+// client-side substring matching in markup — `filter` stays two-way bound to
+// the search box (so Rust can always read the live search text, e.g. to
+// restore it after a `changed selected` reset) and `record_names` is rendered
+// as-provided. D3a-2 wires the search box's per-keystroke `edited` callback to
+// the App-level `search(query)` callback, which Rust answers by recomputing
+// `record_names` to the filtered view immediately — no polling timer needed.
 import { Theme } from "theme.slint";
 
 component Seal inherits Rectangle {
@@ -82,6 +82,11 @@ component Field inherits Rectangle {
     in property <bool> masked: false;
     in-out property <string> text <=> input.text;
     callback accepted();
+    // Fired on every keystroke (not just Enter), so a caller can drive a live
+    // search-as-you-type without a polling timer. `self.text` (the TextInput's
+    // own text) is passed along since the builtin `TextInput.edited` callback
+    // itself carries no argument.
+    callback edited(text: string);
 
     height: 36px;
     background: Theme.bg-inset;
@@ -99,6 +104,7 @@ component Field inherits Rectangle {
         font-family: Theme.font-ui;
         font-size: Theme.text-body;
         accepted => { root.accepted(); }
+        edited => { root.edited(self.text); }
     }
 
     if input.text == "" && !input.has-focus: Text {
@@ -133,6 +139,7 @@ export component VaultScreen inherits Rectangle {
     callback rotate(name: string, value: string);
     callback remove(name: string);
     callback lock_now();
+    callback search(query: string);
 
     // Weaker-than-two-factor posture (passphrase-only, or recovery escrow
     // enabled) gets the caution ring on the seal per design-system.md.
@@ -253,6 +260,7 @@ export component VaultScreen inherits Rectangle {
                 Field {
                     placeholder: "Search";
                     text <=> root.filter;
+                    edited(text) => { root.search(text); }
                 }
 
                 Flickable {

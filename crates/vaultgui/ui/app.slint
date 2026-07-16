@@ -61,6 +61,8 @@ export component App inherits Window {
     callback set_timeout(secs: int);
     callback set_dark(value: bool);
     callback deprovision();
+    callback search(query: string);
+    callback copy_generated();
 
     if root.screen == "create" : CreateScreen {
         x: 0;
@@ -112,6 +114,7 @@ export component App inherits Window {
         rotate(name, value) => { root.rotate(name, value); }
         remove(name) => { root.remove(name); }
         lock_now => { root.lock_now(); }
+        search(query) => { root.search(query); }
     }
 
     if root.screen == "settings" : SettingsScreen {
@@ -133,6 +136,7 @@ export component App inherits Window {
         set_dark(value) => { root.set_dark(value); }
         generate(length, symbols) => { root.generate(length, symbols); }
         deprovision => { root.deprovision(); }
+        copy_generated => { root.copy_generated(); }
     }
 
     // Dismissable error banner, always on top (declared last = highest

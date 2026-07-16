@@ -204,6 +204,7 @@ export component SettingsScreen inherits Rectangle {
     callback set_dark(value: bool);
     callback generate(length: int, symbols: bool);
     callback deprovision();
+    callback copy_generated();
 
     // Generator UI state — the length/symbols choice, not a secret. Only
     // the resulting `generated_value` (an App-level property Rust sets) is
@@ -364,24 +365,37 @@ export component SettingsScreen inherits Rectangle {
             }
         }
 
-        if root.generated_value != "": Rectangle {
-            height: 44px;
-            background: Theme.bg-inset;
-            border-radius: Theme.radius-field;
-            border-width: 1px;
-            border-color: Theme.line;
+        if root.generated_value != "": HorizontalLayout {
+            spacing: Theme.space-2;
 
-            TextInput {
-                x: Theme.space-3;
-                width: parent.width - 2 * Theme.space-3;
-                height: 100%;
-                vertical-alignment: center;
-                text: root.generated_value;
-                read-only: true;
-                color: Theme.text-primary;
-                font-family: Theme.font-mono;
-                font-size: Theme.text-mono-lg;
-                font-weight: Theme.weight-mono-lg;
+            Rectangle {
+                horizontal-stretch: 1;
+                height: 44px;
+                background: Theme.bg-inset;
+                border-radius: Theme.radius-field;
+                border-width: 1px;
+                border-color: Theme.line;
+
+                TextInput {
+                    x: Theme.space-3;
+                    width: parent.width - 2 * Theme.space-3;
+                    height: 100%;
+                    vertical-alignment: center;
+                    text: root.generated_value;
+                    read-only: true;
+                    color: Theme.text-primary;
+                    font-family: Theme.font-mono;
+                    font-size: Theme.text-mono-lg;
+                    font-weight: Theme.weight-mono-lg;
+                }
+            }
+
+            // Routes through the auto-clear clipboard path (native Ctrl+C out
+            // of the read-only TextInput above would not auto-clear).
+            GhostButton {
+                text: "Copy";
+                width: 90px;
+                clicked => { root.copy_generated(); }
             }
         }
 
