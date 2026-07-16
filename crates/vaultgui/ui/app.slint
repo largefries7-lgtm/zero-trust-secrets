@@ -1,6 +1,20 @@
+import { Theme } from "theme.slint";
+
 export component App inherits Window {
     title: "Zero-Trust Secrets";
     preferred-width: 900px;
     preferred-height: 600px;
-    Text { text: "vaultgui"; }
+    background: Theme.bg-base;
+
+    init => {
+        Theme.dark = true;
+    }
+
+    // Proves the theme resolves end-to-end; full screens land in D2.
+    Text {
+        text: "vaultgui";
+        color: Theme.text-primary;
+        font-family: Theme.font-ui;
+        font-size: Theme.text-title;
+    }
 }

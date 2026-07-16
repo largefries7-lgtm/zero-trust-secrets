@@ -1,0 +1,73 @@
+// Design-token theme for vaultgui.
+//
+// Pure token module: colors, type scale, spacing/radius. No components or
+// widgets live here — screens (D2) consume `Theme` by importing it.
+//
+// Visual direction: precision instrument / safe hardware. Cool brushed-slate
+// neutrals, one "vault teal" identity accent. Locked = dormant (accent-dim),
+// unlocked = live (accent). See .superpowers/sdd/design-system.md for the
+// source values.
+export global Theme {
+    // Selects the light/dark variant for every color token below. D2/D3 set
+    // this from the real posture (locked/unlocked doesn't change `dark` —
+    // it's a separate light/dark preference); default true (dark) here so a
+    // standalone build/preview has a sensible look.
+    in property <bool> dark: true;
+
+    // ---- Color tokens -----------------------------------------------------
+    // Neutrals — cool slate (blue-gray), never pure black/white.
+    out property <brush> bg-base: dark ? #0F141A : #EDF1F5;
+    out property <brush> bg-raised: dark ? #171E26 : #FFFFFF;
+    out property <brush> bg-inset: dark ? #1C242E : #F4F7FA;
+    out property <brush> line: dark ? #2A343F : #D5DEE7;
+    out property <brush> text-primary: dark ? #E6EDF3 : #14202B;
+    out property <brush> text-secondary: dark ? #9FB0C0 : #4A5A6A;
+    out property <brush> text-faint: dark ? #6B7B8B : #7B8A99;
+
+    // Signal accent — "vault teal" (identity + primary action + focus +
+    // posture-strong).
+    out property <brush> accent: dark ? #35B7A6 : #0E8C7E;
+    out property <brush> accent-dim: dark ? #4A5C63 : #7E948F;
+    out property <brush> on-accent: dark ? #08110F : #FFFFFF;
+
+    // Semantics. `ok` intentionally reuses `accent` per design-system.md
+    // (posture "strong" reuses the identity teal) — not duplicated here.
+    out property <brush> caution: dark ? #E0A94E : #B9791A;
+    out property <brush> danger: dark ? #E06B5E : #C0392B;
+
+    // ---- Typography ---------------------------------------------------
+    // System fonts only — no bundled files, supply-chain-clean.
+    out property <string> font-ui: "Segoe UI";
+    out property <string> font-mono: "Consolas";
+
+    // Scale (logical px / weight).
+    out property <length> text-display: 26px;
+    out property <int> weight-display: 300;
+    out property <length> text-title: 19px;
+    out property <int> weight-title: 600;
+    out property <length> text-body: 14px;
+    out property <int> weight-body: 400;
+    out property <length> text-label: 11px;
+    out property <int> weight-label: 600;
+    out property <length> text-mono: 14px;
+    out property <int> weight-mono: 400;
+    out property <length> text-mono-lg: 20px;
+    out property <int> weight-mono-lg: 500;
+
+    // `label` tokens are set UPPERCASE by the caller (Slint has no
+    // text-transform); this is the letter-spacing to pair with it. Slint
+    // 1.17's Text element supports `letter-spacing` directly.
+    out property <length> label-letterspacing: 1.2px;
+
+    // ---- Spacing / shape ------------------------------------------------
+    out property <length> space-1: 4px;
+    out property <length> space-2: 8px;
+    out property <length> space-3: 12px;
+    out property <length> space-4: 16px;
+    out property <length> space-6: 24px;
+    out property <length> space-8: 32px;
+    out property <length> space-12: 48px;
+
+    out property <length> radius-panel: 8px;
+    out property <length> radius-field: 6px;
+}
