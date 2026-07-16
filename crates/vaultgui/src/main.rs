@@ -14,6 +14,13 @@
 //! while unlocked.
 slint::include_modules!();
 
+// Scripted hold-mode for the memory-scraping verification harness
+// (verify/dumper). A BIN module (not lib.rs) because it needs the `App` type
+// generated above by `include_modules!()`. Compiled ONLY under
+// `--features leaktest`; absent from a normal build.
+#[cfg(feature = "leaktest")]
+mod leaktest;
+
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -90,6 +97,24 @@ fn do_lock(app: &App, state: &Rc<RefCell<AppState>>, full_names: &Rc<RefCell<Vec
 }
 
 fn main() -> Result<(), slint::PlatformError> {
+    // Verification-harness-only entry point (see leaktest.rs). Checked FIRST,
+    // before any normal UI is built, so the harness can drive this process
+    // into a precise state without ever running the real event loop. Not
+    // present in a normal build (feature-gated).
+    #[cfg(feature = "leaktest")]
+    {
+        let args: Vec<String> = std::env::args().collect();
+        if let Some(pos) = args.iter().position(|a| a == "--leaktest") {
+            if let Err(e) = leaktest::run_from_args(&args[pos + 1..]) {
+                // vaultcore::Error/leaktest usage messages never carry secret
+                // material, so this is safe to print verbatim.
+                eprintln!("leaktest error: {e}");
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
+    }
+
     let app = App::new()?;
 
     let dir = base_dir();
