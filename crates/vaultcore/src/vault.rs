@@ -26,8 +26,10 @@ const MAX_ARGON2_MEM_KIB: u32 = 1 << 20; // 1 GiB
 const MAX_ARGON2_TIME: u32 = 64;
 const MAX_ARGON2_PARALLELISM: u32 = 64;
 /// Current on-disk format version. v2 = two-factor envelope (see `envelope.rs`).
-/// v1 (single-factor: TPM-wraps-DEK *or* passphrase-wraps-DEK) is no longer read
-/// by the hot path; `vaultctl migrate` upgrades a v1 file to v2.
+/// v1 (single-factor: TPM-wraps-DEK *or* passphrase-wraps-DEK) is intentionally
+/// not read by this build — there is no migration command (a v1 reader would
+/// resurrect legacy single-factor crypto); a pre-v2 vault must be recreated with
+/// `vaultctl init` (or the GUI's create flow).
 pub const FORMAT_VERSION: u16 = 2;
 
 /// Authenticated vault header (format v2).
