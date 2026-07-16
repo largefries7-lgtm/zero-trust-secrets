@@ -263,7 +263,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         Cmd::Gen { len, symbols } => {
-            let (secret, charset_size) = gen_password(len, symbols);
+            let (secret, charset_size) = vaultcore::passgen::generate_password(len, symbols);
             let bits = (len as f64) * (charset_size as f64).log2();
             println!("{}", secret.expose_str());
             eprintln!("~{bits:.0} bits of entropy");
@@ -607,54 +607,4 @@ fn resolve_unlock_pw(label: &str, provided: Option<String>) -> std::io::Result<S
     }
     let pw = prompt::read_secret_noecho(&format!("{label}: "))?;
     Ok(SecretString::from_string(pw))
-}
-
-/// Generate a password from a CSPRNG (via `SecretBytes::generate`, OsRng-backed).
-/// Uses rejection sampling so each character is uniform over the charset, keeping
-/// the reported entropy honest. The password is built directly in a page-locked,
-/// zeroize-on-drop buffer (never an ordinary `String`), and returned as a
-/// `SecretString` alongside the charset size.
-fn gen_password(len: usize, symbols: bool) -> (SecretString, usize) {
-    const LOWER: &[u8] = b"abcdefghijklmnopqrstuvwxyz";
-    const UPPER: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ";
-    const DIGITS: &[u8] = b"0123456789";
-    const SYMBOLS: &[u8] = b"!@#$%^&*()-_=+[]{};:,.<>?";
-
-    let mut charset: Vec<u8> = Vec::new();
-    charset.extend_from_slice(LOWER);
-    charset.extend_from_slice(UPPER);
-    charset.extend_from_slice(DIGITS);
-    if symbols {
-        charset.extend_from_slice(SYMBOLS);
-    }
-    let n = charset.len();
-
-    // Largest multiple of n that is <= 256; bytes at/above this are rejected to
-    // avoid modulo bias.
-    let threshold = (256 / n) * n;
-
-    // Fill an exact-length, page-locked secret buffer in place -- no plaintext
-    // password ever lives in an unlocked, un-scrubbed heap allocation.
-    let mut out = SecretBytes::zeros(len);
-    let mut filled = 0usize;
-    while filled < len {
-        let need = len - filled;
-        // Over-provision to reduce the number of CSPRNG draws.
-        let batch = SecretBytes::generate(need.saturating_mul(2).max(16));
-        for &b in batch.expose() {
-            if filled == len {
-                break;
-            }
-            let b = b as usize;
-            if b < threshold {
-                out.expose_mut()[filled] = charset[b % n];
-                filled += 1;
-            }
-        }
-        // batch (SecretBytes) drops here -> zeroized.
-    }
-    // `out` is exactly `len` ASCII bytes, hence valid UTF-8; wrap it in place.
-    let secret = SecretString::from_secret_bytes(out)
-        .expect("generated password is ASCII (valid UTF-8)");
-    (secret, n)
 }

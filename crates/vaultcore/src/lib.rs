@@ -4,6 +4,7 @@ pub mod crypto;
 pub mod envelope;
 pub mod keyprovider;
 pub mod memlock;
+pub mod passgen;
 pub mod secret;
 pub mod vault;
 
