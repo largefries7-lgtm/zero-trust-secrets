@@ -4,3 +4,4 @@
 //! library's public API so they are testable in isolation and never dead code.
 pub mod autolock;
 pub mod input;
+pub mod prefs;
