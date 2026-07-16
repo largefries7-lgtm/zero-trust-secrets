@@ -113,6 +113,11 @@ component Choice inherits TouchArea {
     in property <string> title;
     in property <string> tradeoff;
     in property <bool> selected: false;
+    // Color for the tradeoff/warning line, computed by the caller (see
+    // CreateScreen below) from its own `allow-no-tpm` state — never from
+    // this component's own `selected`, which only reflects "is this the
+    // active card" and says nothing about which option is the risky one.
+    in property <brush> tradeoff-color: Theme.text-secondary;
 
     height: 78px;
 
@@ -139,7 +144,7 @@ component Choice inherits TouchArea {
             }
             Text {
                 text: root.tradeoff;
-                color: root.selected ? Theme.text-secondary : Theme.caution;
+                color: root.tradeoff-color;
                 font-family: Theme.font-ui;
                 font-size: Theme.text-body;
                 wrap: word-wrap;
@@ -191,6 +196,9 @@ export component CreateScreen inherits Rectangle {
                     title: "Two-factor (TPM + passphrase)";
                     tradeoff: "Strongest: needs this machine's TPM and your passphrase.";
                     selected: !root.allow-no-tpm;
+                    // Positive claim, never alarming: accent while it's the
+                    // active choice, plain secondary otherwise.
+                    tradeoff-color: root.allow-no-tpm ? Theme.text-secondary : Theme.accent;
                     clicked => { root.allow-no-tpm = false; }
                 }
 
@@ -198,6 +206,11 @@ export component CreateScreen inherits Rectangle {
                     title: "Passphrase only (--allow-no-tpm)";
                     tradeoff: "Hardware binding off — anyone with the file and passphrase can decrypt it on any machine.";
                     selected: root.allow-no-tpm;
+                    // Always the honest warning for the weaker option — most
+                    // importantly, it must stay Theme.caution (not fade to
+                    // neutral) exactly when the user has committed to it
+                    // (root.allow-no-tpm true).
+                    tradeoff-color: Theme.caution;
                     clicked => { root.allow-no-tpm = true; }
                 }
 

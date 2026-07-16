@@ -136,9 +136,7 @@ export component App inherits Window {
     }
 
     // Dismissable error banner, always on top (declared last = highest
-    // z-order among siblings). `on-accent` is reused for on-danger text —
-    // Theme has no dedicated token, but both `accent` and `danger` are
-    // similarly-bright solid fills so the contrast works both themes.
+    // z-order among siblings).
     if root.error != "" : Rectangle {
         x: 0;
         y: 0;
@@ -154,7 +152,7 @@ export component App inherits Window {
 
             Text {
                 text: root.error;
-                color: Theme.on-accent;
+                color: Theme.on-danger;
                 font-family: Theme.font-ui;
                 font-size: Theme.text-body;
                 vertical-alignment: center;
@@ -168,7 +166,7 @@ export component App inherits Window {
 
                 Text {
                     text: "×";
-                    color: Theme.on-accent;
+                    color: Theme.on-danger;
                     font-size: Theme.text-title;
                     horizontal-alignment: center;
                     vertical-alignment: center;
