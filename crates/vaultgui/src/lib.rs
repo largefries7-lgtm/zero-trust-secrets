@@ -3,3 +3,4 @@
 //! Slint UI wiring lives in the binary (`main.rs`); these modules are the
 //! library's public API so they are testable in isolation and never dead code.
 pub mod autolock;
+pub mod input;
