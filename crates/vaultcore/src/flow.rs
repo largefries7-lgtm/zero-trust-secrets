@@ -132,8 +132,11 @@ pub fn unlock(locked: LockedVault, factors: UnlockFactors) -> Result<Vault> {
     }
 }
 
+/// Acquires the TPM secret factor for a hardware-bound vault (unseals via the
+/// CNG provider); returns `Ok(None)` for a non-hardware-bound vault; fails
+/// closed for a hardware-bound vault whose TPM factor is unavailable.
 #[cfg(windows)]
-fn obtain_tpm_secret(locked: &LockedVault) -> Result<Option<SecretBytes>> {
+pub fn obtain_tpm_secret(locked: &LockedVault) -> Result<Option<SecretBytes>> {
     if !locked.header().hardware_bound {
         return Ok(None);
     }
@@ -146,8 +149,11 @@ fn obtain_tpm_secret(locked: &LockedVault) -> Result<Option<SecretBytes>> {
     Ok(Some(provider.unseal(&SealedBlob(wrap))?))
 }
 
+/// Acquires the TPM secret factor for a hardware-bound vault (unseals via the
+/// CNG provider); returns `Ok(None)` for a non-hardware-bound vault; fails
+/// closed for a hardware-bound vault whose TPM factor is unavailable.
 #[cfg(not(windows))]
-fn obtain_tpm_secret(locked: &LockedVault) -> Result<Option<SecretBytes>> {
+pub fn obtain_tpm_secret(locked: &LockedVault) -> Result<Option<SecretBytes>> {
     if locked.header().hardware_bound {
         return Err(Error::Provider("TPM path unavailable on this platform".into()));
     }

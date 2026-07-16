@@ -466,13 +466,16 @@ fn unlock_vault(
     recovery: bool,
     recovery_passphrase: Option<String>,
 ) -> Result<Vault, Box<dyn std::error::Error>> {
-    use vaultcore::flow::{unlock, UnlockFactors};
     if recovery {
         let pw = resolve_unlock_pw("recovery passphrase", recovery_passphrase)?;
-        return Ok(unlock(locked, UnlockFactors::Recovery { recovery_passphrase: &pw })?);
+        return Ok(locked.unlock_recovery(&pw)?);
     }
+    // Acquire the TPM factor FIRST so a hardware-bound vault with an
+    // unavailable TPM fails fast, before ever prompting for a passphrase
+    // that would never be used.
+    let tpm_secret = vaultcore::flow::obtain_tpm_secret(&locked)?;
     let pw = resolve_unlock_pw("unlock passphrase", passphrase)?;
-    Ok(unlock(locked, UnlockFactors::TwoFactor { passphrase: &pw })?)
+    Ok(locked.unlock_two_factor(&pw, tpm_secret.as_ref())?)
 }
 
 /// Resolve a NEW passphrase for `init` (labelled "unlock passphrase" or
