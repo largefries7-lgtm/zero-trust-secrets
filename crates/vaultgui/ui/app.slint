@@ -1,20 +1,181 @@
+// Root state machine. `App` is the Rust<->Slint contract surface (Task D3
+// binds to these exact property/callback names — do not rename): it
+// switches on `screen` and wires each screen's local callbacks up to the
+// App-level callbacks Rust handles, and forwards the properties each screen
+// needs back down. All colors/fonts/spacing route through `Theme` (D1).
 import { Theme } from "theme.slint";
+import { CreateScreen } from "create.slint";
+import { UnlockScreen } from "unlock.slint";
+import { VaultScreen } from "vault.slint";
+import { SettingsScreen } from "settings.slint";
 
 export component App inherits Window {
     title: "Zero-Trust Secrets";
-    preferred-width: 900px;
-    preferred-height: 600px;
+    preferred-width: 980px;
+    preferred-height: 640px;
     background: Theme.bg-base;
 
-    init => {
-        Theme.dark = true;
+    // ---- Screen selection ("create" | "unlock" | "vault" | "settings") ---
+    in-out property <string> screen: "unlock";
+
+    // ---- Light/dark preference, mirrored onto the Theme global -----------
+    in-out property <bool> dark <=> Theme.dark;
+
+    // ---- Vault identity / posture -----------------------------------------
+    in-out property <string> vault_path;
+    in-out property <string> posture;
+    in-out property <bool> posture_authenticated: false;
+    in-out property <bool> hardware_bound: false;
+    in-out property <bool> has_recovery: false;
+    in-out property <string> provider_desc;
+
+    // ---- Records -----------------------------------------------------
+    in-out property <[string]> record_names;
+    in-out property <string> filter;
+    in-out property <string> selected;
+    in-out property <string> revealed_value;
+    in-out property <string> generated_value;
+
+    // ---- Timers ---------------------------------------------------------
+    in-out property <int> clip_remaining: 0;
+    in-out property <int> idle_remaining: 0;
+    in-out property <int> idle_timeout_secs: 0;
+
+    // ---- Capabilities / errors ---------------------------------------------
+    in-out property <bool> hello_available: false;
+    in-out property <string> error;
+
+    // ---- Callbacks (handled in Rust; see src/main.rs, Task D3) -------------
+    callback pick_vault();
+    callback create_vault(passphrase: string, confirm: string, allow_no_tpm: bool, use_recovery: bool, recovery_passphrase: string);
+    callback unlock(passphrase: string, recovery: bool);
+    callback select(name: string);
+    callback reveal(name: string);
+    callback mask();
+    callback copy(name: string);
+    callback add_secret(name: string, value: string);
+    callback rotate(name: string, value: string);
+    callback remove(name: string);
+    callback generate(length: int, symbols: bool);
+    callback lock_now();
+    callback set_timeout(secs: int);
+    callback set_dark(value: bool);
+    callback deprovision();
+
+    if root.screen == "create" : CreateScreen {
+        x: 0;
+        y: 0;
+        width: 100%;
+        height: 100%;
+
+        create_vault(passphrase, confirm, allow_no_tpm, use_recovery, recovery_passphrase) => {
+            root.create_vault(passphrase, confirm, allow_no_tpm, use_recovery, recovery_passphrase);
+        }
     }
 
-    // Proves the theme resolves end-to-end; full screens land in D2.
-    Text {
-        text: "vaultgui";
-        color: Theme.text-primary;
-        font-family: Theme.font-ui;
-        font-size: Theme.text-title;
+    if root.screen == "unlock" : UnlockScreen {
+        x: 0;
+        y: 0;
+        width: 100%;
+        height: 100%;
+
+        vault_path: root.vault_path;
+        posture: root.posture;
+        posture_authenticated: root.posture_authenticated;
+
+        pick_vault => { root.pick_vault(); }
+        unlock(passphrase, recovery) => { root.unlock(passphrase, recovery); }
+    }
+
+    if root.screen == "vault" : VaultScreen {
+        x: 0;
+        y: 0;
+        width: 100%;
+        height: 100%;
+
+        posture: root.posture;
+        hardware_bound: root.hardware_bound;
+        has_recovery: root.has_recovery;
+        record_names: root.record_names;
+        filter <=> root.filter;
+        selected: root.selected;
+        revealed_value: root.revealed_value;
+        clip_remaining: root.clip_remaining;
+        idle_remaining: root.idle_remaining;
+        idle_timeout_secs: root.idle_timeout_secs;
+
+        select(name) => { root.select(name); }
+        reveal(name) => { root.reveal(name); }
+        mask => { root.mask(); }
+        copy(name) => { root.copy(name); }
+        add_secret(name, value) => { root.add_secret(name, value); }
+        rotate(name, value) => { root.rotate(name, value); }
+        remove(name) => { root.remove(name); }
+        lock_now => { root.lock_now(); }
+    }
+
+    if root.screen == "settings" : SettingsScreen {
+        x: 0;
+        y: 0;
+        width: 100%;
+        height: 100%;
+
+        hardware_bound: root.hardware_bound;
+        posture: root.posture;
+        has_recovery: root.has_recovery;
+        provider_desc: root.provider_desc;
+        idle_timeout_secs: root.idle_timeout_secs;
+        dark: root.dark;
+        hello_available: root.hello_available;
+        generated_value: root.generated_value;
+
+        set_timeout(secs) => { root.set_timeout(secs); }
+        set_dark(value) => { root.set_dark(value); }
+        generate(length, symbols) => { root.generate(length, symbols); }
+        deprovision => { root.deprovision(); }
+    }
+
+    // Dismissable error banner, always on top (declared last = highest
+    // z-order among siblings). `on-accent` is reused for on-danger text —
+    // Theme has no dedicated token, but both `accent` and `danger` are
+    // similarly-bright solid fills so the contrast works both themes.
+    if root.error != "" : Rectangle {
+        x: 0;
+        y: 0;
+        width: 100%;
+        height: 44px;
+        background: Theme.danger;
+
+        HorizontalLayout {
+            width: 100%;
+            height: 100%;
+            padding: Theme.space-3;
+            spacing: Theme.space-3;
+
+            Text {
+                text: root.error;
+                color: Theme.on-accent;
+                font-family: Theme.font-ui;
+                font-size: Theme.text-body;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+                overflow: elide;
+            }
+
+            TouchArea {
+                width: 20px;
+                clicked => { root.error = ""; }
+
+                Text {
+                    text: "×";
+                    color: Theme.on-accent;
+                    font-size: Theme.text-title;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                    width: 100%;
+                    height: 100%;
+                }
+            }
+        }
     }
 }
