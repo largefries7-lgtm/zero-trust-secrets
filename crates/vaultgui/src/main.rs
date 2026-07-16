@@ -6,11 +6,12 @@
 //! `remove`, `generate`, `search`, `deprovision`) plus `pick_vault` (an
 //! intentional no-op — a native file-picker dialog is deferred).
 //!
-//! D3b-1 (this pass) applies anti-capture (`WDA_EXCLUDEFROMCAPTURE`) to the
-//! top-level window so screenshots/screen-share render it blank. Still
-//! deferred to D3b-2: the OS watcher / auto-lock-on-idle wiring, and the
-//! ticking clipboard-countdown timer (the `clip_remaining` property is set on
-//! copy but does not yet count down on its own).
+//! D3b-1 applied anti-capture (`WDA_EXCLUDEFROMCAPTURE`) to the top-level
+//! window so screenshots/screen-share render it blank. D3b-2 (this pass)
+//! spawns the OS watcher (`vaultgui::watcher`) so idle/lock/suspend events
+//! post an `invoke_lock_now()` onto the UI thread, and adds a repeating 1s
+//! timer that ticks `clip_remaining` down and refreshes `idle_remaining`
+//! while unlocked.
 slint::include_modules!();
 
 use std::cell::RefCell;
@@ -494,7 +495,77 @@ fn main() -> Result<(), slint::PlatformError> {
         });
     }
 
-    app.run()
+    // ---- Auto-lock watcher (D3b-2) --------------------------------------
+    // `watcher::spawn` owns a background thread on Windows (message-only
+    // window polling GetLastInputInfo + WTS/power notifications) and is a
+    // no-op handle on other platforms. Its `on_lock` closure runs on THAT
+    // thread, never the UI thread, so it must not touch `state`/`Rc` secrets
+    // directly -- it only posts an `invoke_lock_now()` onto the UI thread via
+    // `slint::invoke_from_event_loop`, which runs the callback wired above
+    // (the one holding the `Rc<RefCell<AppState>>` and calling `do_lock`).
+    // `slint::Weak<App>` is `Send`, so it's the only thing that crosses the
+    // thread boundary here.
+    //
+    // The timeout is read ONCE here at startup. If the user changes the
+    // auto-lock timeout in Settings mid-session, the already-running watcher
+    // keeps using the startup value; the new value takes effect on the NEXT
+    // launch. Accepted slice-2 limitation (see D3b-2 report).
+    let timeout = prefs.borrow().idle_timeout_secs.map(std::time::Duration::from_secs);
+    let watcher = {
+        let w = app.as_weak();
+        vaultgui::watcher::spawn(timeout, move |_reason| {
+            let w = w.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(app) = w.upgrade() {
+                    app.invoke_lock_now();
+                }
+            });
+        })
+    };
+
+    // ---- Countdown timer (D3b-2) -----------------------------------------
+    // One repeating 1s Slint timer drives both on-screen countdowns:
+    //   - `clip_remaining`: ticked down here for display only. The actual
+    //     clipboard CLEAR is performed independently by the detached
+    //     PowerShell helper spawned in `clipboard::copy_with_autoclear` (B5);
+    //     this timer never touches the clipboard itself.
+    //   - `idle_remaining`: recomputed from the live OS idle time (while
+    //     unlocked) so the on-screen "locks in Ns" reflects what the watcher
+    //     thread above is about to act on.
+    // Bound to `_countdown` (not `_`) so the Timer stays alive across
+    // `app.run()` -- a dropped `slint::Timer` stops firing.
+    let _countdown = slint::Timer::default();
+    {
+        let w = app.as_weak();
+        let idle_timeout = prefs.borrow().idle_timeout_secs;
+        _countdown.start(
+            slint::TimerMode::Repeated,
+            std::time::Duration::from_secs(1),
+            move || {
+                if let Some(app) = w.upgrade() {
+                    let c = app.get_clip_remaining();
+                    if c > 0 {
+                        app.set_clip_remaining(c - 1);
+                    }
+                    if app.get_posture_authenticated() {
+                        if let Some(t) = idle_timeout {
+                            let idle = vaultgui::watcher::idle_duration().as_secs();
+                            app.set_idle_remaining(t.saturating_sub(idle) as i32);
+                        }
+                    }
+                }
+            },
+        );
+    }
+
+    app.run()?;
+
+    // Clean thread join for the watcher's background window/thread. Errors
+    // from `app.run()` above already propagated via `?`; this only runs on
+    // the normal shutdown path.
+    watcher.stop();
+
+    Ok(())
 }
 
 /// Exclude the top-level window from screen capture (see

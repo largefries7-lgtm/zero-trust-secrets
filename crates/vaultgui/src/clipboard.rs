@@ -47,10 +47,21 @@ pub fn clear_script(secs: u64) -> String {
 #[cfg(windows)]
 pub fn copy_with_autoclear(secret: &str, secs: u64) -> std::io::Result<()> {
     use std::io::Write;
+    use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
 
+    // Both children are launched from a GUI (subsystem-windows) process with
+    // no inherited console; without this flag Windows allocates a fresh
+    // console for each, which can flash briefly on screen. Purely cosmetic --
+    // does not change the stdin-fed / verify-before-clear / absolute-path
+    // behavior above.
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
     let clip = system32("clip.exe");
-    let mut child = Command::new(&clip).stdin(Stdio::piped()).spawn()?;
+    let mut child = Command::new(&clip)
+        .stdin(Stdio::piped())
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()?;
     if let Some(mut stdin) = child.stdin.take() {
         stdin.write_all(secret.as_bytes())?;
     }
@@ -62,6 +73,7 @@ pub fn copy_with_autoclear(secret: &str, secs: u64) -> std::io::Result<()> {
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
         .spawn()?;
     if let Some(mut stdin) = clearer.stdin.take() {
         stdin.write_all(secret.as_bytes())?;

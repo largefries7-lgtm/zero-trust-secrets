@@ -125,11 +125,19 @@ mod win {
             return LRESULT(1);
         }
         if msg == WM_TIMER {
-            let idle = idle_duration();
-            if evaluate(idle, state.timeout, false, false) == Some(LockReason::Idle)
-                && !state.fired.swap(true, Ordering::Relaxed)
-            {
-                (state.on_lock)(LockReason::Idle);
+            match evaluate(idle_duration(), state.timeout, false, false) {
+                Some(LockReason::Idle) => {
+                    if !state.fired.swap(true, Ordering::Relaxed) {
+                        (state.on_lock)(LockReason::Idle);
+                    }
+                }
+                _ => {
+                    // Not idle-to-threshold right now: clear the latch so the
+                    // NEXT idle period (after this activity) can fire again.
+                    // Without this, the guard stays latched forever after the
+                    // first idle-lock and a later session never idle-locks.
+                    state.fired.store(false, Ordering::Relaxed);
+                }
             }
             return LRESULT(0);
         }
