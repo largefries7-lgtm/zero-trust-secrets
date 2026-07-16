@@ -6,7 +6,8 @@ rust-version.workspace = true
 
 [dependencies]
 vaultcore = { path = "../vaultcore" }
-slint = { workspace = true }
+slint = { workspace = true, features = ["raw-window-handle-06"] }
+raw-window-handle = "0.6"
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = [

@@ -6,10 +6,11 @@
 //! `remove`, `generate`, `search`, `deprovision`) plus `pick_vault` (an
 //! intentional no-op — a native file-picker dialog is deferred).
 //!
-//! Still deferred to D3b: the OS watcher / auto-lock-on-idle wiring, the
-//! anti-capture wiring, and the ticking clipboard-countdown timer (the
-//! `clip_remaining` property is set on copy but does not yet count down on
-//! its own).
+//! D3b-1 (this pass) applies anti-capture (`WDA_EXCLUDEFROMCAPTURE`) to the
+//! top-level window so screenshots/screen-share render it blank. Still
+//! deferred to D3b-2: the OS watcher / auto-lock-on-idle wiring, and the
+//! ticking clipboard-countdown timer (the `clip_remaining` property is set on
+//! copy but does not yet count down on its own).
 slint::include_modules!();
 
 use std::cell::RefCell;
@@ -473,5 +474,42 @@ fn main() -> Result<(), slint::PlatformError> {
     // documented intent rather than an accidental gap.
     app.on_pick_vault(move || {});
 
+    // ---- Anti-capture (D3b-1) ------------------------------------------
+    // The native HWND does not exist yet at this point: Slint's winit backend
+    // creates the OS window lazily once the event loop actually starts
+    // running (`WinitWindowAdapter::ensure_window`, called from winit's
+    // `resumed()` callback), not synchronously during `App::new()`/`show()`.
+    // Reading the raw window handle right here would find no window and
+    // silently no-op. Scheduling a `Duration::ZERO` single-shot timer BEFORE
+    // `app.run()` sidesteps that: timers only fire once the event loop is
+    // pumping, by which point `resumed()` has already created the window, so
+    // this fires on/near the very first iteration with a valid HWND in hand.
+    #[cfg(windows)]
+    {
+        let w = app.as_weak();
+        slint::Timer::single_shot(std::time::Duration::ZERO, move || {
+            if let Some(app) = w.upgrade() {
+                apply_anticapture(&app);
+            }
+        });
+    }
+
     app.run()
+}
+
+/// Exclude the top-level window from screen capture (see
+/// `vaultgui::anticapture`). Pulls the live Win32 `HWND` out of Slint via its
+/// `raw-window-handle` 0.6 integration (the `raw-window-handle-06` Slint
+/// feature); a failure to resolve a `Win32` handle (wrong backend, or called
+/// before the window exists) is a silent no-op -- there is no user-facing
+/// error to surface for "screenshots aren't blanked."
+#[cfg(windows)]
+fn apply_anticapture(app: &App) {
+    use raw_window_handle::HasWindowHandle;
+
+    if let Ok(h) = app.window().window_handle().window_handle() {
+        if let raw_window_handle::RawWindowHandle::Win32(w) = h.as_raw() {
+            let _ = vaultgui::anticapture::exclude_from_capture_hwnd(w.hwnd.get());
+        }
+    }
 }
