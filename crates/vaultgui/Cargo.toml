@@ -3,6 +3,8 @@ name = "vaultgui"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
+# Internal workspace crate only; never published to crates.io.
+publish = false
 
 [dependencies]
 vaultcore = { path = "../vaultcore" }

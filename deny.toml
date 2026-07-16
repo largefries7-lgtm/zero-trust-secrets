@@ -4,17 +4,51 @@
 # Enforced in CI by .github/workflows/ci.yml (the `supply-chain` job) on every
 # push and pull request, so every dependency change is gated.
 
+[graph]
+# This project ships only as a Windows desktop app (see the `windows` crate
+# usage throughout, and SECURITY.md). Scoping the analyzed graph to the real
+# build target prunes macOS/Linux/Android/wasm-only transitive dependencies
+# that winit's cross-platform backend selection pulls into Cargo.lock but that
+# never actually compile into our binary (objc2-*, wayland-*, x11rb, ndk, ...).
+targets = ["x86_64-pc-windows-msvc"]
+
 [advisories]
 version = 2
 # Fail on any unpatched RUSTSEC advisory affecting the locked dependency graph.
 yanked = "deny"
-ignore = []
+ignore = [
+    # `paste` (proc-macro helper): author archived the repo, no safe upgrade
+    # exists. Pulled transitively via Slint's image decoding
+    # (slint -> i-slint-core/i-slint-compiler -> image -> rav1e -> ravif -> pulp
+    # -> exr -> paste). Maintenance-status advisory, not a vulnerability; we
+    # don't call into `paste` or the EXR/AV1F decoders directly.
+    "RUSTSEC-2024-0436",
+    # `rustybuzz` (text shaping): upstream states it is unmaintained, no safe
+    # upgrade. Pulled transitively via Slint's SVG rendering
+    # (slint -> i-slint-core/i-slint-compiler -> resvg -> usvg -> rustybuzz).
+    "RUSTSEC-2026-0206",
+    # `ttf-parser` (font parsing): upstream states it is unmaintained, no safe
+    # upgrade. Pulled transitively via Slint's SVG/font stack the same way as
+    # rustybuzz above (usvg -> fontdb -> ttf-parser, and usvg -> rustybuzz ->
+    # ttf-parser).
+    "RUSTSEC-2026-0192",
+    # NOTE: quick-xml RUSTSEC-2026-0194/0195 (via wayland-scanner, reached
+    # through winit's Wayland backend) do NOT need an entry here: scoping
+    # `[graph].targets` to x86_64-pc-windows-msvc above already prunes that
+    # Linux/Wayland-only subtree out of the analyzed graph entirely.
+]
 
 [bans]
 # Prefer a single version of each crate; flag accidental duplicates.
 multiple-versions = "warn"
 # No wildcard ("*") version requirements — they defeat Cargo.lock pinning.
 wildcards = "deny"
+# `vaultctl`/`vaultgui` depend on `vaultcore` via a path dependency with no
+# `version =`, which cargo-deny otherwise treats as a wildcard requirement.
+# This allows *only* path dependencies on private (unpublished, see
+# `publish = false`) workspace crates to skip the wildcards check; a real
+# third-party wildcard dependency is still denied.
+allow-wildcard-paths = true
 # Deny build/proc-macro crates we don't expect in a security core (tighten as needed).
 deny = []
 
@@ -31,8 +65,79 @@ allow = [
     "Zlib",
     "Unicode-3.0",
     "Unicode-DFS-2016",
+    # Boost Software License 1.0 - permissive, OSI-approved/FSF-free. Needed by
+    # clipboard-win and error-code, pulled in via Slint's `copypasta` clipboard
+    # backend (i-slint-backend-winit -> copypasta -> clipboard-win/error-code).
+    "BSL-1.0",
+    # Public-domain-equivalent, OSI-approved/FSF-free. Needed by `ksni`
+    # (Linux/D-Bus system-tray support): i-slint-core depends on it
+    # unconditionally (not target-gated in its Cargo.toml), so it is still
+    # resolved even though the tray-icon code path is Linux-only.
+    "Unlicense",
 ]
 confidence-threshold = 0.9
+
+# `vaultcore`/`vaultctl`/`vaultgui`/`dumper` are internal workspace crates with
+# `publish = false` (see their Cargo.toml) — they are never published, so we
+# don't require them to carry a `license` field.
+[licenses.private]
+ignore = true
+
+# Slint itself (and its `i-slint-*` internal crates) is multi-licensed:
+# `GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0`.
+# This project is a personal/reference project, not a commercial redistribution,
+# so it uses Slint under the GPL-3.0-only branch of that choice (Slint's
+# royalty-free/commercial terms are alternatives we don't need). The exception
+# is scoped to exactly the Slint-published crates below — nothing else in the
+# tree gets a GPL allowance, and the rest of the policy stays permissive-only.
+[[licenses.exceptions]]
+allow = ["GPL-3.0-only"]
+name = "slint"
+
+[[licenses.exceptions]]
+allow = ["GPL-3.0-only"]
+name = "slint-build"
+
+[[licenses.exceptions]]
+allow = ["GPL-3.0-only"]
+name = "slint-macros"
+
+[[licenses.exceptions]]
+allow = ["GPL-3.0-only"]
+name = "i-slint-backend-selector"
+
+[[licenses.exceptions]]
+allow = ["GPL-3.0-only"]
+name = "i-slint-backend-winit"
+
+[[licenses.exceptions]]
+allow = ["GPL-3.0-only"]
+name = "i-slint-common"
+
+[[licenses.exceptions]]
+allow = ["GPL-3.0-only"]
+name = "i-slint-compiler"
+
+[[licenses.exceptions]]
+allow = ["GPL-3.0-only"]
+name = "i-slint-core"
+
+[[licenses.exceptions]]
+allow = ["GPL-3.0-only"]
+name = "i-slint-core-macros"
+
+[[licenses.exceptions]]
+allow = ["GPL-3.0-only"]
+name = "i-slint-renderer-femtovg"
+
+# NOTE: i-slint-renderer-skia is in Cargo.lock (a possible Slint renderer
+# backend) but is not part of the graph actually resolved for our build
+# (its cargo feature isn't enabled), so it needs no exception entry here.
+# Add one back if that ever changes.
+
+[[licenses.exceptions]]
+allow = ["GPL-3.0-only"]
+name = "i-slint-renderer-software"
 
 [sources]
 # Only crates.io; no unvetted git or alternate registries.
