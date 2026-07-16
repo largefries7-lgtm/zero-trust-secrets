@@ -2,6 +2,7 @@
 
 pub mod crypto;
 pub mod envelope;
+pub mod flow;
 pub mod keyprovider;
 pub mod memlock;
 pub mod passgen;
