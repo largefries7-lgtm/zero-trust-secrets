@@ -6,3 +6,4 @@ pub mod autolock;
 pub mod clipboard;
 pub mod input;
 pub mod prefs;
+pub mod session;
