@@ -170,12 +170,17 @@ fn main() -> Result<(), slint::PlatformError> {
     }
 
     {
+        let w = app.as_weak();
         let prefs = prefs.clone();
         let prefs_path = prefs_path.clone();
         app.on_set_timeout(move |secs| {
+            let app = w.unwrap();
             let mut p = prefs.borrow_mut();
+            let normalized = if secs <= 0 { 0 } else { secs };
             p.idle_timeout_secs = if secs <= 0 { None } else { Some(secs as u64) };
             persist_prefs(&p, &prefs_path);
+            drop(p);
+            app.set_idle_timeout_secs(normalized);
         });
     }
 
@@ -340,8 +345,17 @@ fn main() -> Result<(), slint::PlatformError> {
             if let AppState::Unlocked(s) = &mut *st {
                 match s.vault_mut().add(&name, secret) {
                     Ok(()) => {
-                        let _ = s.vault_mut().save(&vault_path);
+                        let save_result = s.vault_mut().save(&vault_path);
                         refresh_names(&app, &full_names, s.vault());
+                        match save_result {
+                            Ok(()) => app.set_error("".into()),
+                            Err(e) => app.set_error(
+                                format!(
+                                    "Change applied in memory but NOT saved to disk: {e}. Try the action again."
+                                )
+                                .into(),
+                            ),
+                        }
                     }
                     Err(vaultcore::Error::Duplicate(_)) => {
                         app.set_error(format!("A secret named \"{name}\" already exists.").into());
@@ -364,8 +378,17 @@ fn main() -> Result<(), slint::PlatformError> {
             if let AppState::Unlocked(s) = &mut *st {
                 match s.vault_mut().upsert(&name, secret) {
                     Ok(()) => {
-                        let _ = s.vault_mut().save(&vault_path);
+                        let save_result = s.vault_mut().save(&vault_path);
                         refresh_names(&app, &full_names, s.vault());
+                        match save_result {
+                            Ok(()) => app.set_error("".into()),
+                            Err(e) => app.set_error(
+                                format!(
+                                    "Change applied in memory but NOT saved to disk: {e}. Try the action again."
+                                )
+                                .into(),
+                            ),
+                        }
                     }
                     Err(e) => app.set_error(format!("{e}").into()),
                 }
@@ -383,8 +406,17 @@ fn main() -> Result<(), slint::PlatformError> {
             let mut st = state.borrow_mut();
             if let AppState::Unlocked(s) = &mut *st {
                 s.vault_mut().remove(&name);
-                let _ = s.vault_mut().save(&vault_path);
+                let save_result = s.vault_mut().save(&vault_path);
                 refresh_names(&app, &full_names, s.vault());
+                match save_result {
+                    Ok(()) => app.set_error("".into()),
+                    Err(e) => app.set_error(
+                        format!(
+                            "Change applied in memory but NOT saved to disk: {e}. Try the action again."
+                        )
+                        .into(),
+                    ),
+                }
             }
             drop(st);
             app.set_selected("".into());
