@@ -1,9 +1,9 @@
 // Unlock screen: a single centered "unlock panel" card — the dormant hero
-// seal, the vault path + picker, a masked passphrase, and a recovery alternate.
-// Pre-unlock the posture eyebrow carries "· UNVERIFIED" (caution) since the
+// dial, the vault path + picker, a masked passphrase, and a recovery alternate.
+// Pre-unlock the posture chip row carries an amber "UNVERIFIED" chip since the
 // header it's read from hasn't been authenticated yet.
 import { Theme } from "theme.slint";
-import { Seal, Card, Field, PrimaryButton, GhostButton, SectionLabel } from "widgets.slint";
+import { Dial, Card, Field, PrimaryButton, GhostButton, SectionLabel, StatusChip } from "widgets.slint";
 
 export component UnlockScreen inherits Rectangle {
     in property <string> vault_path;
@@ -32,37 +32,36 @@ export component UnlockScreen inherits Rectangle {
 
                     HorizontalLayout {
                         alignment: center;
-                        Seal { size: 56px; engaged: false; }
+                        Dial {
+                            size: 96px;
+                            engaged: false;
+                            center-glyph: "\u{1F512}";
+                            center-label: "LOCKED";
+                        }
                     }
 
                     HorizontalLayout {
                         alignment: center;
                         spacing: Theme.space-2;
-                        Text {
+
+                        StatusChip {
                             text: root.posture == "" ? "NO VAULT" : root.posture;
-                            color: Theme.text-secondary;
-                            font-family: Theme.font-ui;
-                            font-size: Theme.text-label;
-                            font-weight: Theme.weight-label;
-                            letter-spacing: Theme.label-letterspacing;
+                            tone: "cyan";
                         }
-                        if !root.posture_authenticated: Text {
-                            text: "· UNVERIFIED";
-                            color: Theme.caution;
-                            font-family: Theme.font-ui;
-                            font-size: Theme.text-label;
-                            font-weight: Theme.weight-label;
-                            letter-spacing: Theme.label-letterspacing;
+                        if !root.posture_authenticated: StatusChip {
+                            text: "UNVERIFIED";
+                            tone: "amber";
                         }
                     }
 
                     Text {
-                        text: "Unlock vault";
-                        color: Theme.text-primary;
+                        text: "UNLOCK VAULT";
                         font-family: Theme.font-ui;
                         font-size: Theme.text-display;
                         font-weight: Theme.weight-display;
+                        color: Theme.text-primary;
                         horizontal-alignment: center;
+                        letter-spacing: 2px;
                     }
 
                     VerticalLayout {
@@ -79,7 +78,7 @@ export component UnlockScreen inherits Rectangle {
                                 background: Theme.bg-inset;
                                 border-radius: Theme.radius-field;
                                 border-width: 1px;
-                                border-color: Theme.line;
+                                border-color: Theme.glass-border;
 
                                 Text {
                                     x: Theme.space-3;
@@ -95,28 +94,28 @@ export component UnlockScreen inherits Rectangle {
                             }
 
                             GhostButton {
-                                text: "Choose…";
+                                text: "Choose\u{2026}";
                                 width: 96px;
                                 clicked => { root.pick_vault(); }
                             }
                         }
                     }
 
-                    pw-field := Field {
+                    pw := Field {
                         placeholder: root.use-recovery ? "Recovery passphrase" : "Passphrase";
                         masked: true;
                         accepted => { root.unlock(self.text, root.use-recovery); }
                     }
 
                     PrimaryButton {
-                        text: "Unlock";
-                        clicked => { root.unlock(pw-field.text, root.use-recovery); }
+                        text: "UNLOCK";
+                        clicked => { root.unlock(pw.text, root.use-recovery); }
                     }
 
                     HorizontalLayout {
                         alignment: center;
                         GhostButton {
-                            text: root.use-recovery ? "Use regular passphrase" : "Use recovery passphrase";
+                            text: root.use-recovery ? "Use regular passphrase" : "Use recovery key";
                             width: 240px;
                             clicked => { root.use-recovery = !root.use-recovery; }
                         }
