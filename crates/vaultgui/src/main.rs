@@ -80,11 +80,45 @@ fn refresh_names(app: &App, full_names: &Rc<RefCell<Vec<SharedString>>>, vault: 
     app.set_record_names(names_model(names));
 }
 
+/// Populate the pre-unlock posture props from a vault file's (unauthenticated)
+/// header. Used at startup and after the user picks a different vault. Always
+/// leaves `posture_authenticated = false` — this data is read from an
+/// unauthenticated header and must never display as verified until a real unlock.
+fn apply_locked_header(app: &App, path: &Path) {
+    match LockedVault::load(path) {
+        Ok(locked) => {
+            let header = locked.header();
+            app.set_hardware_bound(header.hardware_bound);
+            app.set_has_recovery(header.recovery_wrap.is_some());
+            app.set_provider_desc(describe_provider(header).into());
+            app.set_posture(
+                if header.hardware_bound { "TPM-bound" } else { "Passphrase only" }.into(),
+            );
+        }
+        Err(_) => {
+            // File exists but couldn't be parsed (corrupt/foreign) -- still land
+            // on unlock with a generic posture rather than bouncing to "create".
+            app.set_hardware_bound(false);
+            app.set_has_recovery(false);
+            app.set_provider_desc("".into());
+            app.set_posture("Unknown".into());
+        }
+    }
+    app.set_posture_authenticated(false);
+}
+
 /// Transition to locked and scrub every bit of UI state that could otherwise
-/// linger on-screen or in a model after the `Session` (and its DEK) is
-/// dropped. Shared by the `lock_now` callback (here) and the future OS-watcher
-/// auto-lock path (D3b).
-fn do_lock(app: &App, state: &Rc<RefCell<AppState>>, full_names: &Rc<RefCell<Vec<SharedString>>>) {
+/// linger on-screen or in a model after the `Session` (and its DEK) is dropped.
+/// Shared by the `lock_now` callback and the OS-watcher auto-lock path. Returns
+/// to the "create" screen (not "unlock") if the vault file no longer exists, so
+/// a first-run user who steps away mid-create isn't stranded on an unlock screen
+/// for a vault that was never written.
+fn do_lock(
+    app: &App,
+    state: &Rc<RefCell<AppState>>,
+    full_names: &Rc<RefCell<Vec<SharedString>>>,
+    vault_path: &Rc<RefCell<PathBuf>>,
+) {
     state.borrow_mut().lock();
     app.set_revealed_value("".into());
     app.set_generated_value("".into());
@@ -92,7 +126,7 @@ fn do_lock(app: &App, state: &Rc<RefCell<AppState>>, full_names: &Rc<RefCell<Vec
     app.set_selected("".into());
     app.set_clip_remaining(0);
     app.set_posture_authenticated(false);
-    app.set_screen("unlock".into());
+    app.set_screen(if vault_path.borrow().exists() { "unlock" } else { "create" }.into());
     full_names.borrow_mut().clear();
 }
 
@@ -123,10 +157,12 @@ fn main() -> Result<(), slint::PlatformError> {
     let loaded_prefs = std::fs::read_to_string(&prefs_path)
         .map(|s| Prefs::from_serialized(&s))
         .unwrap_or_default();
-    let vault_path = match &loaded_prefs.last_vault_path {
+    // Held in an `Rc<RefCell<_>>` so the "Choose…" picker can change which vault
+    // the unlock/create/save paths target at runtime.
+    let vault_path = Rc::new(RefCell::new(match &loaded_prefs.last_vault_path {
         Some(p) => PathBuf::from(p),
         None => dir.join("vault.ztsv"),
-    };
+    }));
 
     // UI-thread state. Nothing here is unlocked yet -- that's D3a-2's job.
     let state = Rc::new(RefCell::new(AppState::Locked));
@@ -142,33 +178,11 @@ fn main() -> Result<(), slint::PlatformError> {
     app.set_idle_timeout_secs(prefs.borrow().idle_timeout_secs.unwrap_or(0) as i32);
     app.set_hello_available(vaultgui::hello::available());
     app.set_hello_enabled(prefs.borrow().hello_enabled);
-    app.set_vault_path(vault_path.display().to_string().into());
+    app.set_vault_path(vault_path.borrow().display().to_string().into());
 
-    if vault_path.exists() {
+    if vault_path.borrow().exists() {
         app.set_screen("unlock".into());
-        match LockedVault::load(&vault_path) {
-            Ok(locked) => {
-                let header = locked.header();
-                app.set_hardware_bound(header.hardware_bound);
-                app.set_has_recovery(header.recovery_wrap.is_some());
-                app.set_provider_desc(describe_provider(header).into());
-                app.set_posture(
-                    if header.hardware_bound { "TPM-bound" } else { "Passphrase only" }.into(),
-                );
-            }
-            Err(_) => {
-                // File exists but couldn't be parsed (corrupt/foreign file) --
-                // still let the user land on the unlock screen with a generic
-                // posture rather than bouncing them to "create".
-                app.set_hardware_bound(false);
-                app.set_has_recovery(false);
-                app.set_provider_desc("".into());
-                app.set_posture("Unknown".into());
-            }
-        }
-        // Pre-unlock posture is read from an unauthenticated header -- never
-        // display it as verified until a real unlock succeeds (D3a-2).
-        app.set_posture_authenticated(false);
+        apply_locked_header(&app, vault_path.borrow().as_path());
     } else {
         app.set_screen("create".into());
     }
@@ -178,9 +192,10 @@ fn main() -> Result<(), slint::PlatformError> {
         let w = app.as_weak();
         let state = state.clone();
         let full_names = full_names.clone();
+        let vault_path = vault_path.clone();
         app.on_lock_now(move || {
             let app = w.unwrap();
-            do_lock(&app, &state, &full_names);
+            do_lock(&app, &state, &full_names, &vault_path);
         });
     }
 
@@ -260,7 +275,7 @@ fn main() -> Result<(), slint::PlatformError> {
         app.on_unlock(move |passphrase, recovery| {
             let app = w.unwrap();
             let pass = input::drain_to_secret(&mut passphrase.to_string());
-            match LockedVault::load(&vault_path) {
+            match LockedVault::load(vault_path.borrow().as_path()) {
                 Ok(locked) => {
                     let outcome = if recovery {
                         flow::unlock(locked, UnlockFactors::Recovery { recovery_passphrase: &pass })
@@ -315,7 +330,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 None
             };
             match flow::create_vault(
-                &vault_path,
+                vault_path.borrow().as_path(),
                 CreateOptions { allow_no_tpm, passphrase: pass, recovery_passphrase: rec },
             ) {
                 Ok(outcome) => {
@@ -401,7 +416,7 @@ fn main() -> Result<(), slint::PlatformError> {
             if let AppState::Unlocked(s) = &mut *st {
                 match s.vault_mut().add(&name, secret) {
                     Ok(()) => {
-                        let save_result = s.vault_mut().save(&vault_path);
+                        let save_result = s.vault_mut().save(vault_path.borrow().as_path());
                         refresh_names(&app, &full_names, s.vault());
                         match save_result {
                             Ok(()) => app.set_error("".into()),
@@ -434,7 +449,7 @@ fn main() -> Result<(), slint::PlatformError> {
             if let AppState::Unlocked(s) = &mut *st {
                 match s.vault_mut().upsert(&name, secret) {
                     Ok(()) => {
-                        let save_result = s.vault_mut().save(&vault_path);
+                        let save_result = s.vault_mut().save(vault_path.borrow().as_path());
                         refresh_names(&app, &full_names, s.vault());
                         match save_result {
                             Ok(()) => app.set_error("".into()),
@@ -462,7 +477,7 @@ fn main() -> Result<(), slint::PlatformError> {
             let mut st = state.borrow_mut();
             if let AppState::Unlocked(s) = &mut *st {
                 s.vault_mut().remove(&name);
-                let save_result = s.vault_mut().save(&vault_path);
+                let save_result = s.vault_mut().save(vault_path.borrow().as_path());
                 refresh_names(&app, &full_names, s.vault());
                 match save_result {
                     Ok(()) => app.set_error("".into()),
@@ -524,10 +539,32 @@ fn main() -> Result<(), slint::PlatformError> {
         });
     }
 
-    // A native file-picker dialog is deferred (post-D3). Registered as an
-    // explicit no-op rather than left unregistered, so the deferral is
-    // documented intent rather than an accidental gap.
-    app.on_pick_vault(move || {});
+    // Native "choose vault file" dialog. On selection we retarget every
+    // path-consuming flow (unlock/create/save) at the chosen file, remember it
+    // as `last_vault_path`, and refresh the pre-unlock posture from its header.
+    {
+        let w = app.as_weak();
+        let vault_path = vault_path.clone();
+        let prefs = prefs.clone();
+        let prefs_path = prefs_path.clone();
+        app.on_pick_vault(move || {
+            let app = w.unwrap();
+            // Pass the owner HWND so the picker is modal (disables this window
+            // while it's open — no reentrant input on the screen behind it).
+            if let Some(chosen) = vaultgui::dialog::choose_vault_file(main_hwnd(&app)) {
+                app.set_vault_path(chosen.display().to_string().into());
+                {
+                    let mut p = prefs.borrow_mut();
+                    p.last_vault_path = Some(chosen.display().to_string());
+                    persist_prefs(&p, &prefs_path);
+                }
+                apply_locked_header(&app, &chosen);
+                app.set_screen("unlock".into());
+                app.set_error("".into());
+                *vault_path.borrow_mut() = chosen;
+            }
+        });
+    }
 
     // ---- Anti-capture (D3b-1) ------------------------------------------
     // The native HWND does not exist yet at this point: Slint's winit backend
@@ -622,19 +659,35 @@ fn main() -> Result<(), slint::PlatformError> {
     Ok(())
 }
 
-/// Exclude the top-level window from screen capture (see
-/// `vaultgui::anticapture`). Pulls the live Win32 `HWND` out of Slint via its
-/// `raw-window-handle` 0.6 integration (the `raw-window-handle-06` Slint
-/// feature); a failure to resolve a `Win32` handle (wrong backend, or called
-/// before the window exists) is a silent no-op -- there is no user-facing
-/// error to surface for "screenshots aren't blanked."
+/// The top-level window's Win32 `HWND` (as an `isize`), pulled out of Slint via
+/// its `raw-window-handle` 0.6 integration (the `raw-window-handle-06` Slint
+/// feature). Returns `0` if it can't be resolved (wrong backend, or called
+/// before the window exists). `0` is a safe sentinel for both consumers:
+/// anti-capture skips, and the file dialog treats it as "no owner".
 #[cfg(windows)]
-fn apply_anticapture(app: &App) {
+fn main_hwnd(app: &App) -> isize {
     use raw_window_handle::HasWindowHandle;
 
     if let Ok(h) = app.window().window_handle().window_handle() {
         if let raw_window_handle::RawWindowHandle::Win32(w) = h.as_raw() {
-            let _ = vaultgui::anticapture::exclude_from_capture_hwnd(w.hwnd.get());
+            return w.hwnd.get();
         }
+    }
+    0
+}
+
+#[cfg(not(windows))]
+fn main_hwnd(_app: &App) -> isize {
+    0
+}
+
+/// Exclude the top-level window from screen capture (see
+/// `vaultgui::anticapture`). A missing HWND (`0`) is a silent no-op -- there is
+/// no user-facing error to surface for "screenshots aren't blanked."
+#[cfg(windows)]
+fn apply_anticapture(app: &App) {
+    let hwnd = main_hwnd(app);
+    if hwnd != 0 {
+        let _ = vaultgui::anticapture::exclude_from_capture_hwnd(hwnd);
     }
 }

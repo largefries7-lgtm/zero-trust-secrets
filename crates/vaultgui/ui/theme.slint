@@ -1,74 +1,94 @@
 // Design-token theme for vaultgui.
 //
-// Pure token module: colors, type scale, spacing/radius. No components or
-// widgets live here — screens (D2) consume `Theme` by importing it.
+// Pure token module: colors, type scale, spacing/radius, depth. No components
+// live here — screens consume `Theme` (and the shared `widgets.slint`) by
+// importing it.
 //
-// Visual direction: precision instrument / safe hardware. Cool brushed-slate
-// neutrals, one "vault teal" identity accent. Locked = dormant (accent-dim),
-// unlocked = live (accent). See .superpowers/sdd/design-system.md for the
-// source values.
+// Visual direction: precision instrument / machined safe. Cool graphite
+// neutrals with genuine material depth (layered panels, hairline highlights,
+// soft shadows) and ONE teal identity accent. The bold element is the vault
+// seal (see widgets.slint); everything around it stays quiet.
 export global Theme {
-    // Selects the light/dark variant for every color token below. D2/D3 set
-    // this from the real posture (locked/unlocked doesn't change `dark` —
-    // it's a separate light/dark preference); default true (dark) here so a
-    // standalone build/preview has a sensible look.
+    // Selects light/dark for every token. Locked/unlocked does NOT change this
+    // (that's a separate live/dormant treatment) — this is only the user's
+    // light/dark preference. Default dark for a standalone preview.
     in property <bool> dark: true;
 
-    // ---- Color tokens -----------------------------------------------------
-    // Neutrals — cool slate (blue-gray), never pure black/white.
-    out property <brush> bg-base: dark ? #0F141A : #EDF1F5;
-    out property <brush> bg-raised: dark ? #171E26 : #FFFFFF;
-    out property <brush> bg-inset: dark ? #1C242E : #F4F7FA;
-    out property <brush> line: dark ? #2A343F : #D5DEE7;
-    out property <brush> text-primary: dark ? #E6EDF3 : #14202B;
-    out property <brush> text-secondary: dark ? #9FB0C0 : #4A5A6A;
-    out property <brush> text-faint: dark ? #6B7B8B : #7B8A99;
+    // ---- Neutrals — cool graphite, layered for depth (never flat black) ----
+    // base < inset (recessed fields) ... raised (panels) < raised-hi (hover),
+    // so fields read pressed-in and panels read lifted.
+    out property <brush> bg-base: dark ? #0C1014 : #EAEEF3;
+    out property <brush> bg-base-hi: dark ? #121821 : #F3F6FA;   // vignette / subtle top
+    out property <brush> bg-inset: dark ? #0F151B : #FFFFFF;     // fields, recessed wells
+    out property <brush> bg-raised: dark ? #161D25 : #FFFFFF;    // cards / panels
+    out property <brush> bg-raised-hi: dark ? #1D2731 : #F4F7FB; // hover / selected fill
+    out property <brush> line: dark ? #29333D : #D3DCE5;        // hairline border
+    out property <brush> line-hi: dark ? #38454F : #C0CAD4;     // stronger border / top highlight
+    out property <brush> text-primary: dark ? #EAF1F7 : #10202D;
+    out property <brush> text-secondary: dark ? #9CADBB : #47586A;
+    out property <brush> text-faint: dark ? #5F6F7D : #7C8B99;
 
-    // Signal accent — "vault teal" (identity + primary action + focus +
-    // posture-strong).
-    out property <brush> accent: dark ? #35B7A6 : #0E8C7E;
-    out property <brush> accent-dim: dark ? #4A5C63 : #7E948F;
-    out property <brush> on-accent: dark ? #08110F : #FFFFFF;
+    // ---- Signal accent — "vault teal" (identity + primary + focus + engaged)
+    out property <brush> accent: dark ? #2FBEAD : #0E8C7E;
+    out property <brush> accent-strong: dark ? #45D8C6 : #12A392; // hero / seal glow
+    out property <brush> accent-dim: dark ? #46585F : #7E948F;    // dormant (locked)
+    out property <brush> accent-soft: dark ? #14322E : #DCF1EE;   // selected-row / tint fill
+    out property <brush> on-accent: dark ? #04120F : #FFFFFF;
 
-    // Semantics. `ok` intentionally reuses `accent` per design-system.md
-    // (posture "strong" reuses the identity teal) — not duplicated here.
-    out property <brush> caution: dark ? #E0A94E : #B9791A;
-    out property <brush> danger: dark ? #E06B5E : #C0392B;
-    out property <brush> on-danger: dark ? #160A08 : #FFFFFF;
+    // Semantics. `ok` reuses `accent` (posture-strong = identity teal).
+    out property <brush> caution: dark ? #E7A64C : #B9791A;
+    out property <brush> danger: dark ? #E5695C : #C0392B;
+    out property <brush> on-danger: dark ? #180909 : #FFFFFF;
 
-    // ---- Typography ---------------------------------------------------
-    // System fonts only — no bundled files, supply-chain-clean.
+    // ---- Depth (soft shadows for lifted panels/buttons/seal) ---------------
+    out property <color> shadow: dark ? #00000073 : #1a2a3a2e;
+    out property <length> shadow-blur: 24px;
+
+    // Button/panel material gradients (top-lit, subtle).
+    out property <brush> grad-accent: dark
+        ? @linear-gradient(180deg, #38CCBB 0%, #26A899 100%)
+        : @linear-gradient(180deg, #17A392 0%, #0C8072 100%);
+    out property <brush> grad-panel: dark
+        ? @linear-gradient(180deg, #1B242E 0%, #141B23 100%)
+        : @linear-gradient(180deg, #FFFFFF 0%, #F5F8FC 100%);
+
+    // ---- Typography — Segoe UI (UI) + Consolas (secrets/data), system-only
     out property <string> font-ui: "Segoe UI";
     out property <string> font-mono: "Consolas";
 
     // Scale (logical px / weight).
-    out property <length> text-display: 26px;
+    out property <length> text-hero: 34px;
+    out property <int> weight-hero: 250;
+    out property <length> text-display: 24px;
     out property <int> weight-display: 300;
-    out property <length> text-title: 19px;
+    out property <length> text-title: 18px;
     out property <int> weight-title: 600;
     out property <length> text-body: 14px;
     out property <int> weight-body: 400;
+    out property <length> text-small: 12px;
     out property <length> text-label: 11px;
-    out property <int> weight-label: 600;
+    out property <int> weight-label: 700;
     out property <length> text-mono: 14px;
     out property <int> weight-mono: 400;
-    out property <length> text-mono-lg: 20px;
+    out property <length> text-mono-lg: 22px;
     out property <int> weight-mono-lg: 500;
 
     // `label` tokens are set UPPERCASE by the caller (Slint has no
-    // text-transform); this is the letter-spacing to pair with it. Slint
-    // 1.17's Text element supports `letter-spacing` directly.
-    out property <length> label-letterspacing: 1.2px;
+    // text-transform); this is the letter-spacing to pair with it.
+    out property <length> label-letterspacing: 1.4px;
 
-    // ---- Spacing / shape ------------------------------------------------
+    // ---- Spacing / shape ---------------------------------------------------
     out property <length> space-1: 4px;
     out property <length> space-2: 8px;
     out property <length> space-3: 12px;
     out property <length> space-4: 16px;
+    out property <length> space-5: 20px;
     out property <length> space-6: 24px;
     out property <length> space-8: 32px;
+    out property <length> space-10: 40px;
     out property <length> space-12: 48px;
 
-    out property <length> radius-panel: 8px;
-    out property <length> radius-field: 6px;
+    out property <length> radius-panel: 12px;
+    out property <length> radius-field: 8px;
+    out property <length> radius-pill: 10px;
 }

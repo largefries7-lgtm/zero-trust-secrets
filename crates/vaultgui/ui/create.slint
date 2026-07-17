@@ -1,153 +1,59 @@
 // First-run screen: two-factor vs --allow-no-tpm choice (same honest tradeoff
-// wording as the vaultctl CLI), optional recovery escrow, passphrase +
-// confirm. Emits a single `create_vault` callback carrying everything the
-// caller needs so no long-lived property holds a secret.
+// wording as the CLI), optional recovery escrow, passphrase + confirm. Emits a
+// single `create_vault` callback carrying everything so no long-lived property
+// holds a secret. Scrollable so a tall form never clips on a short window.
 import { Theme } from "theme.slint";
+import { Seal, Card, Field, PrimaryButton, Checkbox, SectionLabel } from "widgets.slint";
 
-component PrimaryButton inherits TouchArea {
-    in property <string> text;
-    height: 40px;
-
-    Rectangle {
-        width: 100%;
-        height: 100%;
-        border-radius: Theme.radius-field;
-        background: root.enabled ? Theme.accent : Theme.accent-dim;
-        opacity: root.has-hover && root.enabled ? 0.88 : 1.0;
-
-        Text {
-            text: root.text;
-            color: Theme.on-accent;
-            font-family: Theme.font-ui;
-            font-size: Theme.text-body;
-            font-weight: 600;
-            horizontal-alignment: center;
-            vertical-alignment: center;
-            width: 100%;
-            height: 100%;
-        }
-    }
-}
-
-component MaskedField inherits Rectangle {
-    in property <string> placeholder;
-    in-out property <string> text <=> input.text;
-    in property <bool> field-enabled: true;
-
-    height: 40px;
-    background: Theme.bg-inset;
-    border-radius: Theme.radius-field;
-    border-width: 1px;
-    border-color: input.has-focus ? Theme.accent : Theme.line;
-    opacity: root.field-enabled ? 1.0 : 0.55;
-
-    input := TextInput {
-        x: Theme.space-3;
-        width: parent.width - 2 * Theme.space-3;
-        height: 100%;
-        vertical-alignment: center;
-        input-type: password;
-        enabled: root.field-enabled;
-        color: Theme.text-primary;
-        font-family: Theme.font-ui;
-        font-size: Theme.text-body;
-    }
-
-    if input.text == "" && !input.has-focus: Text {
-        x: Theme.space-3;
-        width: parent.width - 2 * Theme.space-3;
-        height: 100%;
-        vertical-alignment: center;
-        text: root.placeholder;
-        color: Theme.text-faint;
-        font-family: Theme.font-ui;
-        font-size: Theme.text-body;
-    }
-}
-
-// Controlled checkbox: `checked` is driven by the caller's own state; this
-// component never mutates it itself (avoids fighting the caller's binding).
-// The caller handles the inherited `clicked` callback to flip its state.
-component Checkbox inherits TouchArea {
-    in property <string> text;
-    in property <bool> checked: false;
-    height: 24px;
-
-    HorizontalLayout {
-        spacing: Theme.space-2;
-        alignment: start;
-
-        Rectangle {
-            width: 18px;
-            height: 18px;
-            border-radius: 3px;
-            border-width: 1px;
-            border-color: Theme.line;
-            background: root.checked ? Theme.accent : Theme.bg-inset;
-
-            Text {
-                visible: root.checked;
-                text: "✓";
-                color: Theme.on-accent;
-                font-size: 12px;
-                horizontal-alignment: center;
-                vertical-alignment: center;
-                width: 100%;
-                height: 100%;
-            }
-        }
-
-        Text {
-            text: root.text;
-            color: Theme.text-primary;
-            font-family: Theme.font-ui;
-            font-size: Theme.text-body;
-            vertical-alignment: center;
-        }
-    }
-}
-
-// One tradeoff choice (two-factor vs --allow-no-tpm). `selected` is
-// caller-driven; the caller handles `clicked` to switch the choice.
+// One security-model choice card (two-factor vs --allow-no-tpm). `selected` and
+// `tradeoff-color` are caller-driven; the caller handles `clicked`.
 component Choice inherits TouchArea {
     in property <string> title;
     in property <string> tradeoff;
     in property <bool> selected: false;
-    // Color for the tradeoff/warning line, computed by the caller (see
-    // CreateScreen below) from its own `allow-no-tpm` state — never from
-    // this component's own `selected`, which only reflects "is this the
-    // active card" and says nothing about which option is the risky one.
     in property <brush> tradeoff-color: Theme.text-secondary;
-
-    height: 78px;
+    height: 88px;
 
     Rectangle {
         width: 100%;
         height: 100%;
-        background: Theme.bg-inset;
+        background: root.selected ? Theme.accent-soft : Theme.bg-inset;
         border-radius: Theme.radius-panel;
-        border-width: root.selected ? 2px : 1px;
+        border-width: root.selected ? 1.5px : 1px;
         border-color: root.selected ? Theme.accent : Theme.line;
 
-        VerticalLayout {
-            width: 100%;
-            height: 100%;
-            padding: Theme.space-3;
-            spacing: Theme.space-1;
+        HorizontalLayout {
+            padding: Theme.space-4;
+            spacing: Theme.space-3;
 
-            Text {
-                text: root.title;
-                color: Theme.text-primary;
-                font-family: Theme.font-ui;
-                font-size: Theme.text-body;
-                font-weight: 600;
+            Rectangle {
+                width: 18px;
+                height: 18px;
+                y: 2px;
+                border-radius: self.width / 2;
+                background: transparent;
+                border-width: root.selected ? 6px : 1.5px;
+                border-color: root.selected ? Theme.accent : Theme.line;
             }
-            Text {
-                text: root.tradeoff;
-                color: root.tradeoff-color;
-                font-family: Theme.font-ui;
-                font-size: Theme.text-body;
-                wrap: word-wrap;
+
+            VerticalLayout {
+                spacing: Theme.space-1;
+                horizontal-stretch: 1;
+
+                Text {
+                    text: root.title;
+                    color: Theme.text-primary;
+                    font-family: Theme.font-ui;
+                    font-size: Theme.text-body;
+                    font-weight: 600;
+                }
+                Text {
+                    text: root.tradeoff;
+                    color: root.tradeoff-color;
+                    font-family: Theme.font-ui;
+                    font-size: Theme.text-small;
+                    wrap: word-wrap;
+                }
             }
         }
     }
@@ -156,99 +62,106 @@ component Choice inherits TouchArea {
 export component CreateScreen inherits Rectangle {
     callback create_vault(passphrase: string, confirm: string, allow_no_tpm: bool, use_recovery: bool, recovery_passphrase: string);
 
-    // Local-only form state; nothing here is a secret except the field text,
-    // which is read once (on submit) and passed straight to `create_vault`.
     property <bool> allow-no-tpm: false;
     property <bool> use-recovery: false;
 
     background: Theme.bg-base;
 
-    VerticalLayout {
+    Flickable {
         width: 100%;
         height: 100%;
-        alignment: center;
+        viewport-width: self.width;
+        viewport-height: content.preferred-height;
 
-        HorizontalLayout {
-            alignment: center;
+        content := VerticalLayout {
+            width: parent.width;
+            padding: Theme.space-8;
 
-            VerticalLayout {
-                width: 420px;
-                spacing: Theme.space-4;
+            HorizontalLayout {
+                alignment: center;
 
-                Text {
-                    text: "Create a vault";
-                    color: Theme.text-primary;
-                    font-family: Theme.font-ui;
-                    font-size: Theme.text-display;
-                    font-weight: Theme.weight-display;
-                }
+                Card {
+                    width: 460px;
 
-                Text {
-                    text: "SECOND FACTOR";
-                    color: Theme.text-faint;
-                    font-family: Theme.font-ui;
-                    font-size: Theme.text-label;
-                    font-weight: Theme.weight-label;
-                    letter-spacing: Theme.label-letterspacing;
-                }
+                    VerticalLayout {
+                        padding: Theme.space-8;
+                        spacing: Theme.space-5;
 
-                Choice {
-                    title: "Two-factor (TPM + passphrase)";
-                    tradeoff: "Strongest: needs this machine's TPM and your passphrase.";
-                    selected: !root.allow-no-tpm;
-                    // Positive claim, never alarming: accent while it's the
-                    // active choice, plain secondary otherwise.
-                    tradeoff-color: root.allow-no-tpm ? Theme.text-secondary : Theme.accent;
-                    clicked => { root.allow-no-tpm = false; }
-                }
+                        HorizontalLayout {
+                            spacing: Theme.space-3;
+                            Seal { size: 34px; engaged: false; }
+                            Text {
+                                text: "Create a vault";
+                                color: Theme.text-primary;
+                                font-family: Theme.font-ui;
+                                font-size: Theme.text-display;
+                                font-weight: Theme.weight-display;
+                                vertical-alignment: center;
+                            }
+                        }
 
-                Choice {
-                    title: "Passphrase only (--allow-no-tpm)";
-                    tradeoff: "Hardware binding off — anyone with the file and passphrase can decrypt it on any machine.";
-                    selected: root.allow-no-tpm;
-                    // Always the honest warning for the weaker option — most
-                    // importantly, it must stay Theme.caution (not fade to
-                    // neutral) exactly when the user has committed to it
-                    // (root.allow-no-tpm true).
-                    tradeoff-color: Theme.caution;
-                    clicked => { root.allow-no-tpm = true; }
-                }
+                        VerticalLayout {
+                            spacing: Theme.space-2;
 
-                Checkbox {
-                    text: "Add recovery escrow";
-                    checked: root.use-recovery;
-                    clicked => { root.use-recovery = !root.use-recovery; }
-                }
+                            SectionLabel { text: "SECOND FACTOR"; }
 
-                if root.use-recovery: Text {
-                    text: "A stolen vault is only as strong as the recovery passphrase.";
-                    color: Theme.caution;
-                    font-family: Theme.font-ui;
-                    font-size: Theme.text-body;
-                    wrap: word-wrap;
-                }
+                            Choice {
+                                title: "Two-factor · TPM + passphrase";
+                                tradeoff: "Strongest: unlocking needs this machine's TPM and your passphrase.";
+                                selected: !root.allow-no-tpm;
+                                tradeoff-color: root.allow-no-tpm ? Theme.text-secondary : Theme.accent;
+                                clicked => { root.allow-no-tpm = false; }
+                            }
+                            Choice {
+                                title: "Passphrase only";
+                                tradeoff: "Hardware binding off — anyone with the file and passphrase can decrypt it on any machine.";
+                                selected: root.allow-no-tpm;
+                                tradeoff-color: Theme.caution;
+                                clicked => { root.allow-no-tpm = true; }
+                            }
+                        }
 
-                pw-field := MaskedField {
-                    placeholder: "Passphrase";
-                }
-                confirm-field := MaskedField {
-                    placeholder: "Confirm passphrase";
-                }
-                recovery-field := MaskedField {
-                    placeholder: "Recovery passphrase";
-                    field-enabled: root.use-recovery;
-                }
+                        VerticalLayout {
+                            spacing: Theme.space-2;
 
-                PrimaryButton {
-                    text: "Create vault";
-                    clicked => {
-                        root.create_vault(
-                            pw-field.text,
-                            confirm-field.text,
-                            root.allow-no-tpm,
-                            root.use-recovery,
-                            recovery-field.text,
-                        );
+                            Checkbox {
+                                text: "Add a recovery escrow";
+                                checked: root.use-recovery;
+                                clicked => { root.use-recovery = !root.use-recovery; }
+                            }
+                            if root.use-recovery: Text {
+                                text: "Survives TPM loss — but a stolen vault is then only as strong as the recovery passphrase.";
+                                color: Theme.caution;
+                                font-family: Theme.font-ui;
+                                font-size: Theme.text-small;
+                                wrap: word-wrap;
+                            }
+                        }
+
+                        VerticalLayout {
+                            spacing: Theme.space-3;
+
+                            pw-field := Field { placeholder: "Passphrase"; masked: true; }
+                            confirm-field := Field { placeholder: "Confirm passphrase"; masked: true; }
+                            recovery-field := Field {
+                                placeholder: "Recovery passphrase";
+                                masked: true;
+                                field-enabled: root.use-recovery;
+                            }
+                        }
+
+                        PrimaryButton {
+                            text: "Create vault";
+                            clicked => {
+                                root.create_vault(
+                                    pw-field.text,
+                                    confirm-field.text,
+                                    root.allow-no-tpm,
+                                    root.use-recovery,
+                                    recovery-field.text,
+                                );
+                            }
+                        }
                     }
                 }
             }
