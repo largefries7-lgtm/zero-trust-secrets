@@ -140,6 +140,7 @@ export component VaultScreen inherits Rectangle {
     callback remove(name: string);
     callback lock_now();
     callback search(query: string);
+    callback open_settings();
 
     // Weaker-than-two-factor posture (passphrase-only, or recovery escrow
     // enabled) gets the caution ring on the seal per design-system.md.
@@ -212,6 +213,12 @@ export component VaultScreen inherits Rectangle {
                 font-family: Theme.font-mono;
                 font-size: Theme.text-mono;
                 vertical-alignment: center;
+            }
+
+            GhostButton {
+                text: "Settings";
+                width: 90px;
+                clicked => { root.open_settings(); }
             }
 
             GhostButton {

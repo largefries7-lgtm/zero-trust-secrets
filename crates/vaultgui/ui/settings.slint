@@ -205,6 +205,7 @@ export component SettingsScreen inherits Rectangle {
     callback generate(length: int, symbols: bool);
     callback deprovision();
     callback copy_generated();
+    callback close_settings();
 
     // Generator UI state — the length/symbols choice, not a secret. Only
     // the resulting `generated_value` (an App-level property Rust sets) is
@@ -220,12 +221,24 @@ export component SettingsScreen inherits Rectangle {
         padding: Theme.space-6;
         spacing: Theme.space-4;
 
-        Text {
-            text: "Settings";
-            color: Theme.text-primary;
-            font-family: Theme.font-ui;
-            font-size: Theme.text-display;
-            font-weight: Theme.weight-display;
+        HorizontalLayout {
+            spacing: Theme.space-3;
+
+            Text {
+                text: "Settings";
+                color: Theme.text-primary;
+                font-family: Theme.font-ui;
+                font-size: Theme.text-display;
+                font-weight: Theme.weight-display;
+                horizontal-stretch: 1;
+                vertical-alignment: center;
+            }
+
+            GhostButton {
+                text: "Back";
+                width: 90px;
+                clicked => { root.close_settings(); }
+            }
         }
 
         ReadoutRow {

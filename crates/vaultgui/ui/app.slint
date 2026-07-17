@@ -115,6 +115,7 @@ export component App inherits Window {
         remove(name) => { root.remove(name); }
         lock_now => { root.lock_now(); }
         search(query) => { root.search(query); }
+        open_settings => { root.screen = "settings"; }
     }
 
     if root.screen == "settings" : SettingsScreen {
@@ -137,6 +138,7 @@ export component App inherits Window {
         generate(length, symbols) => { root.generate(length, symbols); }
         deprovision => { root.deprovision(); }
         copy_generated => { root.copy_generated(); }
+        close_settings => { root.screen = "vault"; }
     }
 
     // Dismissable error banner, always on top (declared last = highest
