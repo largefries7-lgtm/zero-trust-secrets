@@ -379,3 +379,97 @@ machine — cannot be closed from userspace; not pretended otherwise.
 Cloud sync, browser extensions, mobile, multi-user/sharing, autofill; any change that
 moves crypto out of vaultcore or weakens the two-factor KEK; defeating the stated
 ceiling (kernel, live-process debugger, cold-boot).
+
+---
+
+## 13. As-built notes — Slice 2 (2026-07-17)
+
+The GUI was built, wired to vaultcore through the lifted `flow`/`passgen` helpers, and
+unit-tested at the engine layer. This section is the as-built delta over §§1–12,
+following the slice-1 convention (see the slice-1 spec §§15–17): what changed, what's
+defended, what honestly is not, and what's deliberately deferred. Where this section
+differs from the design body above, this section is authoritative.
+
+### What changed
+- New crate `crates/vaultgui` (lib + bin, Slint 1.17.1). **Engine** (window-free,
+  unit-tested): a pure `autolock` reducer; `session` (single-owner
+  `AppState::Unlocked(Session)` holding the Vault/DEK); `input::drain_to_secret`;
+  `prefs` (non-secret, hand-rolled codec, zero new deps); `clipboard` (countdown +
+  verify-before-clear + absolute `System32` paths + `CREATE_NO_WINDOW`). **Windows
+  FFI:** `anticapture` (`SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`); `watcher`
+  (message-only window: WTS session-lock + suspend + `GetLastInputInfo` idle → posts a
+  lock to the UI thread); `hello` (Windows Hello `UserConsentVerifier` — app/reveal
+  gate only). **UI:** `theme` (light/dark tokens), four screens (create/unlock/vault/
+  settings), full engine↔UI wiring.
+- `vaultcore` additions (tested, no crypto change): `passgen` + `flow`
+  (create/unlock/describe) lifted out of the CLI, per §3; the CLI now shares those
+  flows instead of duplicating them.
+- The session model realizes the design's "Option C" (§4) as specified: the GUI is
+  the long-lived in-RAM DEK holder; the DEK lives **only** on the UI thread; the
+  watcher is a pure event source — only a `Weak<App>` crosses the thread boundary, no
+  secret material. Auto-lock triggers: idle (`GetLastInputInfo`, default 5 min,
+  configurable), workstation lock, sleep/suspend, and an always-available "Lock now".
+  On lock, the `Session` drops (DEK zeroized) **and** the revealed/generated Slint
+  properties are explicitly cleared (§4).
+
+### Defended (as-built)
+- **Aggressive auto-lock** shrinks the unlocked window: idle, workstation lock, and
+  suspend each zeroize the DEK immediately, alongside an always-available manual
+  "Lock now".
+- **Anti-capture** blanks the window to screenshots and screen-share
+  (`WDA_EXCLUDEFROMCAPTURE`).
+- **Clipboard verify-before-clear + absolute `System32` paths** close two findings
+  from the slice-1 CLI review: the clear step no longer stomps a value the user
+  copied in the meantime, and no earlier-in-`PATH` binary can intercept the secret.
+- **Optional Windows Hello** adds a user-presence gate on app entry/reveal without
+  touching the crypto.
+
+### NOT defended (honest ceiling)
+- **Long-lived DEK in RAM while unlocked.** By construction the GUI holds the DEK for
+  the whole session; a debugger or code injection on the live unlocked process can
+  read it. This is the same userspace ceiling as slice 1 (its CLI held the DEK only
+  per-command) — slice 2 trades a much longer exposure window for usability, and
+  auto-lock **mitigates**, but does not **close**, that window.
+- **Input-field residual.** Slint's `LineEdit` `SharedString` storage and the OS
+  IME/undo stacks retain copies of typed text we cannot zeroize (design invariant
+  #4). We minimize exposure — drain to a `SecretString` on submit, then clear the
+  field — but do not claim the input path is clean.
+- **Revealed-value widget residual.** After `do_lock` clears the Slint property, the
+  freed `SharedString` buffer can still hold the revealed plaintext until the
+  allocator reuses it. This is **measured** by the `gui-post-autolock` harness
+  scenario and **reported honestly** — not asserted zero. See `verify/TEST_PLAN.md`.
+- **Hello is an app/reveal presence gate, not a KEK factor.** It does not harden the
+  vault file; the `Argon2id(passphrase)` factor is exactly as strong with or without
+  Hello enabled.
+- **Anti-capture covers screen capture, not a camera pointed at the display; and
+  accessibility APIs can read a revealed value while it is shown** (reveal remains
+  user-initiated and transient, per §5.3).
+
+### Unchanged ceiling (from slice-1 §16)
+Kernel compromise, a debugger attached to the live unlocked process, and cold-boot on
+an already-unlocked machine carry forward unchanged — none of these is closable from
+userspace, and slice 2 does not pretend otherwise.
+
+### Consciously deferred (with reason)
+- **System tray / minimize-to-tray** — convenience, not security-load-bearing.
+- **Entropy visualizer** — the honest numeric entropy estimate already meets the
+  requirement.
+- **Encrypted metadata names** — carried forward from slice 1; not a currently
+  exploitable hole.
+- **PCR-policy sealing** — still a CNG limitation (slice-1 §15); needs a `tss-esapi`
+  backend.
+- **Dynamic auto-lock timeout** — a Settings change to the idle timeout takes effect
+  on next launch, not live mid-session.
+- **Native file-open dialog for the vault-path picker** — `pick_vault` is a stub; the
+  vault path defaults to `%APPDATA%\ZeroTrustSecrets\vault.ztsv`.
+- **Scrubbing Slint's own retained-render residual** — not achievable without owning
+  the toolkit's internals; measured and disclosed instead (see above and §7).
+
+### Verification honesty
+The GUI is compile-verified and structurally code-reviewed. The live lifecycle, the
+visual pass, and the memory harness (`gui-locked` / `gui-post-autolock` / `gui-leak`)
+require real hardware (a display, a TPM for the two-factor/Hello paths, and
+`MiniDumpWriteDump`) and are run there — see `verify/TEST_PLAN.md` for the harness
+design, the pass criteria, and the recorded result (including whether the GUI
+scenarios have been executed yet in a given environment). No claim in this section
+outruns what the code and the harness actually demonstrate.
