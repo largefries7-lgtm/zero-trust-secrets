@@ -92,8 +92,9 @@ sub-APIs actually used are enabled).
 **Auditing:** [`deny.toml`](deny.toml) defines the supply-chain policy
 (advisories = deny, wildcards = deny, permissive-license allow-list, crates.io
 only). [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs `cargo deny
-check` and `cargo audit` on every push and pull request, gating every dependency
-change.
+check` — the sole supply-chain gate, performing the advisory audit against that
+target-scoped, justified-ignore policy — on every push and pull request, gating
+every dependency change.
 
 ### Dependency-surface tradeoff of the GUI (slice 2) — honest disclosure
 

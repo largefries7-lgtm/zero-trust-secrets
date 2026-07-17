@@ -1,11 +1,20 @@
 name: CI
 
 # Enforces what SECURITY.md promises: tests plus the supply-chain policy
-# (cargo-deny + cargo-audit) run on every push and pull request, so a new or
-# yanked/advisory-bearing dependency fails the build instead of slipping in.
+# (cargo deny check, the sole supply-chain gate — see the supply-chain job
+# below for why cargo-audit is not used alongside it) run on every push and
+# pull request, so a new or yanked/advisory-bearing dependency fails the
+# build instead of slipping in.
+#
+# Two build/test jobs, split because the GUI is Windows-first and Slint's
+# Linux backend needs system libs the ubuntu runner may lack:
+#   - `test-non-gui` (ubuntu): builds/tests vaultcore + vaultctl + dumper only.
+#   - `test-windows` (windows-latest): builds/tests the FULL workspace,
+#     including vaultgui — the only job that actually compiles the
+#     `#[cfg(windows)]` FFI + Slint + WinRT code.
 #
 # The memory-scraping proof (`bash verify/run.sh`) is Windows-only and needs
-# MiniDump access, so it stays a documented manual step rather than a CI gate.
+# MiniDump access, so it stays a documented MANUAL step rather than a CI gate.
 
 on:
   push:
@@ -15,31 +24,59 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  test:
-    name: build & test
+  test-non-gui:
+    name: "build & test (non-GUI: core + CLI + dumper)"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust (stable, pinned by rust-version)
         run: rustup toolchain install stable --profile minimal
       # --locked: fail if Cargo.lock is out of date, preserving the committed pins.
+      # Scoped to the non-GUI crates: vaultgui (Slint) is Windows-first and its
+      # Linux backend needs system libs this runner may lack; see test-windows.
+      - name: Build
+        run: cargo build -p vaultcore -p vaultctl -p dumper --locked
+      - name: Test
+        run: cargo test -p vaultcore -p vaultctl -p dumper --locked
+
+  test-windows:
+    name: build & test (windows-latest, full workspace incl. vaultgui)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (stable, pinned by rust-version)
+        run: rustup toolchain install stable --profile minimal
+      # Full workspace, including vaultgui: this is the first job that actually
+      # compiles the #[cfg(windows)] FFI + Slint + WinRT code.
       - name: Build
         run: cargo build --workspace --locked
+      # vaultgui's tests are pure unit tests (no window is opened), so they run
+      # headless here. The interactive memory-scraping harness (verify/run.sh)
+      # is NOT run in CI — it stays a documented MANUAL step (see top of file).
       - name: Test
         run: cargo test --workspace --locked
 
   supply-chain:
-    name: cargo-deny + cargo-audit
+    name: cargo deny check (sole supply-chain gate)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust (stable)
         run: rustup toolchain install stable --profile minimal
-      - name: Install cargo-deny and cargo-audit
-        run: cargo install cargo-deny cargo-audit --locked
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
       # Advisories, license allow-list, wildcard bans, and registry restrictions
-      # are all defined in deny.toml.
+      # are all defined in deny.toml, and are the single source of truth here.
+      #
+      # cargo-audit is deliberately NOT run alongside this: it audits the
+      # entire Cargo.lock with no target-scoping, so it would flag advisories
+      # that deny.toml already handles honestly and with justification —
+      # the three unmaintained Slint-stack crates (paste/rustybuzz/ttf-parser)
+      # in `[advisories].ignore`, and the Linux/Wayland-only quick-xml
+      # advisories that `[graph].targets` prunes because that subtree never
+      # compiles into our Windows binary. Duplicating those into a
+      # `cargo audit --ignore` list would be LESS honest: cargo-audit has no
+      # way to express "not applicable on our target," only "ignore this
+      # advisory everywhere."
       - name: cargo deny check
         run: cargo deny check
-      - name: cargo audit
-        run: cargo audit
