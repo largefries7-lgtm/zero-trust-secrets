@@ -1,7 +1,9 @@
-//! Windows Hello as an ADDITIONAL user-presence gate. It gates access to the app
-//! (or a reveal); it does NOT contribute to the KEK and never blocks a passphrase
-//! unlock. If Hello is unavailable or declined, the app still unlocks via the
-//! passphrase factor (the real cryptographic factor is unchanged).
+//! Windows Hello as an OPT-IN, additional user-presence gate on the REVEAL
+//! action (see `main.rs`'s `on_reveal`, gated by `Prefs::hello_enabled`). It
+//! is never app-entry and never contributes to the KEK: it does not touch
+//! unlock at all. If Hello is unavailable or the user declines the prompt,
+//! reveal simply does not proceed for that click -- the passphrase (+ TPM, if
+//! bound) remains the sole cryptographic factor, unchanged either way.
 
 #[cfg(windows)]
 pub fn available() -> bool {

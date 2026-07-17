@@ -43,6 +43,7 @@ export component App inherits Window {
 
     // ---- Capabilities / errors ---------------------------------------------
     in-out property <bool> hello_available: false;
+    in-out property <bool> hello_enabled: false;
     in-out property <string> error;
 
     // ---- Callbacks (handled in Rust; see src/main.rs, Task D3) -------------
@@ -63,6 +64,7 @@ export component App inherits Window {
     callback deprovision();
     callback search(query: string);
     callback copy_generated();
+    callback set_hello(value: bool);
 
     if root.screen == "create" : CreateScreen {
         x: 0;
@@ -131,10 +133,12 @@ export component App inherits Window {
         idle_timeout_secs: root.idle_timeout_secs;
         dark: root.dark;
         hello_available: root.hello_available;
+        hello_enabled: root.hello_enabled;
         generated_value: root.generated_value;
 
         set_timeout(secs) => { root.set_timeout(secs); }
         set_dark(value) => { root.set_dark(value); }
+        set_hello(value) => { root.set_hello(value); }
         generate(length, symbols) => { root.generate(length, symbols); }
         deprovision => { root.deprovision(); }
         copy_generated => { root.copy_generated(); }

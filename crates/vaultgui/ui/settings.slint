@@ -1,7 +1,7 @@
 // Settings screen: an instrument "readout" panel — engraved labels + mono
 // value rows for the vault's security posture, an auto-lock timeout control,
-// a light/dark toggle, a Windows Hello status readout, a password generator,
-// and a typed-DELETE-gated deprovision action.
+// a light/dark toggle, an opt-in Windows Hello reveal-gate toggle, a password
+// generator, and a typed-DELETE-gated deprovision action.
 import { Theme } from "theme.slint";
 
 component PrimaryButton inherits TouchArea {
@@ -86,6 +86,11 @@ component Checkbox inherits TouchArea {
     in property <string> text;
     in property <bool> checked: false;
     height: 24px;
+    // Dim + block interaction when the underlying capability isn't there
+    // (e.g. the Windows Hello toggle when Hello isn't available on this
+    // device). `enabled` is TouchArea's own built-in input-gating property;
+    // this just adds the matching visual treatment.
+    opacity: root.enabled ? 1.0 : 0.4;
 
     HorizontalLayout {
         spacing: Theme.space-2;
@@ -198,10 +203,12 @@ export component SettingsScreen inherits Rectangle {
     in property <int> idle_timeout_secs;
     in property <bool> dark;
     in property <bool> hello_available;
+    in property <bool> hello_enabled;
     in property <string> generated_value;
 
     callback set_timeout(secs: int);
     callback set_dark(value: bool);
+    callback set_hello(value: bool);
     callback generate(length: int, symbols: bool);
     callback deprovision();
     callback copy_generated();
@@ -259,9 +266,29 @@ export component SettingsScreen inherits Rectangle {
             label: "PROVIDER";
             value: root.provider_desc;
         }
-        ReadoutRow {
-            label: "WINDOWS HELLO";
-            value: root.hello_available ? "Available as an unlock factor" : "Not available on this device";
+        VerticalLayout {
+            spacing: Theme.space-1;
+
+            Checkbox {
+                text: "Require Windows Hello before revealing a secret";
+                checked: root.hello_enabled;
+                enabled: root.hello_available;
+                clicked => { root.set_hello(!root.hello_enabled); }
+            }
+
+            Text {
+                // Always accurate about scope: Hello gates the on-screen
+                // REVEAL action only. It never touches the vault key --
+                // the passphrase (+ TPM, if bound) remains the sole
+                // cryptographic factor either way.
+                text: root.hello_available
+                    ? "Gates revealing a secret's value on screen. Does not protect the vault key -- the passphrase (and TPM, if bound) is unchanged."
+                    : "Windows Hello isn't available on this device, so this gate can't be enforced.";
+                color: Theme.text-faint;
+                font-family: Theme.font-ui;
+                font-size: Theme.text-label;
+                wrap: word-wrap;
+            }
         }
 
         Divider {}

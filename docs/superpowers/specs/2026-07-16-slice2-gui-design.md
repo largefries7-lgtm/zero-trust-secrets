@@ -103,7 +103,7 @@ crates/vaultgui/
       mod.rs          #   message-only Win32 window: WM_WTSSESSION_CHANGE, WM_POWERBROADCAST
                       #   + GetLastInputInfo idle poll; posts Lock via invoke_from_event_loop
     clipboard.rs      # stdin-fed copy + verify-before-clear + countdown model  [timing tested]
-    hello.rs          # Windows Hello UserConsentVerifier gate (app/reveal presence)
+    hello.rs          # Windows Hello UserConsentVerifier — opt-in reveal gate only
     anticapture.rs    # SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE) on the HWND
     input.rs          # field-text -> SecretString marshalling + field-clear helpers
     prefs.rs          # non-secret prefs only (auto-lock timeout, theme override, last vault path)
@@ -220,12 +220,15 @@ the docs rather than silently resolved either way.
 
 ### 5.4 Windows Hello (optional, in scope)
 
-An optional gate using WinRT `UserConsentVerifier::RequestVerificationAsync`.
-**Precise framing (non-negotiable):** Hello gates *access to the app* (and, if
-enabled, re-challenges before a reveal). It **does not** contribute to the KEK — the
-`Argon2id(passphrase)` factor is unchanged, and the vault file is exactly as strong
-with or without Hello. If Hello is unavailable or the user declines, the app still
-unlocks via the passphrase (the real factor). We never weaken the crypto to add a
+An opt-in gate using WinRT `UserConsentVerifier::RequestVerificationAsync`.
+**Precise framing (non-negotiable):** Hello gates *the reveal action*, and only the
+reveal action — never app entry, never unlock. A Settings toggle (default off) lets
+the user require a Hello prompt before a secret's value is shown on screen. It
+**does not** contribute to the KEK — the `Argon2id(passphrase)` factor is unchanged,
+and the vault file is exactly as strong with or without Hello. If Hello is
+unavailable, or the toggle is off, or the user declines the prompt, reveal simply
+does not proceed for that click; unlock itself is never gated by Hello and always
+goes through the passphrase (the real factor). We never weaken the crypto to add a
 biometric convenience. This framing is surfaced in the UI and the threat-model docs.
 
 ---
@@ -337,7 +340,8 @@ Test-first cadence matches the repo's existing git history.
 - **Input-field residual (§5.1).** Slint/OS retain un-zeroizable copies of typed text.
 - **Revealed-value widget residual (§5.2/§7).** Whatever Slint keeps after our on-lock
   scrub — measured and reported, not assumed zero.
-- **Hello is an app gate, not a KEK factor** — it does not harden the vault file.
+- **Hello is an opt-in reveal gate, not a KEK factor** — it does not harden the vault
+  file, and it never gates app entry/unlock.
 - **Anti-capture covers screen capture, not a camera; a11y APIs can read revealed values.**
 
 ### Unchanged ceiling (from slice-1 §16)
@@ -398,9 +402,10 @@ differs from the design body above, this section is authoritative.
   verify-before-clear + absolute `System32` paths + `CREATE_NO_WINDOW`). **Windows
   FFI:** `anticapture` (`SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`); `watcher`
   (message-only window: WTS session-lock + suspend + `GetLastInputInfo` idle → posts a
-  lock to the UI thread); `hello` (Windows Hello `UserConsentVerifier` — app/reveal
-  gate only). **UI:** `theme` (light/dark tokens), four screens (create/unlock/vault/
-  settings), full engine↔UI wiring.
+  lock to the UI thread); `hello` (Windows Hello `UserConsentVerifier` — an opt-in
+  gate on the reveal action only; off by default, toggled in Settings, never app
+  entry, never a KEK factor). **UI:** `theme` (light/dark tokens), four screens
+  (create/unlock/vault/settings), full engine↔UI wiring.
 - `vaultcore` additions (tested, no crypto change): `passgen` + `flow`
   (create/unlock/describe) lifted out of the CLI, per §3; the CLI now shares those
   flows instead of duplicating them.
@@ -421,8 +426,10 @@ differs from the design body above, this section is authoritative.
 - **Clipboard verify-before-clear + absolute `System32` paths** close two findings
   from the slice-1 CLI review: the clear step no longer stomps a value the user
   copied in the meantime, and no earlier-in-`PATH` binary can intercept the secret.
-- **Optional Windows Hello** adds a user-presence gate on app entry/reveal without
-  touching the crypto.
+- **Opt-in Windows Hello reveal gate.** A Settings toggle (default off) requires a
+  Hello prompt (`UserConsentVerifier`) immediately before a secret's value is
+  revealed on screen; declining or Hello being unavailable simply fails the reveal
+  for that click. It never gates app entry/unlock and never touches the crypto.
 
 ### NOT defended (honest ceiling)
 - **Long-lived DEK in RAM while unlocked.** By construction the GUI holds the DEK for
@@ -438,7 +445,9 @@ differs from the design body above, this section is authoritative.
   freed `SharedString` buffer can still hold the revealed plaintext until the
   allocator reuses it. This is **measured** by the `gui-post-autolock` harness
   scenario and **reported honestly** — not asserted zero. See `verify/TEST_PLAN.md`.
-- **Hello is an app/reveal presence gate, not a KEK factor.** It does not harden the
+- **Hello is an opt-in reveal gate, not a KEK factor, and not app entry.** Enforcement
+  requires both the Settings toggle **and** live Hello availability (so a device that
+  later loses Hello is not permanently locked out of reveal) — it does not harden the
   vault file; the `Argon2id(passphrase)` factor is exactly as strong with or without
   Hello enabled.
 - **Anti-capture covers screen capture, not a camera pointed at the display; and

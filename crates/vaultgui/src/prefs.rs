@@ -32,11 +32,19 @@ pub struct Prefs {
     pub idle_timeout_secs: Option<u64>,
     pub theme: Theme,
     pub last_vault_path: Option<String>,
+    /// Opt-in gate on the REVEAL action (see `hello.rs`). Never contributes to
+    /// the KEK/passphrase factor -- defaults to `false` (off).
+    pub hello_enabled: bool,
 }
 
 impl Default for Prefs {
     fn default() -> Self {
-        Prefs { idle_timeout_secs: Some(300), theme: Theme::System, last_vault_path: None }
+        Prefs {
+            idle_timeout_secs: Some(300),
+            theme: Theme::System,
+            last_vault_path: None,
+            hello_enabled: false,
+        }
     }
 }
 
@@ -51,6 +59,7 @@ impl Prefs {
         if let Some(p) = &self.last_vault_path {
             s.push_str(&format!("last_vault_path={p}\n"));
         }
+        s.push_str(&format!("hello_enabled={}\n", if self.hello_enabled { "true" } else { "false" }));
         s
     }
 
@@ -71,6 +80,13 @@ impl Prefs {
                 }
                 "theme" => p.theme = Theme::parse(v.trim()),
                 "last_vault_path" => p.last_vault_path = Some(v.trim().to_string()),
+                "hello_enabled" => {
+                    p.hello_enabled = match v.trim() {
+                        "true" => true,
+                        "false" => false,
+                        _ => p.hello_enabled,
+                    };
+                }
                 _ => {}
             }
         }
@@ -88,9 +104,24 @@ mod tests {
             idle_timeout_secs: Some(120),
             theme: Theme::Dark,
             last_vault_path: Some("C:\\vaults\\my.ztsv".into()),
+            hello_enabled: true,
         };
         let back = Prefs::from_serialized(&p.to_serialized());
         assert_eq!(back, p);
+    }
+
+    #[test]
+    fn hello_enabled_roundtrips_and_defaults_false() {
+        assert_eq!(Prefs::default().hello_enabled, false);
+
+        let p = Prefs { hello_enabled: true, ..Prefs::default() };
+        let back = Prefs::from_serialized(&p.to_serialized());
+        assert_eq!(back.hello_enabled, true);
+
+        // Absent key (e.g. prefs written before this field existed) leniently
+        // defaults to false rather than failing to parse.
+        let back = Prefs::from_serialized("theme=light\n");
+        assert_eq!(back.hello_enabled, false);
     }
 
     #[test]

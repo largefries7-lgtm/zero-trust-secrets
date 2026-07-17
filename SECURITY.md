@@ -39,8 +39,8 @@ tradeoff, not an oversight — two new surfaces follow from it:
 
 Neither surface is hidden or minimized — see §13 of the slice-2 spec for the full
 defended / not-defended / deferred breakdown, including why Windows Hello (an
-optional feature of this slice) is a presence gate on the app and not a
-contribution to the cryptographic key.
+opt-in feature of this slice, toggled in Settings) is a reveal gate — not
+app-entry, and never a contribution to the cryptographic key.
 
 ## Empirical verification
 

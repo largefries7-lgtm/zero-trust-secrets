@@ -141,6 +141,7 @@ fn main() -> Result<(), slint::PlatformError> {
     app.set_dark(matches!(prefs.borrow().theme, Theme::Dark | Theme::System));
     app.set_idle_timeout_secs(prefs.borrow().idle_timeout_secs.unwrap_or(0) as i32);
     app.set_hello_available(vaultgui::hello::available());
+    app.set_hello_enabled(prefs.borrow().hello_enabled);
     app.set_vault_path(vault_path.display().to_string().into());
 
     if vault_path.exists() {
@@ -208,6 +209,20 @@ fn main() -> Result<(), slint::PlatformError> {
             persist_prefs(&p, &prefs_path);
             drop(p);
             app.set_idle_timeout_secs(normalized);
+        });
+    }
+
+    {
+        let w = app.as_weak();
+        let prefs = prefs.clone();
+        let prefs_path = prefs_path.clone();
+        app.on_set_hello(move |value| {
+            let app = w.unwrap();
+            let mut p = prefs.borrow_mut();
+            p.hello_enabled = value;
+            persist_prefs(&p, &prefs_path);
+            drop(p);
+            app.set_hello_enabled(value);
         });
     }
 
@@ -323,6 +338,20 @@ fn main() -> Result<(), slint::PlatformError> {
         let state = state.clone();
         app.on_reveal(move |name| {
             let app = w.unwrap();
+            // Opt-in Windows Hello reveal gate (Settings). Gated on BOTH the
+            // user's preference AND live availability -- if Hello was
+            // enabled but the device later loses it (driver issue, disabled
+            // in Windows), the gate is not enforced rather than permanently
+            // locking reveal out. This never touches the KEK/passphrase
+            // factor; it only stands in front of the on-screen reveal.
+            if app.get_hello_enabled() && vaultgui::hello::available() {
+                if !vaultgui::hello::verify("Reveal a secret in Zero-Trust Secrets") {
+                    app.set_error(
+                        "Windows Hello verification was declined — secret not revealed.".into(),
+                    );
+                    return;
+                }
+            }
             let st = state.borrow();
             if let AppState::Unlocked(s) = &*st {
                 match s.vault().get(&name) {

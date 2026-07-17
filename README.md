@@ -44,11 +44,11 @@ tool, not replaced.
 per command), `vaultgui` holds the decryption key in RAM for the whole unlocked
 session, aggressively auto-locking on idle, workstation-lock, suspend, or manual
 "Lock now". It also blanks itself to screen capture/screen-share and offers an
-optional Windows Hello presence gate that does not touch the crypto. These are
-real new surfaces with honest, stated limits (a long-lived in-RAM key while
-unlocked, and un-zeroizable input-field/revealed-value residuals in the UI
-toolkit) — see the as-built section of the slice-2 design spec for the full
-defended/not-defended breakdown:
+optional Windows Hello gate on secret reveal (opt-in in Settings) that does not
+touch the crypto. These are real new surfaces with honest, stated limits (a
+long-lived in-RAM key while unlocked, and un-zeroizable input-field/revealed-value
+residuals in the UI toolkit) — see the as-built section of the slice-2 design spec
+for the full defended/not-defended breakdown:
 [`docs/superpowers/specs/2026-07-16-slice2-gui-design.md`](docs/superpowers/specs/2026-07-16-slice2-gui-design.md)
 (§13).
 
