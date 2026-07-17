@@ -1,0 +1,36 @@
+[package]
+name = "vaultgui"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+# Internal workspace crate only; never published to crates.io.
+publish = false
+
+[dependencies]
+vaultcore = { path = "../vaultcore" }
+slint = { workspace = true, features = ["raw-window-handle-06"] }
+raw-window-handle = "0.6"
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+  "Win32_Foundation",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_System_RemoteDesktop",
+  "Win32_System_Power",
+  "Win32_System_LibraryLoader",
+  # GetTickCount (idle_duration).
+  "Win32_System_SystemInformation",
+  # WNDCLASSW/RegisterClassW carry an HBRUSH field, so the class-registration
+  # path is gated behind the GDI feature even for a message-only (UI-less) window.
+  "Win32_Graphics_Gdi",
+  "Security_Credentials_UI",
+] }
+
+[build-dependencies]
+slint-build = "1"
+
+[features]
+# Scripted hold-mode used ONLY by the verification harness (verify/dumper) to
+# drive the GUI into a precise state for memory dumping. Never in a shipping build.
+leaktest = []

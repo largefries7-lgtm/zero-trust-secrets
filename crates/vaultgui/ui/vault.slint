@@ -1,0 +1,439 @@
+// Unlocked main view: header strip (posture seal, idle countdown, Lock now),
+// a filterable record list on the left, and the selected record's detail
+// (masked/revealed value, copy/rotate/remove, add) on the right.
+//
+// NOTE on `filter`: Slint 1.17's expression language has no string
+// "contains"/substring test and no array `.filter()` (only
+// to-lowercase/to-uppercase/is-empty/character-count on strings, per the
+// vendored i-slint-compiler sources). So this screen does NOT attempt
+// client-side substring matching in markup — `filter` stays two-way bound to
+// the search box (so Rust can always read the live search text, e.g. to
+// restore it after a `changed selected` reset) and `record_names` is rendered
+// as-provided. D3a-2 wires the search box's per-keystroke `edited` callback to
+// the App-level `search(query)` callback, which Rust answers by recomputing
+// `record_names` to the filtered view immediately — no polling timer needed.
+import { Theme } from "theme.slint";
+
+component Seal inherits Rectangle {
+    in property <bool> engaged: true;
+    in property <bool> caution: false;
+    width: 28px;
+    height: 28px;
+    border-radius: self.width / 2;
+    background: root.engaged ? Theme.accent : transparent;
+    border-width: root.engaged && !root.caution ? 0px : 2px;
+    border-color: root.caution ? Theme.caution : (root.engaged ? Theme.accent : Theme.accent-dim);
+}
+
+component PrimaryButton inherits TouchArea {
+    in property <string> text;
+    height: 34px;
+
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        border-radius: Theme.radius-field;
+        background: root.enabled ? Theme.accent : Theme.accent-dim;
+        opacity: root.has-hover && root.enabled ? 0.88 : 1.0;
+
+        Text {
+            text: root.text;
+            color: Theme.on-accent;
+            font-family: Theme.font-ui;
+            font-size: Theme.text-body;
+            font-weight: 600;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            width: 100%;
+            height: 100%;
+        }
+    }
+}
+
+component GhostButton inherits TouchArea {
+    in property <string> text;
+    in property <bool> danger: false;
+    height: 34px;
+
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        border-radius: Theme.radius-field;
+        border-width: 1px;
+        border-color: root.danger ? Theme.danger : Theme.line;
+        background: root.has-hover ? Theme.bg-inset : transparent;
+
+        Text {
+            text: root.text;
+            color: root.danger ? Theme.danger : Theme.text-secondary;
+            font-family: Theme.font-ui;
+            font-size: Theme.text-body;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            width: 100%;
+            height: 100%;
+        }
+    }
+}
+
+// Plain or masked text field, used for search / name / secret-value entry.
+component Field inherits Rectangle {
+    in property <string> placeholder;
+    in property <bool> masked: false;
+    in-out property <string> text <=> input.text;
+    callback accepted();
+    // Fired on every keystroke (not just Enter), so a caller can drive a live
+    // search-as-you-type without a polling timer. `self.text` (the TextInput's
+    // own text) is passed along since the builtin `TextInput.edited` callback
+    // itself carries no argument.
+    callback edited(text: string);
+
+    height: 36px;
+    background: Theme.bg-inset;
+    border-radius: Theme.radius-field;
+    border-width: 1px;
+    border-color: input.has-focus ? Theme.accent : Theme.line;
+
+    input := TextInput {
+        x: Theme.space-2;
+        width: parent.width - 2 * Theme.space-2;
+        height: 100%;
+        vertical-alignment: center;
+        input-type: root.masked ? InputType.password : InputType.text;
+        color: Theme.text-primary;
+        font-family: Theme.font-ui;
+        font-size: Theme.text-body;
+        accepted => { root.accepted(); }
+        edited => { root.edited(self.text); }
+    }
+
+    if input.text == "" && !input.has-focus: Text {
+        x: Theme.space-2;
+        width: parent.width - 2 * Theme.space-2;
+        height: 100%;
+        vertical-alignment: center;
+        text: root.placeholder;
+        color: Theme.text-faint;
+        font-family: Theme.font-ui;
+        font-size: Theme.text-body;
+    }
+}
+
+export component VaultScreen inherits Rectangle {
+    in property <string> posture;
+    in property <bool> hardware_bound;
+    in property <bool> has_recovery;
+    in property <[string]> record_names;
+    in-out property <string> filter;
+    in property <string> selected;
+    in property <string> revealed_value;
+    in property <int> clip_remaining;
+    in property <int> idle_remaining;
+    in property <int> idle_timeout_secs;
+
+    callback select(name: string);
+    callback reveal(name: string);
+    callback mask();
+    callback copy(name: string);
+    callback add_secret(name: string, value: string);
+    callback rotate(name: string, value: string);
+    callback remove(name: string);
+    callback lock_now();
+    callback search(query: string);
+    callback open_settings();
+
+    // Weaker-than-two-factor posture (passphrase-only, or recovery escrow
+    // enabled) gets the caution ring on the seal per design-system.md.
+    property <bool> weak-posture: !root.hardware_bound || root.has_recovery;
+
+    // Local-only UI state (which inline panel is open); never a secret.
+    property <bool> adding: false;
+    property <bool> rotating: false;
+    property <bool> confirm-remove: false;
+
+    // Backing text for the add/rotate inline fields, tracked here (rather
+    // than only as each Field's own local `text`) so `changed selected`
+    // below can reliably blank them even while their panel is closed.
+    property <string> add-name-text: "";
+    property <string> add-value-text: "";
+    property <string> rotate-value-text: "";
+
+    // A newly-selected record must never inherit another record's pending
+    // "Confirm remove?"/rotate/add affordance state or typed-but-unsaved
+    // field text — otherwise a stale single click (or stale value) meant
+    // for the previous record could act on the new one.
+    changed selected => {
+        root.adding = false;
+        root.rotating = false;
+        root.confirm-remove = false;
+        root.add-name-text = "";
+        root.add-value-text = "";
+        root.rotate-value-text = "";
+    }
+
+    background: Theme.bg-base;
+
+    header := Rectangle {
+        x: 0;
+        y: 0;
+        width: 100%;
+        height: 64px;
+        background: Theme.bg-raised;
+
+        HorizontalLayout {
+            width: 100%;
+            height: 100%;
+            padding: Theme.space-4;
+            spacing: Theme.space-3;
+
+            HorizontalLayout {
+                spacing: Theme.space-2;
+                alignment: start;
+
+                Seal {
+                    engaged: true;
+                    caution: root.weak-posture;
+                }
+                Text {
+                    text: root.posture;
+                    color: root.weak-posture ? Theme.caution : Theme.accent;
+                    font-family: Theme.font-ui;
+                    font-size: Theme.text-label;
+                    font-weight: Theme.weight-label;
+                    letter-spacing: Theme.label-letterspacing;
+                    vertical-alignment: center;
+                }
+            }
+
+            Rectangle { horizontal-stretch: 1; }
+
+            if root.idle_remaining > 0: Text {
+                text: "Locks in " + root.idle_remaining + "s";
+                color: Theme.text-faint;
+                font-family: Theme.font-mono;
+                font-size: Theme.text-mono;
+                vertical-alignment: center;
+            }
+
+            GhostButton {
+                text: "Settings";
+                width: 90px;
+                clicked => { root.open_settings(); }
+            }
+
+            GhostButton {
+                text: "Lock now";
+                width: 100px;
+                clicked => { root.lock_now(); }
+            }
+        }
+    }
+
+    idle-bar := Rectangle {
+        x: 0;
+        y: header.height;
+        width: 100%;
+        height: 3px;
+        background: Theme.line;
+
+        Rectangle {
+            x: 0;
+            y: 0;
+            height: 100%;
+            width: root.idle_timeout_secs > 0
+                ? parent.width * root.idle_remaining / root.idle_timeout_secs
+                : 0px;
+            background: Theme.accent;
+        }
+    }
+
+    HorizontalLayout {
+        x: 0;
+        y: header.height + idle-bar.height;
+        width: 100%;
+        height: parent.height - header.height - idle-bar.height;
+
+        // ---- Left: search + record list -------------------------------
+        Rectangle {
+            width: 260px;
+            background: Theme.bg-raised;
+
+            VerticalLayout {
+                width: 100%;
+                height: 100%;
+                padding: Theme.space-3;
+                spacing: Theme.space-2;
+
+                Field {
+                    placeholder: "Search";
+                    text <=> root.filter;
+                    edited(text) => { root.search(text); }
+                }
+
+                Flickable {
+                    horizontal-stretch: 1;
+                    vertical-stretch: 1;
+                    viewport-width: self.width;
+                    viewport-height: max(self.height, root.record_names.length * 40px);
+
+                    for name[i] in root.record_names : Rectangle {
+                        y: i * 40px;
+                        x: 0;
+                        width: parent.width;
+                        height: 40px;
+                        background: name == root.selected ? Theme.bg-inset : transparent;
+
+                        Text {
+                            x: Theme.space-2;
+                            width: parent.width - 2 * Theme.space-2;
+                            height: 100%;
+                            vertical-alignment: center;
+                            text: name;
+                            color: name == root.selected ? Theme.text-primary : Theme.text-secondary;
+                            font-family: Theme.font-ui;
+                            font-size: Theme.text-body;
+                            overflow: elide;
+                        }
+
+                        TouchArea {
+                            clicked => { root.select(name); }
+                        }
+                    }
+                }
+
+                GhostButton {
+                    text: root.adding ? "Cancel" : "+ Add";
+                    clicked => { root.adding = !root.adding; }
+                }
+
+                if root.adding: VerticalLayout {
+                    spacing: Theme.space-2;
+
+                    add-name := Field { placeholder: "Name"; text <=> root.add-name-text; }
+                    add-value := Field { placeholder: "Value"; masked: true; text <=> root.add-value-text; }
+
+                    PrimaryButton {
+                        text: "Save";
+                        clicked => {
+                            root.add_secret(add-name.text, add-value.text);
+                            root.adding = false;
+                            root.add-name-text = "";
+                            root.add-value-text = "";
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---- Right: selected record detail -----------------------------
+        Rectangle {
+            horizontal-stretch: 1;
+            background: Theme.bg-base;
+
+            if root.selected == "": VerticalLayout {
+                width: 100%;
+                height: 100%;
+                alignment: center;
+
+                Text {
+                    text: "Select a record";
+                    color: Theme.text-faint;
+                    font-family: Theme.font-ui;
+                    font-size: Theme.text-body;
+                    horizontal-alignment: center;
+                }
+            }
+
+            if root.selected != "": VerticalLayout {
+                width: 100%;
+                height: 100%;
+                padding: Theme.space-6;
+                spacing: Theme.space-4;
+
+                Text {
+                    text: root.selected;
+                    color: Theme.text-primary;
+                    font-family: Theme.font-ui;
+                    font-size: Theme.text-title;
+                    font-weight: Theme.weight-title;
+                }
+
+                Rectangle {
+                    height: 48px;
+                    background: Theme.bg-inset;
+                    border-radius: Theme.radius-field;
+                    border-width: 1px;
+                    border-color: Theme.line;
+
+                    Text {
+                        x: Theme.space-3;
+                        width: parent.width - 2 * Theme.space-3;
+                        height: 100%;
+                        vertical-alignment: center;
+                        text: root.revealed_value == "" ? "••••••••••••" : root.revealed_value;
+                        color: Theme.text-primary;
+                        font-family: Theme.font-mono;
+                        font-size: Theme.text-mono-lg;
+                        font-weight: Theme.weight-mono-lg;
+                        overflow: elide;
+                    }
+                }
+
+                HorizontalLayout {
+                    spacing: Theme.space-2;
+
+                    GhostButton {
+                        text: root.revealed_value == "" ? "Reveal" : "Hide";
+                        clicked => {
+                            if root.revealed_value == "" {
+                                root.reveal(root.selected);
+                            } else {
+                                root.mask();
+                            }
+                        }
+                    }
+                    GhostButton {
+                        text: root.clip_remaining > 0 ? "Copy · " + root.clip_remaining + "s" : "Copy";
+                        clicked => { root.copy(root.selected); }
+                    }
+                }
+
+                HorizontalLayout {
+                    spacing: Theme.space-2;
+
+                    GhostButton {
+                        text: root.rotating ? "Cancel" : "Rotate";
+                        clicked => { root.rotating = !root.rotating; }
+                    }
+                    GhostButton {
+                        danger: true;
+                        text: root.confirm-remove ? "Confirm remove?" : "Remove";
+                        clicked => {
+                            if root.confirm-remove {
+                                root.remove(root.selected);
+                                root.confirm-remove = false;
+                            } else {
+                                root.confirm-remove = true;
+                            }
+                        }
+                    }
+                }
+
+                if root.rotating: HorizontalLayout {
+                    spacing: Theme.space-2;
+
+                    rotate-value := Field { placeholder: "New value"; masked: true; text <=> root.rotate-value-text; }
+                    PrimaryButton {
+                        text: "Save";
+                        width: 80px;
+                        clicked => {
+                            root.rotate(root.selected, rotate-value.text);
+                            root.rotating = false;
+                            root.rotate-value-text = "";
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

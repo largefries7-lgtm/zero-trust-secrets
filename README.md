@@ -1,10 +1,11 @@
-# Zero-Trust Local Secrets Manager — Security Core (Slice 1)
+# Zero-Trust Local Secrets Manager
 
 A local-first, air-gapped secrets manager whose master key is **bound to this
 machine's TPM** and whose plaintext secrets **provably never linger in process
-RAM**. This slice is the headless security core: a Rust library (`vaultcore`), a
-CLI (`vaultctl`), and a memory-scraping verification harness (`verify/`). The GUI
-is a separate later slice.
+RAM** longer than the design admits. The security core is a Rust library
+(`vaultcore`); `vaultgui` (Slint desktop app) is the primary user surface as of
+slice 2; `vaultctl` (CLI) remains for automation/testing; `verify/` is the
+memory-scraping verification harness for both.
 
 > Windows-first. The TPM path uses the CNG Platform Crypto Provider and has been
 > exercised on real hardware. macOS/Linux providers are compiled stubs for now.
@@ -23,6 +24,33 @@ is a separate later slice.
 cargo build --release -p vaultctl
 # binary: target/release/vaultctl.exe
 ```
+
+## Desktop GUI (`vaultgui`) — the primary user surface
+
+```sh
+cargo build --release -p vaultgui
+# binary: target/release/vaultgui.exe
+cargo run --release -p vaultgui        # or run the built exe directly
+```
+
+`vaultgui` is a Slint desktop app and is the primary way to use the vault day to
+day: create/unlock, browse and search records, reveal/copy with an auto-clearing
+clipboard, generate passwords, and manage settings (auto-lock timeout, Hello
+toggle, deprovision). It is Windows-first, like the rest of this project. The
+`vaultctl` CLI documented below is retained in the repo as an automation/testing
+tool, not replaced.
+
+**GUI security surfaces.** Unlike the stateless CLI (which obtains the DEK fresh
+per command), `vaultgui` holds the decryption key in RAM for the whole unlocked
+session, aggressively auto-locking on idle, workstation-lock, suspend, or manual
+"Lock now". It also blanks itself to screen capture/screen-share and offers an
+optional Windows Hello gate on secret reveal (opt-in in Settings) that does not
+touch the crypto. These are real new surfaces with honest, stated limits (a
+long-lived in-RAM key while unlocked, and un-zeroizable input-field/revealed-value
+residuals in the UI toolkit) — see the as-built section of the slice-2 design spec
+for the full defended/not-defended breakdown:
+[`docs/superpowers/specs/2026-07-16-slice2-gui-design.md`](docs/superpowers/specs/2026-07-16-slice2-gui-design.md)
+(§13).
 
 ## Quickstart
 
@@ -127,6 +155,12 @@ positive control proves the scanner actually works; each clean scenario also fin
 a non-secret sentinel, proving its own dump is real (not vacuously empty). See
 [`verify/TEST_PLAN.md`](verify/TEST_PLAN.md).
 
+`verify/run.sh` also builds and dumps `vaultgui` (`gui-locked` / `gui-post-autolock`
+/ `gui-leak`), including the honestly-reported Slint widget residual for
+`gui-post-autolock`. Those scenarios need a real interactive Windows session (a
+display, and a TPM for the Hello-gated paths) — see `verify/TEST_PLAN.md` for the
+current recorded result in this environment.
+
 ## Honest limitations (slice 1)
 
 - TPM binding is **device-bound, not PCR-policy-bound** (a CNG limitation); real
@@ -147,6 +181,7 @@ Full design, threat model, and as-built notes:
 ```
 crates/vaultcore/   library: secret types, crypto, vault format, KeyProvider HAL
 crates/vaultctl/    the CLI
+crates/vaultgui/    the Slint desktop GUI (slice 2)
 verify/             memory-scraping harness (dumper + scan_dump.py + TEST_PLAN)
 docs/               design spec + implementation plan
 ```
@@ -154,6 +189,11 @@ docs/               design spec + implementation plan
 ## Test
 
 ```sh
-cargo test           # vaultcore 22 + proptest 1 + vaultctl CLI 5
-bash verify/run.sh   # empirical memory-dump proof
+cargo test --workspace   # vaultcore 43 (lib) + codec-fuzz 3 + proptest 1, vaultctl CLI 10, vaultgui 19
+bash verify/run.sh       # empirical memory-dump proof (CLI + GUI scenarios)
 ```
+
+`vaultgui` is a workspace member but not a `default-member` (see `Cargo.toml`), so
+plain `cargo test` skips its 19 tests — pass `--workspace` to include them. Counts
+above are current as of this doc; they will drift as tests are added, so treat
+`cargo test --workspace` itself as the source of truth.

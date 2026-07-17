@@ -1,0 +1,471 @@
+// Settings screen: an instrument "readout" panel — engraved labels + mono
+// value rows for the vault's security posture, an auto-lock timeout control,
+// a light/dark toggle, an opt-in Windows Hello reveal-gate toggle, a password
+// generator, and a typed-DELETE-gated deprovision action.
+import { Theme } from "theme.slint";
+
+component PrimaryButton inherits TouchArea {
+    in property <string> text;
+    height: 34px;
+
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        border-radius: Theme.radius-field;
+        background: root.enabled ? Theme.accent : Theme.accent-dim;
+        opacity: root.has-hover && root.enabled ? 0.88 : 1.0;
+
+        Text {
+            text: root.text;
+            color: Theme.on-accent;
+            font-family: Theme.font-ui;
+            font-size: Theme.text-body;
+            font-weight: 600;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            width: 100%;
+            height: 100%;
+        }
+    }
+}
+
+component DangerButton inherits TouchArea {
+    in property <string> text;
+    height: 40px;
+
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        border-radius: Theme.radius-field;
+        background: root.enabled ? Theme.danger : Theme.line;
+        opacity: root.has-hover && root.enabled ? 0.88 : 1.0;
+
+        Text {
+            text: root.text;
+            color: Theme.on-accent;
+            font-family: Theme.font-ui;
+            font-size: Theme.text-body;
+            font-weight: 600;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            width: 100%;
+            height: 100%;
+        }
+    }
+}
+
+// Pill-style choice button (auto-lock presets, light/dark). `active` is
+// caller-driven; the caller handles `clicked` to switch the choice.
+component GhostButton inherits TouchArea {
+    in property <string> text;
+    in property <bool> active: false;
+    height: 32px;
+
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        border-radius: Theme.radius-field;
+        border-width: root.active ? 2px : 1px;
+        border-color: root.active ? Theme.accent : Theme.line;
+        background: root.has-hover ? Theme.bg-inset : transparent;
+
+        Text {
+            text: root.text;
+            color: root.active ? Theme.accent : Theme.text-secondary;
+            font-family: Theme.font-ui;
+            font-size: Theme.text-body;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            width: 100%;
+            height: 100%;
+        }
+    }
+}
+
+component Checkbox inherits TouchArea {
+    in property <string> text;
+    in property <bool> checked: false;
+    height: 24px;
+    // Dim + block interaction when the underlying capability isn't there
+    // (e.g. the Windows Hello toggle when Hello isn't available on this
+    // device). `enabled` is TouchArea's own built-in input-gating property;
+    // this just adds the matching visual treatment.
+    opacity: root.enabled ? 1.0 : 0.4;
+
+    HorizontalLayout {
+        spacing: Theme.space-2;
+        alignment: start;
+
+        Rectangle {
+            width: 18px;
+            height: 18px;
+            border-radius: 3px;
+            border-width: 1px;
+            border-color: Theme.line;
+            background: root.checked ? Theme.accent : Theme.bg-inset;
+
+            Text {
+                visible: root.checked;
+                text: "✓";
+                color: Theme.on-accent;
+                font-size: 12px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                width: 100%;
+                height: 100%;
+            }
+        }
+
+        Text {
+            text: root.text;
+            color: Theme.text-primary;
+            font-family: Theme.font-ui;
+            font-size: Theme.text-body;
+            vertical-alignment: center;
+        }
+    }
+}
+
+component Field inherits Rectangle {
+    in property <string> placeholder;
+    in-out property <string> text <=> input.text;
+
+    height: 36px;
+    background: Theme.bg-inset;
+    border-radius: Theme.radius-field;
+    border-width: 1px;
+    border-color: input.has-focus ? Theme.accent : Theme.line;
+
+    input := TextInput {
+        x: Theme.space-2;
+        width: parent.width - 2 * Theme.space-2;
+        height: 100%;
+        vertical-alignment: center;
+        color: Theme.text-primary;
+        font-family: Theme.font-ui;
+        font-size: Theme.text-body;
+    }
+
+    if input.text == "" && !input.has-focus: Text {
+        x: Theme.space-2;
+        width: parent.width - 2 * Theme.space-2;
+        height: 100%;
+        vertical-alignment: center;
+        text: root.placeholder;
+        color: Theme.text-faint;
+        font-family: Theme.font-ui;
+        font-size: Theme.text-body;
+    }
+}
+
+component ReadoutRow inherits Rectangle {
+    in property <string> label;
+    in property <string> value;
+    height: 40px;
+
+    HorizontalLayout {
+        width: 100%;
+        height: 100%;
+        spacing: Theme.space-3;
+
+        Text {
+            text: root.label;
+            color: Theme.text-faint;
+            font-family: Theme.font-ui;
+            font-size: Theme.text-label;
+            font-weight: Theme.weight-label;
+            letter-spacing: Theme.label-letterspacing;
+            width: 190px;
+            vertical-alignment: center;
+        }
+        Text {
+            text: root.value;
+            color: Theme.text-primary;
+            font-family: Theme.font-mono;
+            font-size: Theme.text-mono;
+            horizontal-stretch: 1;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+    }
+}
+
+component Divider inherits Rectangle {
+    height: 1px;
+    background: Theme.line;
+}
+
+export component SettingsScreen inherits Rectangle {
+    in property <bool> hardware_bound;
+    in property <string> posture;
+    in property <bool> has_recovery;
+    in property <string> provider_desc;
+    in property <int> idle_timeout_secs;
+    in property <bool> dark;
+    in property <bool> hello_available;
+    in property <bool> hello_enabled;
+    in property <string> generated_value;
+
+    callback set_timeout(secs: int);
+    callback set_dark(value: bool);
+    callback set_hello(value: bool);
+    callback generate(length: int, symbols: bool);
+    callback deprovision();
+    callback copy_generated();
+    callback close_settings();
+
+    // Generator UI state — the length/symbols choice, not a secret. Only
+    // the resulting `generated_value` (an App-level property Rust sets) is
+    // ever displayed.
+    property <int> gen-length: 20;
+    property <bool> gen-symbols: true;
+
+    background: Theme.bg-base;
+
+    VerticalLayout {
+        width: 100%;
+        height: 100%;
+        padding: Theme.space-6;
+        spacing: Theme.space-4;
+
+        HorizontalLayout {
+            spacing: Theme.space-3;
+
+            Text {
+                text: "Settings";
+                color: Theme.text-primary;
+                font-family: Theme.font-ui;
+                font-size: Theme.text-display;
+                font-weight: Theme.weight-display;
+                horizontal-stretch: 1;
+                vertical-alignment: center;
+            }
+
+            GhostButton {
+                text: "Back";
+                width: 90px;
+                clicked => { root.close_settings(); }
+            }
+        }
+
+        ReadoutRow {
+            label: "HARDWARE BINDING";
+            value: root.hardware_bound ? "TPM-bound" : "Passphrase only — no hardware binding";
+        }
+        ReadoutRow {
+            label: "FACTORS";
+            value: root.posture;
+        }
+        ReadoutRow {
+            label: "RECOVERY ESCROW";
+            value: root.has_recovery
+                ? "Enabled — a stolen vault is only as strong as the recovery passphrase"
+                : "Disabled";
+        }
+        ReadoutRow {
+            label: "PROVIDER";
+            value: root.provider_desc;
+        }
+        VerticalLayout {
+            spacing: Theme.space-1;
+
+            Checkbox {
+                text: "Require Windows Hello before revealing a secret";
+                checked: root.hello_enabled;
+                enabled: root.hello_available;
+                clicked => { root.set_hello(!root.hello_enabled); }
+            }
+
+            Text {
+                // Always accurate about scope: Hello gates the on-screen
+                // REVEAL action only. It never touches the vault key --
+                // the passphrase (+ TPM, if bound) remains the sole
+                // cryptographic factor either way.
+                text: root.hello_available
+                    ? "Gates revealing a secret's value on screen. Does not protect the vault key -- the passphrase (and TPM, if bound) is unchanged."
+                    : "Windows Hello isn't available on this device, so this gate can't be enforced.";
+                color: Theme.text-faint;
+                font-family: Theme.font-ui;
+                font-size: Theme.text-label;
+                wrap: word-wrap;
+            }
+        }
+
+        Divider {}
+
+        Text {
+            text: "AUTO-LOCK";
+            color: Theme.text-faint;
+            font-family: Theme.font-ui;
+            font-size: Theme.text-label;
+            font-weight: Theme.weight-label;
+            letter-spacing: Theme.label-letterspacing;
+        }
+        HorizontalLayout {
+            spacing: Theme.space-2;
+
+            GhostButton {
+                text: "1 min";
+                active: root.idle_timeout_secs == 60;
+                clicked => { root.set_timeout(60); }
+            }
+            GhostButton {
+                text: "5 min";
+                active: root.idle_timeout_secs == 300;
+                clicked => { root.set_timeout(300); }
+            }
+            GhostButton {
+                text: "15 min";
+                active: root.idle_timeout_secs == 900;
+                clicked => { root.set_timeout(900); }
+            }
+            GhostButton {
+                text: "30 min";
+                active: root.idle_timeout_secs == 1800;
+                clicked => { root.set_timeout(1800); }
+            }
+        }
+
+        Divider {}
+
+        Text {
+            text: "APPEARANCE";
+            color: Theme.text-faint;
+            font-family: Theme.font-ui;
+            font-size: Theme.text-label;
+            font-weight: Theme.weight-label;
+            letter-spacing: Theme.label-letterspacing;
+        }
+        HorizontalLayout {
+            spacing: Theme.space-2;
+
+            GhostButton {
+                text: "Light";
+                active: !root.dark;
+                clicked => { root.set_dark(false); }
+            }
+            GhostButton {
+                text: "Dark";
+                active: root.dark;
+                clicked => { root.set_dark(true); }
+            }
+        }
+
+        Divider {}
+
+        Text {
+            text: "GENERATE PASSWORD";
+            color: Theme.text-faint;
+            font-family: Theme.font-ui;
+            font-size: Theme.text-label;
+            font-weight: Theme.weight-label;
+            letter-spacing: Theme.label-letterspacing;
+        }
+        HorizontalLayout {
+            spacing: Theme.space-2;
+
+            GhostButton {
+                text: "−";
+                width: 32px;
+                clicked => { root.gen-length = max(8, root.gen-length - 4); }
+            }
+            Rectangle {
+                width: 56px;
+                height: 32px;
+                background: Theme.bg-inset;
+                border-radius: Theme.radius-field;
+                border-width: 1px;
+                border-color: Theme.line;
+
+                Text {
+                    text: root.gen-length;
+                    color: Theme.text-primary;
+                    font-family: Theme.font-mono;
+                    font-size: Theme.text-mono;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                    width: 100%;
+                    height: 100%;
+                }
+            }
+            GhostButton {
+                text: "+";
+                width: 32px;
+                clicked => { root.gen-length = min(64, root.gen-length + 4); }
+            }
+            Checkbox {
+                text: "Symbols";
+                checked: root.gen-symbols;
+                clicked => { root.gen-symbols = !root.gen-symbols; }
+            }
+            PrimaryButton {
+                text: "Generate";
+                width: 100px;
+                clicked => { root.generate(root.gen-length, root.gen-symbols); }
+            }
+        }
+
+        if root.generated_value != "": HorizontalLayout {
+            spacing: Theme.space-2;
+
+            Rectangle {
+                horizontal-stretch: 1;
+                height: 44px;
+                background: Theme.bg-inset;
+                border-radius: Theme.radius-field;
+                border-width: 1px;
+                border-color: Theme.line;
+
+                TextInput {
+                    x: Theme.space-3;
+                    width: parent.width - 2 * Theme.space-3;
+                    height: 100%;
+                    vertical-alignment: center;
+                    text: root.generated_value;
+                    read-only: true;
+                    color: Theme.text-primary;
+                    font-family: Theme.font-mono;
+                    font-size: Theme.text-mono-lg;
+                    font-weight: Theme.weight-mono-lg;
+                }
+            }
+
+            // Routes through the auto-clear clipboard path (native Ctrl+C out
+            // of the read-only TextInput above would not auto-clear).
+            GhostButton {
+                text: "Copy";
+                width: 90px;
+                clicked => { root.copy_generated(); }
+            }
+        }
+
+        Divider {}
+
+        Text {
+            text: "DEPROVISION TPM KEY";
+            color: Theme.danger;
+            font-family: Theme.font-ui;
+            font-size: Theme.text-label;
+            font-weight: Theme.weight-label;
+            letter-spacing: Theme.label-letterspacing;
+        }
+        Text {
+            text: "Deletes the machine's TPM wrapping key. Every TPM-bound vault becomes undecryptable via the TPM afterward (a vault's recovery passphrase, if set, still works).";
+            color: Theme.text-secondary;
+            font-family: Theme.font-ui;
+            font-size: Theme.text-body;
+            wrap: word-wrap;
+        }
+        HorizontalLayout {
+            spacing: Theme.space-2;
+
+            confirm-field := Field { placeholder: "Type DELETE to confirm"; }
+            DangerButton {
+                text: "Deprovision TPM key";
+                width: 180px;
+                enabled: confirm-field.text == "DELETE";
+                clicked => { root.deprovision(); }
+            }
+        }
+    }
+}

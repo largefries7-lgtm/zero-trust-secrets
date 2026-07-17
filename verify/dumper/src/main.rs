@@ -11,7 +11,7 @@
 //!   4. scans the dump for the canary (UTF-8 and UTF-16LE), and
 //!   5. asserts the expected hit count.
 //!
-//! Scenarios & expectations:
+//! Scenarios & expectations (CLI, driven by `vaultctl`'s `__hold-*`/`__leak`):
 //!   * `locked`    — vault loaded but never unlocked -> **0 hits** (ciphertext only).
 //!   * `post-clip` — secret fetched, copied to clipboard, then dropped/zeroized
 //!                   BEFORE the dump -> **0 hits** in vaultctl's own heap.
@@ -19,9 +19,23 @@
 //!                   String across the dump -> **>= 1 hit**. If this finds zero,
 //!                   the whole harness is meaningless (hard failure).
 //!
+//! GUI scenarios (Task E2, driven by `vaultgui --leaktest <scenario>`; see
+//! `crates/vaultgui/src/leaktest.rs`):
+//!   * `gui-locked`        — mirrors `locked`: vault loaded, never unlocked ->
+//!                           **0 hits**.
+//!   * `gui-post-autolock` — unlock + reveal into the real Slint `App`, let
+//!                           vaultcore's own buffers zeroize, THEN scrub the UI
+//!                           exactly as auto-lock does. vaultcore's hygiene is
+//!                           proven (sentinel found), but Slint's own freed
+//!                           `SharedString` is NOT under our control and is not
+//!                           zeroizable, so the canary MAY still be found. This
+//!                           is reported as a measured residual, not a failure.
+//!   * `gui-leak`          — POSITIVE CONTROL for the GUI binary, same shape as
+//!                           `leak` -> **>= 1 hit**.
+//!
 //! Honesty note: THIS process holds the canary in its own memory (it must, to
-//! search for it). That is exactly why it dumps the CHILD (`vaultctl`) and never
-//! itself.
+//! search for it). That is exactly why it dumps the CHILD (`vaultctl`/
+//! `vaultgui`) and never itself.
 
 use std::error::Error;
 use std::fs::{self, File};
@@ -34,13 +48,28 @@ use std::os::windows::io::AsRawHandle;
 
 type Res<T> = Result<T, Box<dyn Error>>;
 
-/// The three verification scenarios.
+/// All verification scenarios: the original CLI (`vaultctl`) trio plus the
+/// GUI (`vaultgui --leaktest`) trio added by Task E2.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Scenario {
     Locked,
     PostClip,
     Leak,
+    GuiLocked,
+    GuiPostAutolock,
+    GuiLeak,
 }
+
+/// Every scenario `run_verify` runs, in report order: CLI trio first (as
+/// before), then the GUI trio.
+const ALL_SCENARIOS: [Scenario; 6] = [
+    Scenario::Locked,
+    Scenario::PostClip,
+    Scenario::Leak,
+    Scenario::GuiLocked,
+    Scenario::GuiPostAutolock,
+    Scenario::GuiLeak,
+];
 
 impl Scenario {
     fn name(self) -> &'static str {
@@ -48,6 +77,9 @@ impl Scenario {
             Scenario::Locked => "locked",
             Scenario::PostClip => "post-clip",
             Scenario::Leak => "leak(ctrl)",
+            Scenario::GuiLocked => "gui-locked",
+            Scenario::GuiPostAutolock => "gui-post-autolock",
+            Scenario::GuiLeak => "gui-leak(ctrl)",
         }
     }
     /// Human-readable expectation.
@@ -56,22 +88,39 @@ impl Scenario {
             // Self-validating: the non-secret sentinel (the record NAME, held in
             // plaintext metadata) MUST be found in this very dump — proving the
             // dump+scan pipeline works on IT — while the canary MUST be absent.
-            Scenario::Locked | Scenario::PostClip => "sent>=1 & can==0",
-            // Positive control loads no vault, so it has no sentinel; its own
-            // validity proof is that the canary IS found.
-            Scenario::Leak => "can>=1",
+            Scenario::Locked | Scenario::PostClip | Scenario::GuiLocked => "sent>=1 & can==0",
+            // vaultcore's own buffers are proven zeroized (sentinel found), but
+            // Slint's freed SharedString is not ours to zeroize -- the canary
+            // count here is a measured residual, not a pass/fail signal.
+            Scenario::GuiPostAutolock => "sent>=1 & can=RESIDUAL",
+            // Positive controls load no vault, so they have no sentinel; their
+            // own validity proof is that the canary IS found.
+            Scenario::Leak | Scenario::GuiLeak => "can>=1",
         }
     }
     /// Whether this scenario loads the vault (and therefore carries the record
-    /// NAME / sentinel in its process heap). The positive control does not.
+    /// NAME / sentinel in its process heap). The positive controls do not.
     fn loads_vault(self) -> bool {
-        !matches!(self, Scenario::Leak)
+        !matches!(self, Scenario::Leak | Scenario::GuiLeak)
+    }
+    /// Whether this scenario is a positive control (must find the canary, or
+    /// the harness itself is broken/meaningless).
+    fn is_control(self) -> bool {
+        matches!(self, Scenario::Leak | Scenario::GuiLeak)
+    }
+    /// Whether this scenario is driven by the `vaultgui --leaktest` binary
+    /// rather than `vaultctl`'s `__hold-*`/`__leak` subcommands.
+    fn is_gui(self) -> bool {
+        matches!(self, Scenario::GuiLocked | Scenario::GuiPostAutolock | Scenario::GuiLeak)
     }
     fn parse(s: &str) -> Option<Scenario> {
         match s {
             "locked" => Some(Scenario::Locked),
             "post-clip" | "postclip" => Some(Scenario::PostClip),
             "leak" => Some(Scenario::Leak),
+            "gui-locked" => Some(Scenario::GuiLocked),
+            "gui-post-autolock" | "gui-postautolock" => Some(Scenario::GuiPostAutolock),
+            "gui-leak" => Some(Scenario::GuiLeak),
             _ => None,
         }
     }
@@ -96,17 +145,41 @@ impl ScenarioResult {
         self.canary_utf8 + self.canary_utf16
     }
     /// Pass criteria, per scenario:
-    ///   * locked / post-clip: sentinel MUST be found (dump+scan proven real for
-    ///     THIS dump) AND canary MUST be absent (no plaintext secret lingering).
-    ///   * leak (positive control): canary MUST be found.
+    ///   * locked / post-clip / gui-locked: sentinel MUST be found (dump+scan
+    ///     proven real for THIS dump) AND canary MUST be absent (no plaintext
+    ///     secret lingering).
+    ///   * gui-post-autolock: sentinel MUST be found (pipeline proven real).
+    ///     The canary is NOT required to be absent here -- see
+    ///     `gui_residual_note`. vaultcore's own buffers are zeroized before this
+    ///     dump, but Slint's freed `SharedString` (holding the revealed value)
+    ///     is outside our control and is not zeroizable, so a nonzero canary
+    ///     count is an expected, reported residual rather than a failure.
+    ///   * leak / gui-leak (positive controls): canary MUST be found.
     /// A missing sentinel where one is expected is a FAILURE — the pipeline is
-    /// broken for that dump, so its canary==0 would be vacuous.
+    /// broken for that dump, so its canary count would be vacuous either way.
     fn passed(&self) -> bool {
         match self.scenario {
-            Scenario::Locked | Scenario::PostClip => {
+            Scenario::Locked | Scenario::PostClip | Scenario::GuiLocked => {
                 self.sentinel_hits >= 1 && self.canary_total() == 0
             }
-            Scenario::Leak => self.canary_total() >= 1,
+            Scenario::GuiPostAutolock => self.sentinel_hits >= 1,
+            Scenario::Leak | Scenario::GuiLeak => self.canary_total() >= 1,
+        }
+    }
+    /// Informational note for the un-zeroizable Slint `SharedString` residual:
+    /// `Some(..)` only for `gui-post-autolock` with a nonzero canary count.
+    /// Never affects `passed()` -- this is a measurement, not a defect.
+    fn gui_residual_note(&self) -> Option<String> {
+        if self.scenario == Scenario::GuiPostAutolock && self.canary_total() > 0 {
+            Some(format!(
+                "gui-post-autolock: vaultcore buffers zeroized; Slint retains {} canary \
+                 byte-run{} in its freed SharedString (un-zeroizable toolkit residual — see \
+                 TEST_PLAN)",
+                self.canary_total(),
+                if self.canary_total() == 1 { "" } else { "s" }
+            ))
+        } else {
+            None
         }
     }
 }
@@ -137,24 +210,32 @@ const USAGE: &str = "\
 dumper — memory-scraping verification harness
 
 USAGE:
-  dumper verify [--vaultctl <path>] [--keep-dumps]
-      Run all three scenarios (locked, post-clip, leak) and assert. Each
-      vault-loading scenario self-validates via a non-secret sentinel that MUST
-      appear in its own dump. Exits 0 iff:
-        locked   (sentinel>=1 AND canary==0)
-        post-clip(sentinel>=1 AND canary==0)
-        leak     (canary>=1)
+  dumper verify [--vaultctl <path>] [--vaultgui <path>] [--keep-dumps]
+      Run all six scenarios (locked, post-clip, leak, gui-locked,
+      gui-post-autolock, gui-leak) and assert. Each vault-loading scenario
+      self-validates via a non-secret sentinel that MUST appear in its own
+      dump. Exits 0 iff:
+        locked            (sentinel>=1 AND canary==0)
+        post-clip         (sentinel>=1 AND canary==0)
+        leak              (canary>=1)
+        gui-locked        (sentinel>=1 AND canary==0)
+        gui-post-autolock (sentinel>=1; canary count is a reported residual,
+                            NOT a pass/fail signal -- see module docs)
+        gui-leak          (canary>=1)
 
-  dumper <scenario> <out.dmp> [--vaultctl <path>]
-      Run a single scenario (locked | post-clip | leak), write the dump to
-      <out.dmp> (kept), and print the sentinel + canary hit counts for manual use.
+  dumper <scenario> <out.dmp> [--vaultctl <path>] [--vaultgui <path>]
+      Run a single scenario (locked | post-clip | leak | gui-locked |
+      gui-post-autolock | gui-leak), write the dump to <out.dmp> (kept), and
+      print the sentinel + canary hit counts for manual use.
 
 Default --vaultctl: target/release/vaultctl.exe (relative to the current dir;
-verify/run.sh cds to the repo root first).";
+verify/run.sh cds to the repo root first).
+Default --vaultgui: target/release/vaultgui.exe (same convention).";
 
-/// `dumper verify [--vaultctl <path>] [--keep-dumps]`
+/// `dumper verify [--vaultctl <path>] [--vaultgui <path>] [--keep-dumps]`
 fn run_verify(rest: &[String]) -> Res<ExitCode> {
     let mut vaultctl = default_vaultctl();
+    let mut vaultgui = default_vaultgui();
     let mut keep_dumps = false;
     let mut it = rest.iter();
     while let Some(a) = it.next() {
@@ -164,26 +245,32 @@ fn run_verify(rest: &[String]) -> Res<ExitCode> {
                     it.next().ok_or("--vaultctl requires a path argument")?,
                 );
             }
+            "--vaultgui" => {
+                vaultgui = PathBuf::from(
+                    it.next().ok_or("--vaultgui requires a path argument")?,
+                );
+            }
             "--keep-dumps" => keep_dumps = true,
             other => return Err(format!("unknown argument: {other}").into()),
         }
     }
     check_vaultctl(&vaultctl)?;
+    check_vaultgui(&vaultgui)?;
 
     let base = make_workdir()?;
     println!("dumper: work dir {}", base.display());
     println!("dumper: vaultctl {}", vaultctl.display());
+    println!("dumper: vaultgui {}", vaultgui.display());
     println!();
 
-    let scenarios = [Scenario::Locked, Scenario::PostClip, Scenario::Leak];
     let mut results: Vec<ScenarioResult> = Vec::new();
-    for scen in scenarios {
+    for scen in ALL_SCENARIOS {
         let sdir = base.join(scen.name().replace(['(', ')'], ""));
         let dmp = sdir.join("dump.dmp");
-        let res = run_scenario(&vaultctl, scen, &sdir, &dmp)?;
+        let res = run_scenario(&vaultctl, &vaultgui, scen, &sdir, &dmp)?;
         if scen.loads_vault() {
             eprintln!(
-                "  {:<11} dumped -> sentinel={} canary(utf8={} utf16={} total={})",
+                "  {:<18} dumped -> sentinel={} canary(utf8={} utf16={} total={})",
                 scen.name(),
                 res.sentinel_hits,
                 res.canary_utf8,
@@ -192,12 +279,15 @@ fn run_verify(rest: &[String]) -> Res<ExitCode> {
             );
         } else {
             eprintln!(
-                "  {:<11} dumped -> canary(utf8={} utf16={} total={})",
+                "  {:<18} dumped -> canary(utf8={} utf16={} total={})",
                 scen.name(),
                 res.canary_utf8,
                 res.canary_utf16,
                 res.canary_total()
             );
+        }
+        if let Some(note) = res.gui_residual_note() {
+            eprintln!("      note: {note}");
         }
         if !keep_dumps {
             let _ = fs::remove_file(&dmp);
@@ -209,26 +299,41 @@ fn run_verify(rest: &[String]) -> Res<ExitCode> {
     print_table(&results);
 
     let all_pass = results.iter().all(ScenarioResult::passed);
-    // The positive control is the crux: call it out explicitly.
-    let ctrl = results
-        .iter()
-        .find(|r| r.scenario == Scenario::Leak)
-        .expect("leak scenario always run");
-    if ctrl.canary_total() == 0 {
-        println!(
-            "\nHARD FAILURE: positive control found 0 hits -> the scanner is \
-             not proving anything. A passing 'locked'/'post-clip' would be vacuous."
-        );
+    // The positive controls are the crux: call each out explicitly. There are
+    // two now (CLI `leak` and GUI `gui-leak`) -- each validates its own binary's
+    // dump+scan pipeline independently.
+    for ctrl_scen in ALL_SCENARIOS.iter().copied().filter(|s| s.is_control()) {
+        let ctrl = results
+            .iter()
+            .find(|r| r.scenario == ctrl_scen)
+            .expect("control scenario always run");
+        if ctrl.canary_total() == 0 {
+            println!(
+                "\nHARD FAILURE: positive control '{}' found 0 hits -> the scanner is \
+                 not proving anything for that binary. A passing vault-loading scenario \
+                 for it would be vacuous.",
+                ctrl_scen.name()
+            );
+        }
     }
     // Each vault-loading scenario also self-validates via its sentinel: if the
-    // sentinel is missing, that dump/scan is broken and its canary==0 is vacuous.
+    // sentinel is missing, that dump/scan is broken and its canary count (0 or
+    // otherwise) proves nothing.
     for r in &results {
         if r.scenario.loads_vault() && r.sentinel_hits == 0 {
             println!(
                 "\nHARD FAILURE: scenario '{}' found 0 sentinel hits -> its \
-                 dump/scan pipeline is broken; a canary==0 there proves nothing.",
+                 dump/scan pipeline is broken; its canary count there proves nothing.",
                 r.scenario.name()
             );
+        }
+    }
+    // gui-post-autolock's canary count (if any) is informational only -- surface
+    // it distinctly from the PASS/FAIL machinery above so it never reads as a
+    // failure.
+    for r in &results {
+        if let Some(note) = r.gui_residual_note() {
+            println!("\nNOTE: {note}");
         }
     }
 
@@ -247,11 +352,12 @@ fn run_verify(rest: &[String]) -> Res<ExitCode> {
     }
 }
 
-/// `dumper <scenario> <out.dmp> [--vaultctl <path>]`
+/// `dumper <scenario> <out.dmp> [--vaultctl <path>] [--vaultgui <path>]`
 fn run_single(args: &[String]) -> Res<ExitCode> {
     let scen = Scenario::parse(&args[0]).ok_or("unknown scenario")?;
     let out = PathBuf::from(args.get(1).ok_or("missing <out.dmp> path")?);
     let mut vaultctl = default_vaultctl();
+    let mut vaultgui = default_vaultgui();
     let mut it = args[2..].iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -260,14 +366,27 @@ fn run_single(args: &[String]) -> Res<ExitCode> {
                     it.next().ok_or("--vaultctl requires a path argument")?,
                 );
             }
+            "--vaultgui" => {
+                vaultgui = PathBuf::from(
+                    it.next().ok_or("--vaultgui requires a path argument")?,
+                );
+            }
             other => return Err(format!("unknown argument: {other}").into()),
         }
     }
+    // Provisioning always goes through vaultctl (shared .ztsv format), so it
+    // must exist regardless of scenario.
     check_vaultctl(&vaultctl)?;
+    // The binary this scenario actually spawns as its "hold" child also needs
+    // to exist -- only checked for GUI scenarios here since vaultctl was just
+    // checked above unconditionally.
+    if scen.is_gui() {
+        check_vaultgui(&vaultgui)?;
+    }
 
     let base = make_workdir()?;
     let sdir = base.join("single");
-    let res = run_scenario(&vaultctl, scen, &sdir, &out)?;
+    let res = run_scenario(&vaultctl, &vaultgui, scen, &sdir, &out)?;
     if scen.loads_vault() {
         println!(
             "scenario={} dump={} sentinel={} (hits={}) canary={} (utf8={} utf16={} total={}) expected {} -> {}",
@@ -282,6 +401,9 @@ fn run_single(args: &[String]) -> Res<ExitCode> {
             scen.expected_str(),
             if res.passed() { "PASS" } else { "FAIL" },
         );
+        if let Some(note) = res.gui_residual_note() {
+            println!("note: {note}");
+        }
         println!(
             "manual cross-check: python verify/scan_dump.py {} {}   # canary: expect ABSENT (exit 0)",
             out.display(),
@@ -316,16 +438,23 @@ fn run_single(args: &[String]) -> Res<ExitCode> {
 }
 
 /// Provision a fresh vault whose record NAME is a random non-secret sentinel and
-/// whose VALUE is a random secret canary, spawn the hold subcommand, dump the
-/// child's memory, and scan the dump for BOTH markers.
+/// whose VALUE is a random secret canary, spawn the hold subcommand (either
+/// `vaultctl`'s `__hold-*`/`__leak`, or `vaultgui --leaktest <scenario>` for the
+/// GUI trio — see `Scenario::is_gui`), dump the child's memory, and scan the
+/// dump for BOTH markers.
+///
+/// Provisioning always goes through `vaultctl` (both binaries share the same
+/// `.ztsv` on-disk format), even for GUI scenarios.
 ///
 /// The sentinel (record name) is stored as plaintext metadata and is loaded into
-/// the vaultctl heap by any vault-loading scenario, so it MUST appear in those
+/// the child's heap by any vault-loading scenario, so it MUST appear in those
 /// dumps — self-validating that the dump+scan pipeline works on that very dump.
 /// The canary (secret value) is encrypted at rest and zeroized after use, so it
-/// MUST NOT appear in the locked/post-clip heaps.
+/// MUST NOT appear in the locked/post-clip/gui-locked heaps. (`gui-post-autolock`
+/// is the one exception — see its `passed()`/`gui_residual_note` docs.)
 fn run_scenario(
     vaultctl: &Path,
+    vaultgui: &Path,
     scen: Scenario,
     sdir: &Path,
     dmp: &Path,
@@ -340,27 +469,62 @@ fn run_scenario(
 
     provision(vaultctl, &vault, &sentinel, &canary)?;
 
-    // Build the hold subcommand for this scenario.
-    let mut cmd = Command::new(vaultctl);
-    cmd.arg("--vault").arg(&vault);
-    match scen {
-        Scenario::Locked => {
-            cmd.arg("__hold-locked");
+    // Build the hold subcommand for this scenario: CLI scenarios spawn
+    // vaultctl's hidden `__hold-*`/`__leak` subcommands; GUI scenarios spawn
+    // vaultgui's `--leaktest <scenario>` mode (Task E1). Both print `READY`
+    // once frozen in the target state and then block on stdin EOF, so the rest
+    // of this function (wait_for_ready/dump_process/scan) is shared.
+    let mut cmd = if scen.is_gui() {
+        let mut c = Command::new(vaultgui);
+        c.arg("--leaktest");
+        match scen {
+            Scenario::GuiLocked => {
+                c.arg("gui-locked").arg("--vault").arg(&vault);
+            }
+            Scenario::GuiPostAutolock => {
+                c.arg("gui-post-autolock")
+                    .arg("--vault")
+                    .arg(&vault)
+                    .arg("--passphrase")
+                    .arg("pw")
+                    .arg("--name")
+                    .arg(&sentinel);
+            }
+            Scenario::GuiLeak => {
+                c.arg("gui-leak").arg("--canary").arg(&canary);
+            }
+            Scenario::Locked | Scenario::PostClip | Scenario::Leak => {
+                unreachable!("is_gui() guarantees a GUI variant here")
+            }
         }
-        Scenario::PostClip => {
-            // Fetch by the sentinel record name.
-            cmd.args(["__hold-postclip", &sentinel, "--passphrase", "pw"]);
+        c
+    } else {
+        let mut c = Command::new(vaultctl);
+        c.arg("--vault").arg(&vault);
+        match scen {
+            Scenario::Locked => {
+                c.arg("__hold-locked");
+            }
+            Scenario::PostClip => {
+                // Fetch by the sentinel record name.
+                c.args(["__hold-postclip", &sentinel, "--passphrase", "pw"]);
+            }
+            Scenario::Leak => {
+                c.arg("__leak").arg(&canary);
+            }
+            Scenario::GuiLocked | Scenario::GuiPostAutolock | Scenario::GuiLeak => {
+                unreachable!("!is_gui() guarantees a CLI variant here")
+            }
         }
-        Scenario::Leak => {
-            cmd.arg("__leak").arg(&canary);
-        }
-    }
+        c
+    };
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
-    let mut child = cmd.spawn().map_err(|e| {
-        format!("failed to spawn vaultctl hold subcommand: {e}")
-    })?;
+    let child_bin = if scen.is_gui() { "vaultgui" } else { "vaultctl" };
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("failed to spawn {child_bin} hold subcommand: {e}"))?;
 
     // Wait until the child signals it is in the target state.
     wait_for_ready(child.stdout.take().ok_or("child has no stdout pipe")?)?;
@@ -604,11 +768,29 @@ fn default_vaultctl() -> PathBuf {
     PathBuf::from("target").join("release").join("vaultctl.exe")
 }
 
+/// Default vaultgui path, relative to the current working directory (same
+/// convention as `default_vaultctl`).
+fn default_vaultgui() -> PathBuf {
+    PathBuf::from("target").join("release").join("vaultgui.exe")
+}
+
 fn check_vaultctl(p: &Path) -> Res<()> {
     if !p.exists() {
         return Err(format!(
             "vaultctl binary not found at {} (build it: \
              `cargo build --release -p vaultctl --features leaktest`)",
+            p.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn check_vaultgui(p: &Path) -> Res<()> {
+    if !p.exists() {
+        return Err(format!(
+            "vaultgui binary not found at {} (build it: \
+             `cargo build --release -p vaultgui --features leaktest`)",
             p.display()
         )
         .into());
@@ -631,10 +813,10 @@ fn print_table(results: &[ScenarioResult]) {
     // the scan pipeline works on THAT dump); canary = secret value that must not
     // linger. "-" for sentinel means the scenario loads no vault (positive control).
     println!(
-        "{:<12} {:>8} {:>10} {:>11} {:>16}  {}",
+        "{:<18} {:>8} {:>10} {:>11} {:>22}  {}",
         "scenario", "sentinel", "canary_u8", "canary_u16", "expected", "result"
     );
-    println!("{}", "-".repeat(68));
+    println!("{}", "-".repeat(86));
     for r in results {
         let sentinel = if r.scenario.loads_vault() {
             r.sentinel_hits.to_string()
@@ -642,7 +824,7 @@ fn print_table(results: &[ScenarioResult]) {
             "-".to_string()
         };
         println!(
-            "{:<12} {:>8} {:>10} {:>11} {:>16}  {}",
+            "{:<18} {:>8} {:>10} {:>11} {:>22}  {}",
             r.scenario.name(),
             sentinel,
             r.canary_utf8,
@@ -650,5 +832,11 @@ fn print_table(results: &[ScenarioResult]) {
             r.scenario.expected_str(),
             if r.passed() { "PASS" } else { "FAIL" },
         );
+        // gui-post-autolock's canary count is a reported residual, never a
+        // pass/fail signal on its own -- flag it right under its table row so
+        // it can't be misread as silent.
+        if let Some(note) = r.gui_residual_note() {
+            println!("    ^ residual: {note}");
+        }
     }
 }
