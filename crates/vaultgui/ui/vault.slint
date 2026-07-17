@@ -1,12 +1,12 @@
-// Unlocked main view: a header strip (engaged seal + posture, idle countdown,
-// Settings, Lock now), a filterable record list on the left, and the selected
-// record's detail as a centered card on the right.
+// Unlocked main view: a header strip (engaged dial + posture chip, idle
+// countdown, Settings, Lock now), a filterable record list on the left, and
+// the selected record's detail as a centered glass card on the right.
 //
 // NOTE on `filter`: Slint 1.17 has no string "contains"/array `.filter()`, so
 // filtering happens in Rust — the search box's per-keystroke `edited` fires the
 // App-level `search(query)` callback, which recomputes `record_names`.
 import { Theme } from "theme.slint";
-import { Seal, Card, Field, PrimaryButton, GhostButton, SectionLabel, Divider } from "widgets.slint";
+import { Dial, Card, Field, PrimaryButton, GhostButton, SectionLabel, Divider, StatusChip } from "widgets.slint";
 
 export component VaultScreen inherits Rectangle {
     in property <string> posture;
@@ -74,35 +74,28 @@ export component VaultScreen inherits Rectangle {
             spacing: Theme.space-3;
 
             HorizontalLayout {
-                spacing: Theme.space-2;
+                spacing: Theme.space-3;
                 alignment: start;
 
-                Seal {
+                Dial {
+                    size: 40px;
                     y: (parent.height - self.height) / 2;
-                    size: 24px;
                     engaged: true;
                     caution: root.weak-posture;
+                    fraction: root.idle_timeout_secs > 0 ? root.idle_remaining / root.idle_timeout_secs : 1.0;
+                    center-glyph: "";
+                    center-label: root.idle_remaining > 0
+                        ? (floor(root.idle_remaining / 60) + ":" + (mod(root.idle_remaining, 60) < 10 ? "0" : "") + mod(root.idle_remaining, 60))
+                        : "\u{221E}";
                 }
-                Text {
+                StatusChip {
+                    y: (parent.height - self.height) / 2;
                     text: root.posture;
-                    color: root.weak-posture ? Theme.caution : Theme.accent;
-                    font-family: Theme.font-ui;
-                    font-size: Theme.text-label;
-                    font-weight: Theme.weight-label;
-                    letter-spacing: Theme.label-letterspacing;
-                    vertical-alignment: center;
+                    tone: root.weak-posture ? "amber" : "cyan";
                 }
             }
 
             Rectangle { horizontal-stretch: 1; }
-
-            if root.idle_remaining > 0: Text {
-                text: "Locks in " + root.idle_remaining + "s";
-                color: Theme.text-faint;
-                font-family: Theme.font-mono;
-                font-size: Theme.text-small;
-                vertical-alignment: center;
-            }
 
             GhostButton {
                 text: "Settings";
@@ -119,29 +112,11 @@ export component VaultScreen inherits Rectangle {
         }
     }
 
-    idle-bar := Rectangle {
+    HorizontalLayout {
         x: 0;
         y: header.height;
         width: 100%;
-        height: 2px;
-        background: Theme.bg-base;
-
-        Rectangle {
-            x: 0;
-            y: 0;
-            height: 100%;
-            width: root.idle_timeout_secs > 0
-                ? parent.width * root.idle_remaining / root.idle_timeout_secs
-                : 0px;
-            background: Theme.accent;
-        }
-    }
-
-    HorizontalLayout {
-        x: 0;
-        y: header.height + idle-bar.height;
-        width: 100%;
-        height: parent.height - header.height - idle-bar.height;
+        height: parent.height - header.height;
 
         // ---- Left: search + record list --------------------------------
         Rectangle {
@@ -187,16 +162,18 @@ export component VaultScreen inherits Rectangle {
                         height: 38px;
                         border-radius: Theme.radius-field;
                         background: name == root.selected
-                            ? Theme.accent-soft
-                            : (row-touch.has-hover ? Theme.bg-raised-hi : transparent);
+                            ? Theme.cyan-soft
+                            : (row-touch.has-hover ? Theme.bg-raised : transparent);
 
-                        Rectangle {
+                        if name == root.selected: Rectangle {
                             x: 0;
                             y: 6px;
                             width: 3px;
                             height: parent.height - 12px;
                             border-radius: 2px;
-                            background: name == root.selected ? Theme.accent : transparent;
+                            background: Theme.cyan;
+                            drop-shadow-blur: 6px;
+                            drop-shadow-color: Theme.cyan-glow;
                         }
 
                         Text {
@@ -247,7 +224,7 @@ export component VaultScreen inherits Rectangle {
             horizontal-stretch: 1;
             background: Theme.bg-base;
 
-            // Empty state — an invitation, with a dormant seal watermark.
+            // Empty state — an invitation, with a dormant dial watermark.
             if root.selected == "": VerticalLayout {
                 width: 100%;
                 height: 100%;
@@ -256,7 +233,12 @@ export component VaultScreen inherits Rectangle {
 
                 HorizontalLayout {
                     alignment: center;
-                    Seal { size: 48px; engaged: false; }
+                    Dial {
+                        size: 56px;
+                        engaged: false;
+                        center-glyph: "\u{1F512}";
+                        center-label: "";
+                    }
                 }
                 Text {
                     text: "Select a secret";
@@ -275,7 +257,7 @@ export component VaultScreen inherits Rectangle {
                 }
             }
 
-            // Selected — a focused card, vertically centered.
+            // Selected — a focused glass card, centered.
             if root.selected != "": HorizontalLayout {
                 width: 100%;
                 height: 100%;
@@ -311,14 +293,16 @@ export component VaultScreen inherits Rectangle {
                                     background: Theme.bg-inset;
                                     border-radius: Theme.radius-field;
                                     border-width: 1px;
-                                    border-color: root.revealed_value == "" ? Theme.line : Theme.accent;
+                                    border-color: root.revealed_value == "" ? Theme.glass-border : Theme.cyan;
+                                    drop-shadow-blur: root.revealed_value == "" ? 0px : 12px;
+                                    drop-shadow-color: Theme.cyan-glow;
 
                                     Text {
                                         x: Theme.space-4;
                                         width: parent.width - 2 * Theme.space-4;
                                         height: 100%;
                                         vertical-alignment: center;
-                                        text: root.revealed_value == "" ? "••••••••••••••••" : root.revealed_value;
+                                        text: root.revealed_value == "" ? "\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}" : root.revealed_value;
                                         color: root.revealed_value == "" ? Theme.text-faint : Theme.text-primary;
                                         font-family: Theme.font-mono;
                                         font-size: Theme.text-mono-lg;
@@ -342,7 +326,7 @@ export component VaultScreen inherits Rectangle {
                                     }
                                 }
                                 GhostButton {
-                                    text: root.clip_remaining > 0 ? "Copied · " + root.clip_remaining + "s" : "Copy";
+                                    text: root.clip_remaining > 0 ? "Copied \u{00B7} " + root.clip_remaining + "s" : "Copy";
                                     active: root.clip_remaining > 0;
                                     clicked => { root.copy(root.selected); }
                                 }
