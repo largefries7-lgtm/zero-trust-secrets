@@ -24,6 +24,8 @@ windows = { workspace = true, features = [
   # WNDCLASSW/RegisterClassW carry an HBRUSH field, so the class-registration
   # path is gated behind the GDI feature even for a message-only (UI-less) window.
   "Win32_Graphics_Gdi",
+  # GetOpenFileNameW (native "choose vault file" dialog).
+  "Win32_UI_Controls_Dialogs",
   "Security_Credentials_UI",
 ] }
 

@@ -1,0 +1,232 @@
+// Shared, polished widget kit for vaultgui. Every screen imports these so the
+// look is consistent (before, each screen redefined its own flat buttons/seal,
+// which is why they drifted). The vault SEAL is the signature element; the rest
+// stays quiet and disciplined.
+import { Theme } from "theme.slint";
+
+// ---- The vault seal — the signature element ---------------------------------
+// A concentric "dial": an outer ring, a faint inner index ring, and a center
+// disc. Dormant (locked) = hollow slate rings, no glow. Engaged (unlocked +
+// verified) = teal rings + filled center + a soft outer glow. Caution (weaker
+// posture) tints it amber. Sized by `size` so it works both as a small header
+// badge and a large hero.
+export component Seal {
+    in property <length> size: 28px;
+    in property <bool> engaged: false;
+    in property <bool> caution: false;
+    property <brush> tone: root.caution ? Theme.caution : (root.engaged ? Theme.accent : Theme.accent-dim);
+    width: root.size;
+    height: root.size;
+
+    // outer ring (+ glow when engaged)
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        border-radius: self.width / 2;
+        background: transparent;
+        border-width: root.size / 14;
+        border-color: root.tone;
+        drop-shadow-blur: root.engaged ? root.size / 2 : 0px;
+        drop-shadow-color: root.engaged ? (root.caution ? Theme.caution : Theme.accent) : #00000000;
+    }
+    // faint index ring
+    Rectangle {
+        x: (root.size - self.width) / 2;
+        y: (root.size - self.height) / 2;
+        width: root.size * 0.64;
+        height: root.size * 0.64;
+        border-radius: self.width / 2;
+        background: transparent;
+        border-width: 1px;
+        border-color: root.engaged ? (root.caution ? Theme.caution : Theme.accent-strong) : Theme.line;
+        opacity: 0.55;
+    }
+    // center disc (engaged only)
+    Rectangle {
+        x: (root.size - self.width) / 2;
+        y: (root.size - self.height) / 2;
+        width: root.size * 0.32;
+        height: root.size * 0.32;
+        border-radius: self.width / 2;
+        background: root.engaged ? (root.caution ? Theme.caution : Theme.accent) : transparent;
+    }
+}
+
+// ---- Cards / structure ------------------------------------------------------
+export component Card inherits Rectangle {
+    background: Theme.bg-raised;
+    border-radius: Theme.radius-panel;
+    border-width: 1px;
+    border-color: Theme.line;
+    drop-shadow-blur: Theme.shadow-blur;
+    drop-shadow-color: Theme.shadow;
+    drop-shadow-offset-y: 10px;
+}
+
+export component SectionLabel inherits Text {
+    color: Theme.text-faint;
+    font-family: Theme.font-ui;
+    font-size: Theme.text-label;
+    font-weight: Theme.weight-label;
+    letter-spacing: Theme.label-letterspacing;
+}
+
+export component Divider inherits Rectangle {
+    height: 1px;
+    background: Theme.line;
+}
+
+// ---- Buttons ----------------------------------------------------------------
+export component PrimaryButton inherits TouchArea {
+    in property <string> text;
+    height: 42px;
+
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        border-radius: Theme.radius-field;
+        background: root.enabled ? Theme.grad-accent : Theme.accent-dim;
+        drop-shadow-blur: root.enabled ? 16px : 0px;
+        drop-shadow-color: root.enabled ? #00000066 : #00000000;
+        drop-shadow-offset-y: 4px;
+
+        // hover sheen
+        Rectangle {
+            width: 100%;
+            height: 100%;
+            border-radius: parent.border-radius;
+            background: root.pressed && root.enabled ? #00000024 : (root.has-hover && root.enabled ? #FFFFFF1F : transparent);
+        }
+
+        Text {
+            text: root.text;
+            color: Theme.on-accent;
+            font-family: Theme.font-ui;
+            font-size: Theme.text-body;
+            font-weight: 700;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            width: 100%;
+            height: 100%;
+        }
+    }
+}
+
+export component GhostButton inherits TouchArea {
+    in property <string> text;
+    in property <bool> active: false;
+    in property <bool> danger: false;
+    height: 38px;
+
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        border-radius: Theme.radius-field;
+        border-width: root.active ? 1.5px : 1px;
+        border-color: root.danger ? Theme.danger : (root.active ? Theme.accent : Theme.line);
+        background: root.active
+            ? Theme.accent-soft
+            : (root.has-hover && root.enabled ? Theme.bg-raised-hi : transparent);
+        opacity: root.enabled ? 1.0 : 0.45;
+
+        Text {
+            text: root.text;
+            color: root.danger ? Theme.danger : (root.active ? Theme.accent : Theme.text-secondary);
+            font-family: Theme.font-ui;
+            font-size: Theme.text-body;
+            font-weight: root.active ? 600 : 400;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            width: 100%;
+            height: 100%;
+        }
+    }
+}
+
+// ---- Inputs -----------------------------------------------------------------
+export component Field inherits Rectangle {
+    in property <string> placeholder;
+    in property <bool> masked: false;
+    in property <bool> field-enabled: true;
+    in-out property <string> text <=> input.text;
+    callback accepted();
+    callback edited(text: string);
+
+    height: 42px;
+    background: Theme.bg-inset;
+    border-radius: Theme.radius-field;
+    border-width: 1px;
+    border-color: input.has-focus ? Theme.accent : Theme.line;
+    opacity: root.field-enabled ? 1.0 : 0.5;
+
+    input := TextInput {
+        x: Theme.space-3;
+        width: parent.width - 2 * Theme.space-3;
+        height: 100%;
+        vertical-alignment: center;
+        input-type: root.masked ? InputType.password : InputType.text;
+        enabled: root.field-enabled;
+        color: Theme.text-primary;
+        font-family: Theme.font-ui;
+        font-size: Theme.text-body;
+        accepted => {
+            root.accepted();
+        }
+        edited => {
+            root.edited(self.text);
+        }
+    }
+
+    if input.text == "" && !input.has-focus: Text {
+        x: Theme.space-3;
+        width: parent.width - 2 * Theme.space-3;
+        height: 100%;
+        vertical-alignment: center;
+        text: root.placeholder;
+        color: Theme.text-faint;
+        font-family: Theme.font-ui;
+        font-size: Theme.text-body;
+    }
+}
+
+export component Checkbox inherits TouchArea {
+    in property <string> text;
+    in property <bool> checked: false;
+    height: 24px;
+    opacity: root.enabled ? 1.0 : 0.4;
+
+    HorizontalLayout {
+        spacing: Theme.space-2;
+        alignment: start;
+
+        Rectangle {
+            width: 18px;
+            height: 18px;
+            y: (parent.height - self.height) / 2;
+            border-radius: 4px;
+            border-width: 1px;
+            border-color: root.checked ? Theme.accent : Theme.line;
+            background: root.checked ? Theme.accent : Theme.bg-inset;
+
+            Text {
+                visible: root.checked;
+                text: "✓";
+                color: Theme.on-accent;
+                font-size: 13px;
+                font-weight: 700;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                width: 100%;
+                height: 100%;
+            }
+        }
+
+        Text {
+            text: root.text;
+            color: Theme.text-primary;
+            font-family: Theme.font-ui;
+            font-size: Theme.text-body;
+            vertical-alignment: center;
+        }
+    }
+}

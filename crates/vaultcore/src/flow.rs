@@ -12,8 +12,12 @@ use std::path::Path;
 
 #[cfg(windows)]
 use crate::keyprovider::{CngPcpProvider, KeyProvider, RecoveryProvider, SealedBlob};
+// `KeyProvider` is needed here too (not only on Windows): `describe_provider`
+// calls the trait method `RecoveryProvider::describe`, so the trait must be in
+// scope on every target. Without it, non-Windows builds fail E0599 (the Windows
+// import above masked this because it already pulls `KeyProvider` in).
 #[cfg(not(windows))]
-use crate::keyprovider::RecoveryProvider;
+use crate::keyprovider::{KeyProvider, RecoveryProvider};
 
 /// Why a vault did (not) end up hardware-bound, so callers can warn precisely.
 #[derive(Debug)]
