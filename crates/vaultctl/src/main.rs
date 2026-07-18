@@ -9,6 +9,10 @@
 mod clip;
 mod prompt;
 
+// `Write` is only used by the `#[cfg(windows)]` deprovision confirmation prompt
+// (`stderr().flush()`), so gate the import to avoid an unused-import warning on
+// non-Windows targets (the CI `non-GUI` job builds on Linux).
+#[cfg(windows)]
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;

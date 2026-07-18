@@ -1,108 +1,9 @@
-// Unlock screen: centered column with the dormant posture seal, a vault-path
-// picker, a masked passphrase field, and a recovery-passphrase alternate.
-// Pre-unlock the eyebrow is always "· UNVERIFIED" in `caution` when
-// `posture_authenticated` is false (App/Rust sets that flag).
+// Unlock screen: a single centered "unlock panel" card — the dormant hero
+// dial, the vault path + picker, a masked passphrase, and a recovery alternate.
+// Pre-unlock the posture chip row carries an amber "UNVERIFIED" chip since the
+// header it's read from hasn't been authenticated yet.
 import { Theme } from "theme.slint";
-
-component Seal inherits Rectangle {
-    // Locked screen: always the dormant hollow ring (design-system.md
-    // "locked vs unlocked treatment") — no engaged/caution state pre-unlock.
-    width: 28px;
-    height: 28px;
-    border-radius: self.width / 2;
-    background: transparent;
-    border-width: 2px;
-    border-color: Theme.accent-dim;
-}
-
-component PrimaryButton inherits TouchArea {
-    in property <string> text;
-    height: 40px;
-
-    Rectangle {
-        width: 100%;
-        height: 100%;
-        border-radius: Theme.radius-field;
-        background: root.enabled ? Theme.accent : Theme.accent-dim;
-        opacity: root.has-hover && root.enabled ? 0.88 : 1.0;
-
-        Text {
-            text: root.text;
-            color: Theme.on-accent;
-            font-family: Theme.font-ui;
-            font-size: Theme.text-body;
-            font-weight: 600;
-            horizontal-alignment: center;
-            vertical-alignment: center;
-            width: 100%;
-            height: 100%;
-        }
-    }
-}
-
-component GhostButton inherits TouchArea {
-    in property <string> text;
-    height: 32px;
-
-    Rectangle {
-        width: 100%;
-        height: 100%;
-        border-radius: Theme.radius-field;
-        border-width: 1px;
-        border-color: Theme.line;
-        background: root.has-hover ? Theme.bg-inset : transparent;
-
-        Text {
-            text: root.text;
-            color: Theme.text-secondary;
-            font-family: Theme.font-ui;
-            font-size: Theme.text-body;
-            horizontal-alignment: center;
-            vertical-alignment: center;
-            width: 100%;
-            height: 100%;
-        }
-    }
-}
-
-// Masked passphrase field. `text` is read once by the caller when the
-// Unlock button is pressed / Enter is accepted; nothing here persists it
-// beyond the field itself (Task D3 marshals it to `SecretString` and the
-// underlying TextInput buffer is dropped with the field).
-component MaskedField inherits Rectangle {
-    in property <string> placeholder;
-    in-out property <string> text <=> input.text;
-    callback accepted();
-
-    height: 40px;
-    background: Theme.bg-inset;
-    border-radius: Theme.radius-field;
-    border-width: 1px;
-    border-color: input.has-focus ? Theme.accent : Theme.line;
-
-    input := TextInput {
-        x: Theme.space-3;
-        width: parent.width - 2 * Theme.space-3;
-        height: 100%;
-        vertical-alignment: center;
-        input-type: password;
-        color: Theme.text-primary;
-        font-family: Theme.font-ui;
-        font-size: Theme.text-body;
-        accepted => { root.accepted(); }
-    }
-
-    if input.text == "" && !input.has-focus: Text {
-        x: Theme.space-3;
-        width: parent.width - 2 * Theme.space-3;
-        height: 100%;
-        vertical-alignment: center;
-        text: root.placeholder;
-        color: Theme.text-faint;
-        font-family: Theme.font-ui;
-        font-size: Theme.text-body;
-    }
-}
+import { Dial, Card, Field, PrimaryButton, GhostButton, SectionLabel, StatusChip } from "widgets.slint";
 
 export component UnlockScreen inherits Rectangle {
     in property <string> vault_path;
@@ -112,119 +13,113 @@ export component UnlockScreen inherits Rectangle {
     callback pick_vault();
     callback unlock(passphrase: string, recovery: bool);
 
-    // Local-only: which field mode ("Unlock" vs "Use recovery passphrase")
-    // is active. Never leaves this component.
     property <bool> use-recovery: false;
 
     background: Theme.bg-base;
 
-    VerticalLayout {
-        width: 100%;
-        height: 100%;
+    HorizontalLayout {
         alignment: center;
 
-        HorizontalLayout {
+        VerticalLayout {
             alignment: center;
 
-            VerticalLayout {
-                width: 360px;
-                spacing: Theme.space-4;
-
-                HorizontalLayout {
-                    spacing: Theme.space-2;
-                    alignment: center;
-
-                    Seal {}
-
-                    VerticalLayout {
-                        alignment: center;
-                        spacing: 0px;
-
-                        Text {
-                            text: root.posture;
-                            color: Theme.accent-dim;
-                            font-family: Theme.font-ui;
-                            font-size: Theme.text-label;
-                            font-weight: Theme.weight-label;
-                            letter-spacing: Theme.label-letterspacing;
-                        }
-                        if !root.posture_authenticated: Text {
-                            text: "· UNVERIFIED";
-                            color: Theme.caution;
-                            font-family: Theme.font-ui;
-                            font-size: Theme.text-label;
-                            font-weight: Theme.weight-label;
-                            letter-spacing: Theme.label-letterspacing;
-                        }
-                    }
-                }
-
-                Text {
-                    text: "Unlock vault";
-                    color: Theme.text-primary;
-                    font-family: Theme.font-ui;
-                    font-size: Theme.text-display;
-                    font-weight: Theme.weight-display;
-                    horizontal-alignment: center;
-                }
+            Card {
+                width: 400px;
 
                 VerticalLayout {
-                    spacing: Theme.space-1;
+                    padding: Theme.space-8;
+                    spacing: Theme.space-5;
 
-                    Text {
-                        text: "VAULT";
-                        color: Theme.text-faint;
-                        font-family: Theme.font-ui;
-                        font-size: Theme.text-label;
-                        font-weight: Theme.weight-label;
-                        letter-spacing: Theme.label-letterspacing;
+                    HorizontalLayout {
+                        alignment: center;
+                        Dial {
+                            size: 96px;
+                            engaged: false;
+                            center-glyph: "\u{1F512}";
+                            center-label: "LOCKED";
+                        }
                     }
 
                     HorizontalLayout {
+                        alignment: center;
                         spacing: Theme.space-2;
 
-                        Rectangle {
-                            horizontal-stretch: 1;
-                            height: 32px;
-                            background: Theme.bg-inset;
-                            border-radius: Theme.radius-field;
-                            border-width: 1px;
-                            border-color: Theme.line;
-
-                            Text {
-                                x: Theme.space-2;
-                                width: parent.width - 2 * Theme.space-2;
-                                height: 100%;
-                                vertical-alignment: center;
-                                text: root.vault_path == "" ? "No vault selected" : root.vault_path;
-                                color: root.vault_path == "" ? Theme.text-faint : Theme.text-secondary;
-                                font-family: Theme.font-mono;
-                                font-size: Theme.text-mono;
-                                overflow: elide;
-                            }
+                        StatusChip {
+                            text: root.posture == "" ? "NO VAULT" : root.posture;
+                            tone: "cyan";
                         }
-
-                        GhostButton {
-                            text: "Choose…";
-                            width: 90px;
-                            clicked => { root.pick_vault(); }
+                        if !root.posture_authenticated: StatusChip {
+                            text: "UNVERIFIED";
+                            tone: "amber";
                         }
                     }
-                }
 
-                pw-field := MaskedField {
-                    placeholder: root.use-recovery ? "Recovery code" : "Passphrase";
-                    accepted => { root.unlock(self.text, root.use-recovery); }
-                }
+                    Text {
+                        text: "UNLOCK VAULT";
+                        font-family: Theme.font-ui;
+                        font-size: Theme.text-display;
+                        font-weight: Theme.weight-display;
+                        color: Theme.text-primary;
+                        horizontal-alignment: center;
+                        letter-spacing: 2px;
+                    }
 
-                PrimaryButton {
-                    text: "Unlock";
-                    clicked => { root.unlock(pw-field.text, root.use-recovery); }
-                }
+                    VerticalLayout {
+                        spacing: Theme.space-2;
 
-                GhostButton {
-                    text: root.use-recovery ? "Use regular passphrase" : "Use recovery code";
-                    clicked => { root.use-recovery = !root.use-recovery; }
+                        SectionLabel { text: "VAULT FILE"; }
+
+                        HorizontalLayout {
+                            spacing: Theme.space-2;
+
+                            Rectangle {
+                                horizontal-stretch: 1;
+                                height: 38px;
+                                background: Theme.bg-inset;
+                                border-radius: Theme.radius-field;
+                                border-width: 1px;
+                                border-color: Theme.glass-border;
+
+                                Text {
+                                    x: Theme.space-3;
+                                    width: parent.width - 2 * Theme.space-3;
+                                    height: 100%;
+                                    vertical-alignment: center;
+                                    text: root.vault_path == "" ? "No vault selected" : root.vault_path;
+                                    color: root.vault_path == "" ? Theme.text-faint : Theme.text-secondary;
+                                    font-family: Theme.font-mono;
+                                    font-size: Theme.text-small;
+                                    overflow: elide;
+                                }
+                            }
+
+                            GhostButton {
+                                text: "Choose\u{2026}";
+                                width: 96px;
+                                clicked => { root.pick_vault(); }
+                            }
+                        }
+                    }
+
+                    pw := Field {
+                        placeholder: root.use-recovery ? "Recovery code" : "Passphrase";
+                        masked: true;
+                        accepted => { root.unlock(self.text, root.use-recovery); }
+                    }
+
+                    PrimaryButton {
+                        text: "UNLOCK";
+                        clicked => { root.unlock(pw.text, root.use-recovery); }
+                    }
+
+                    HorizontalLayout {
+                        alignment: center;
+                        GhostButton {
+                            text: root.use-recovery ? "Use regular passphrase" : "Use recovery code";
+                            width: 240px;
+                            clicked => { root.use-recovery = !root.use-recovery; }
+                        }
+                    }
                 }
             }
         }

@@ -5,6 +5,7 @@
 pub mod anticapture;
 pub mod autolock;
 pub mod clipboard;
+pub mod dialog;
 pub mod hello;
 pub mod input;
 pub mod prefs;
