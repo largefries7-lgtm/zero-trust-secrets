@@ -113,11 +113,14 @@ Format v3 closes all three:
   is revealed only to a coarse bucket. Tombstones are inside the authenticated
   set and filtered out at unlock.
 
-The DEK envelope and AEAD/MAC constructions are unchanged; no new primitive. This
-is a breaking on-disk change — consistent with this project's "recreate to upgrade"
-stance, the build reads only v3 (one format, minimal parser surface), so a pre-v3
-vault must be recreated. Verified empirically: a distinctive record name and value
-do not appear anywhere in the raw file, and the on-disk record count is padded.
+The DEK envelope and AEAD/MAC constructions are unchanged; no new primitive. An
+existing **v2** vault is read and **auto-migrated to v3 on the next save**: it is
+authenticated under the legacy MAC, its values are re-encrypted into the v3 layout,
+and (for a legacy escrow) a human recovery passphrase is still accepted — so the
+upgrade is lossless and transparent. Only a **v1** vault (single-factor, genuinely
+weaker crypto) stays unreadable and must be recreated. Verified empirically: a
+distinctive record name and value do not appear anywhere in a v3 file, the on-disk
+record count is padded, and a v2 vault round-trips through migration to v3.
 
 ### New surfaces introduced by the GUI (slice 2)
 
