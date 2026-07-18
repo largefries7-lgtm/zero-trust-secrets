@@ -1,66 +1,81 @@
-// Shared, polished widget kit for vaultgui. Every screen imports these so the
-// look is consistent (before, each screen redefined its own flat buttons/seal,
-// which is why they drifted). The vault SEAL is the signature element; the rest
-// stays quiet and disciplined.
 import { Theme } from "theme.slint";
 
-// ---- The vault seal — the signature element ---------------------------------
-// A concentric "dial": an outer ring, a faint inner index ring, and a center
-// disc. Dormant (locked) = hollow slate rings, no glow. Engaged (unlocked +
-// verified) = teal rings + filled center + a soft outer glow. Caution (weaker
-// posture) tints it amber. Sized by `size` so it works both as a small header
-// badge and a large hero.
-export component Seal {
-    in property <length> size: 28px;
+// ---- The radial vault dial (signature) --------------------------------------
+// A segmented tick-ring gauge (robust in Slint: rotated ticks, no SVG-arc trig)
+// + a glass hub. `fraction` (0..1) lights that share of the ring; lit ticks glow
+// cyan, or amber when `caution` or the fraction is low. `engaged=false` = dormant
+// (all ticks dim). Reused as the auto-lock countdown gauge (fraction = remaining).
+export component Dial {
+    in property <length> size: 150px;
     in property <bool> engaged: false;
     in property <bool> caution: false;
-    property <brush> tone: root.caution ? Theme.caution : (root.engaged ? Theme.accent : Theme.accent-dim);
+    in property <float> fraction: 1.0;
+    in property <string> center-glyph: "\u{1F512}";
+    in property <string> center-label: "LOCKED";
+    property <int> segs: 44;
+    property <bool> warm: root.caution || root.fraction < 0.2;
     width: root.size;
     height: root.size;
 
-    // outer ring (+ glow when engaged)
-    Rectangle {
-        width: 100%;
-        height: 100%;
-        border-radius: self.width / 2;
-        background: transparent;
-        border-width: root.size / 14;
-        border-color: root.tone;
-        drop-shadow-blur: root.engaged ? root.size / 2 : 0px;
-        drop-shadow-color: root.engaged ? (root.caution ? Theme.caution : Theme.accent) : #00000000;
+    for i in root.segs : Rectangle {
+        property <float> t: i / root.segs;
+        property <bool> lit: root.engaged && root.fraction >= t;
+        property <angle> a: (i * 360deg) / root.segs;
+        width: 2px;
+        height: root.size * 0.09;
+        // Slint's `rotation-angle`/`rotation-origin-*` are only valid on Image
+        // and Text (not Rectangle, needed here for drop-shadow glow), so the
+        // tick centre is placed directly on the ring via sin/cos instead of
+        // positioning-then-rotating a fixed dash.
+        x: root.size / 2 + (root.size * 0.44) * sin(self.a) - self.width / 2;
+        y: root.size / 2 - (root.size * 0.44) * cos(self.a) - self.height / 2;
+        border-radius: 1px;
+        background: self.lit ? (root.warm ? Theme.amber : Theme.cyan) : Theme.line;
+        drop-shadow-blur: self.lit ? 6px : 0px;
+        drop-shadow-color: root.warm ? Theme.amber-glow : Theme.cyan-glow;
     }
-    // faint index ring
+
+    // glass hub
     Rectangle {
+        width: root.size * 0.52;
+        height: root.size * 0.52;
         x: (root.size - self.width) / 2;
         y: (root.size - self.height) / 2;
-        width: root.size * 0.64;
-        height: root.size * 0.64;
         border-radius: self.width / 2;
-        background: transparent;
+        background: Theme.bg-inset;
         border-width: 1px;
-        border-color: root.engaged ? (root.caution ? Theme.caution : Theme.accent-strong) : Theme.line;
-        opacity: 0.55;
-    }
-    // center disc (engaged only)
-    Rectangle {
-        x: (root.size - self.width) / 2;
-        y: (root.size - self.height) / 2;
-        width: root.size * 0.32;
-        height: root.size * 0.32;
-        border-radius: self.width / 2;
-        background: root.engaged ? (root.caution ? Theme.caution : Theme.accent) : transparent;
+        border-color: root.engaged ? (root.warm ? Theme.amber : Theme.cyan) : Theme.line;
+        drop-shadow-blur: root.engaged ? 14px : 0px;
+        drop-shadow-color: root.warm ? Theme.amber-glow : Theme.cyan-glow;
+
+        VerticalLayout {
+            alignment: center;
+            Text {
+                text: root.center-glyph;
+                font-size: root.size * 0.16;
+                horizontal-alignment: center;
+            }
+            Text {
+                text: root.center-label;
+                color: Theme.text-secondary;
+                font-family: Theme.font-mono;
+                font-size: root.size * 0.075;
+                letter-spacing: 1.5px;
+                horizontal-alignment: center;
+            }
+        }
     }
 }
 
-// ---- Cards / structure ------------------------------------------------------
+// ---- Glass panel ------------------------------------------------------------
 export component Card inherits Rectangle {
-    background: Theme.bg-raised;
+    background: Theme.glass-fill;
     border-radius: Theme.radius-panel;
     border-width: 1px;
-    border-color: Theme.line;
+    border-color: Theme.glass-border;
     drop-shadow-blur: Theme.shadow-blur;
     drop-shadow-color: Theme.shadow;
-    drop-shadow-offset-y: 10px;
+    drop-shadow-offset-y: 12px;
 }
 
 export component SectionLabel inherits Text {
@@ -76,34 +91,63 @@ export component Divider inherits Rectangle {
     background: Theme.line;
 }
 
-// ---- Buttons ----------------------------------------------------------------
+export component StatusChip {
+    in property <string> text;
+    in property <string> tone: "cyan"; // "cyan" | "amber" | "danger"
+    // Note: `col` collides with Slint's reserved GridLayout cell-position
+    // property (valid on any element, not just grid children), so the
+    // compiler rejects redeclaring it here ("Cannot override property
+    // 'col'"). Named these `chip-color`/`chip-glow` instead.
+    property <brush> chip-color: root.tone == "amber" ? Theme.amber : (root.tone == "danger" ? Theme.danger : Theme.cyan);
+    property <color> chip-glow: root.tone == "amber" ? Theme.amber-glow : Theme.cyan-glow;
+    height: 22px;
+    Rectangle {
+        border-radius: Theme.radius-pill;
+        background: Theme.bg-inset;
+        border-width: 1px;
+        border-color: root.chip-color;
+        drop-shadow-blur: 6px;
+        drop-shadow-color: root.chip-glow;
+        HorizontalLayout {
+            padding-left: Theme.space-2;
+            padding-right: Theme.space-2;
+            Text {
+                text: root.text;
+                color: root.chip-color;
+                font-family: Theme.font-ui;
+                font-size: 9.5px;
+                font-weight: 700;
+                letter-spacing: 1px;
+                vertical-alignment: center;
+            }
+        }
+    }
+}
+
 export component PrimaryButton inherits TouchArea {
     in property <string> text;
     height: 42px;
-
     Rectangle {
         width: 100%;
         height: 100%;
         border-radius: Theme.radius-field;
         background: root.enabled ? Theme.grad-accent : Theme.accent-dim;
-        drop-shadow-blur: root.enabled ? 16px : 0px;
-        drop-shadow-color: root.enabled ? #00000066 : #00000000;
-        drop-shadow-offset-y: 4px;
-
-        // hover sheen
+        drop-shadow-blur: root.enabled ? 18px : 0px;
+        drop-shadow-color: root.enabled ? Theme.cyan-glow : #00000000;
+        drop-shadow-offset-y: 3px;
         Rectangle {
             width: 100%;
             height: 100%;
             border-radius: parent.border-radius;
-            background: root.pressed && root.enabled ? #00000024 : (root.has-hover && root.enabled ? #FFFFFF1F : transparent);
+            background: root.pressed && root.enabled ? #00000024 : (root.has-hover && root.enabled ? #FFFFFF24 : transparent);
         }
-
         Text {
             text: root.text;
             color: Theme.on-accent;
             font-family: Theme.font-ui;
             font-size: Theme.text-body;
             font-weight: 700;
+            letter-spacing: 1px;
             horizontal-alignment: center;
             vertical-alignment: center;
             width: 100%;
@@ -117,24 +161,21 @@ export component GhostButton inherits TouchArea {
     in property <bool> active: false;
     in property <bool> danger: false;
     height: 38px;
-
     Rectangle {
         width: 100%;
         height: 100%;
         border-radius: Theme.radius-field;
         border-width: root.active ? 1.5px : 1px;
-        border-color: root.danger ? Theme.danger : (root.active ? Theme.accent : Theme.line);
-        background: root.active
-            ? Theme.accent-soft
-            : (root.has-hover && root.enabled ? Theme.bg-raised-hi : transparent);
+        border-color: root.danger ? Theme.danger : (root.active ? Theme.cyan : Theme.glass-border);
+        background: root.active ? Theme.cyan-soft : (root.has-hover && root.enabled ? Theme.bg-raised : transparent);
+        drop-shadow-blur: root.active ? 8px : 0px;
+        drop-shadow-color: Theme.cyan-glow;
         opacity: root.enabled ? 1.0 : 0.45;
-
         Text {
             text: root.text;
-            color: root.danger ? Theme.danger : (root.active ? Theme.accent : Theme.text-secondary);
+            color: root.danger ? Theme.danger : (root.active ? Theme.cyan : Theme.text-secondary);
             font-family: Theme.font-ui;
             font-size: Theme.text-body;
-            font-weight: root.active ? 600 : 400;
             horizontal-alignment: center;
             vertical-alignment: center;
             width: 100%;
@@ -143,7 +184,6 @@ export component GhostButton inherits TouchArea {
     }
 }
 
-// ---- Inputs -----------------------------------------------------------------
 export component Field inherits Rectangle {
     in property <string> placeholder;
     in property <bool> masked: false;
@@ -151,14 +191,14 @@ export component Field inherits Rectangle {
     in-out property <string> text <=> input.text;
     callback accepted();
     callback edited(text: string);
-
     height: 42px;
     background: Theme.bg-inset;
     border-radius: Theme.radius-field;
     border-width: 1px;
-    border-color: input.has-focus ? Theme.accent : Theme.line;
+    border-color: input.has-focus ? Theme.cyan : Theme.glass-border;
+    drop-shadow-blur: input.has-focus ? 10px : 0px;
+    drop-shadow-color: Theme.cyan-glow;
     opacity: root.field-enabled ? 1.0 : 0.5;
-
     input := TextInput {
         x: Theme.space-3;
         width: parent.width - 2 * Theme.space-3;
@@ -169,14 +209,9 @@ export component Field inherits Rectangle {
         color: Theme.text-primary;
         font-family: Theme.font-ui;
         font-size: Theme.text-body;
-        accepted => {
-            root.accepted();
-        }
-        edited => {
-            root.edited(self.text);
-        }
+        accepted => { root.accepted(); }
+        edited => { root.edited(self.text); }
     }
-
     if input.text == "" && !input.has-focus: Text {
         x: Theme.space-3;
         width: parent.width - 2 * Theme.space-3;
@@ -194,23 +229,22 @@ export component Checkbox inherits TouchArea {
     in property <bool> checked: false;
     height: 24px;
     opacity: root.enabled ? 1.0 : 0.4;
-
     HorizontalLayout {
         spacing: Theme.space-2;
         alignment: start;
-
         Rectangle {
             width: 18px;
             height: 18px;
             y: (parent.height - self.height) / 2;
             border-radius: 4px;
             border-width: 1px;
-            border-color: root.checked ? Theme.accent : Theme.line;
-            background: root.checked ? Theme.accent : Theme.bg-inset;
-
+            border-color: root.checked ? Theme.cyan : Theme.glass-border;
+            background: root.checked ? Theme.cyan : Theme.bg-inset;
+            drop-shadow-blur: root.checked ? 8px : 0px;
+            drop-shadow-color: Theme.cyan-glow;
             Text {
                 visible: root.checked;
-                text: "✓";
+                text: "\u{2713}";
                 color: Theme.on-accent;
                 font-size: 13px;
                 font-weight: 700;
@@ -220,7 +254,6 @@ export component Checkbox inherits TouchArea {
                 height: 100%;
             }
         }
-
         Text {
             text: root.text;
             color: Theme.text-primary;
