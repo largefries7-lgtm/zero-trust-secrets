@@ -213,7 +213,7 @@ export component UnlockScreen inherits Rectangle {
                 }
 
                 pw-field := MaskedField {
-                    placeholder: root.use-recovery ? "Recovery passphrase" : "Passphrase";
+                    placeholder: root.use-recovery ? "Recovery code" : "Passphrase";
                     accepted => { root.unlock(self.text, root.use-recovery); }
                 }
 
@@ -223,7 +223,7 @@ export component UnlockScreen inherits Rectangle {
                 }
 
                 GhostButton {
-                    text: root.use-recovery ? "Use regular passphrase" : "Use recovery passphrase";
+                    text: root.use-recovery ? "Use regular passphrase" : "Use recovery code";
                     clicked => { root.use-recovery = !root.use-recovery; }
                 }
             }

@@ -61,8 +61,8 @@ BIN=target/release/vaultctl.exe
 # UNLOCK passphrase; every unlock then needs the TPM *and* that passphrase.
 $BIN --vault my.ztsv init
 
-# Optional: also create a single-factor recovery escrow (survives TPM loss, but
-# a stolen vault file is then only as strong as this recovery passphrase):
+# Optional: also create a single-factor recovery escrow (survives TPM loss). A
+# 128-bit recovery CODE is generated and printed ONCE — store it offline:
 #   $BIN --vault my.ztsv init --recovery
 
 $BIN --vault my.ztsv seal-status
@@ -79,8 +79,8 @@ $BIN --vault my.ztsv get github --clip          # clipboard copy, auto-clears in
 $BIN --vault my.ztsv list                       # names only
 $BIN --vault my.ztsv rm github                  # delete a record
 
-# If the vault has a recovery escrow (init --recovery), unlock via it instead:
-$BIN --vault my.ztsv get github --recovery --recovery-passphrase "..."
+# If the vault has a recovery escrow (init --recovery), unlock via the code:
+$BIN --vault my.ztsv get github --recovery --recovery-code "XXXX-XXXX-..."
 
 # Standalone password generator (OS CSPRNG, reports entropy):
 $BIN gen --len 24 --symbols
@@ -97,8 +97,8 @@ passphrase becomes the sole factor; pass `--passphrase` (prompted if omitted) to
 
 | Command | Purpose |
 |---------|---------|
-| `init [--allow-no-tpm] [--passphrase <pw>] [--recovery [--recovery-passphrase <pw>]]` | Create a vault; wrap the DEK under TPM + passphrase (two-factor), optionally add a single-factor recovery escrow |
-| `unlock [--passphrase <pw>] [--recovery --recovery-passphrase <pw>]` | Credential smoke-check (verifies you can obtain the DEK) |
+| `init [--allow-no-tpm] [--passphrase <pw>] [--recovery]` | Create a vault; wrap the DEK under TPM + passphrase (two-factor), optionally add a single-factor recovery escrow (prints a generated 128-bit code once). Refuses a weak passphrase. |
+| `unlock [--passphrase <pw>] [--recovery --recovery-code <code>]` | Credential smoke-check (verifies you can obtain the DEK) |
 | `lock` | No-op by design — the CLI is stateless, nothing is cached to clear |
 | `add <name> [--value <v>] [--force] [--passphrase <pw>]` | Add a secret; refuses an existing name unless `--force` (rotate in place) |
 | `rm <name> [--passphrase <pw>]` | Remove a secret record |
@@ -108,8 +108,9 @@ passphrase becomes the sole factor; pass `--passphrase` (prompted if omitted) to
 | `seal-status` | Show `hardware_bound`, factors, the active key provider, and warnings |
 | `deprovision [--yes]` | Delete the persisted TPM wrapping key (destructive) |
 
-`--recovery-passphrase` requires `--recovery`; passing it alone is rejected rather
-than silently ignored.
+`--recovery-code` (on `unlock`/`get`/`add`/`rm`) requires `--recovery`; passing it
+alone is rejected rather than silently ignored. `init --recovery` takes no code
+argument — the code is generated and shown once.
 
 `--vault <path>` is global (default `vault.ztsv`).
 
@@ -121,8 +122,16 @@ than silently ignored.
   the original TPM **and** the passphrase — a stolen vault file, or same-user
   malware that can drive the TPM, is useless without also capturing the passphrase.
   An optional, off-by-default recovery escrow (`init --recovery`) additionally wraps
-  the DEK under a separate recovery passphrase alone, trading theft-resistance for
-  survivability if the TPM is lost.
+  the DEK under a **generated 128-bit recovery code** (shown once, stored offline) —
+  as strong as the DEK itself — trading theft-resistance for survivability if the
+  TPM is lost.
+- **Calibrated KDF + strength floor.** The Argon2id passphrase cost is
+  auto-calibrated at vault creation to the largest memory (256 MiB floor, up to a
+  1 GiB cap) that keeps unlock near ~0.75 s on the creating machine — materially
+  harder against offline attack than a fixed default (was 64 MiB). Creation also
+  refuses weak passphrases: a length + character-class entropy floor plus a
+  common-password blocklist, stricter for a passphrase-only vault than a two-factor
+  one.
 - **Tamper-evident.** The vault header and the whole record set (count, order,
   names, ciphertext) are authenticated by an HKDF-keyed HMAC; each secret is also
   bound to its name via AEAD AAD. Relabel / delete / reorder / inject all fail
@@ -165,7 +174,7 @@ current recorded result in this environment.
 
 - TPM binding is **device-bound, not PCR-policy-bound** (a CNG limitation); real
   PCR sealing needs a `tss-esapi` backend in a later slice.
-- `--value` / `--recovery-passphrase` travel on the command line (visible in
+- `--value` / `--recovery-code` travel on the command line (visible in
   process listings). This is a property of the test/automation CLI; the GUI slice
   avoids argv. The `--clip` path routes the secret via stdin, not argv.
 - Record **names** are authenticated but stored as plaintext metadata (values are
@@ -189,7 +198,7 @@ docs/               design spec + implementation plan
 ## Test
 
 ```sh
-cargo test --workspace   # vaultcore 43 (lib) + codec-fuzz 3 + proptest 1, vaultctl CLI 10, vaultgui 19
+cargo test --workspace   # vaultcore 59 (lib) + codec-fuzz 3 + proptest 1, vaultctl CLI 11, vaultgui 20
 bash verify/run.sh       # empirical memory-dump proof (CLI + GUI scenarios)
 ```
 

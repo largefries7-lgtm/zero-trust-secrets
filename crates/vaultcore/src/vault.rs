@@ -22,7 +22,7 @@ const MAGIC: [u8; 4] = *b"ZTSV";
 // memory/CPU DoS. The ceilings are generous versus `default_tuned` (64 MiB / t=3)
 // yet keep the worst case survivable. A header outside these bounds is rejected
 // at parse time, before any Argon2 work happens.
-const MAX_ARGON2_MEM_KIB: u32 = 1 << 20; // 1 GiB
+pub(crate) const MAX_ARGON2_MEM_KIB: u32 = 1 << 20; // 1 GiB
 const MAX_ARGON2_TIME: u32 = 64;
 const MAX_ARGON2_PARALLELISM: u32 = 64;
 /// Current on-disk format version. v2 = two-factor envelope (see `envelope.rs`).

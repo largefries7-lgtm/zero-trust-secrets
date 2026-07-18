@@ -47,13 +47,11 @@ enum Cmd {
         /// sole factor with --allow-no-tpm. Prompted (no echo) if omitted.
         #[arg(long)]
         passphrase: Option<String>,
-        /// Also create a single-factor recovery escrow. Survives TPM loss, but
-        /// reduces a STOLEN vault's security to the recovery passphrase's strength.
+        /// Also create a single-factor recovery escrow. A 128-bit recovery CODE is
+        /// generated and shown ONCE; store it offline. Survives TPM loss, but a
+        /// stolen vault is then only as strong as that code (still 128-bit).
         #[arg(long)]
         recovery: bool,
-        /// Recovery passphrase (requires --recovery). Prompted if omitted.
-        #[arg(long, requires = "recovery")]
-        recovery_passphrase: Option<String>,
     },
     /// Stateless credential smoke-check: derive the DEK, verify the MAC, drop it.
     Unlock {
@@ -63,8 +61,9 @@ enum Cmd {
         /// Unlock via the recovery escrow (single factor) instead of TPM+passphrase.
         #[arg(long)]
         recovery: bool,
+        /// Recovery code (requires --recovery). Prompted (no echo) if omitted.
         #[arg(long, requires = "recovery")]
-        recovery_passphrase: Option<String>,
+        recovery_code: Option<String>,
     },
     /// No-op (nothing is persisted); prints `locked` for CLI symmetry.
     Lock,
@@ -86,8 +85,9 @@ enum Cmd {
         /// Unlock via the recovery escrow instead of TPM+passphrase.
         #[arg(long)]
         recovery: bool,
+        /// Recovery code (requires --recovery). Prompted (no echo) if omitted.
         #[arg(long, requires = "recovery")]
-        recovery_passphrase: Option<String>,
+        recovery_code: Option<String>,
     },
     /// Remove a secret record.
     Rm {
@@ -99,8 +99,9 @@ enum Cmd {
         /// Unlock via the recovery escrow instead of TPM+passphrase.
         #[arg(long)]
         recovery: bool,
+        /// Recovery code (requires --recovery). Prompted (no echo) if omitted.
         #[arg(long, requires = "recovery")]
-        recovery_passphrase: Option<String>,
+        recovery_code: Option<String>,
     },
     /// Retrieve a secret; prints to stdout, or copies to the clipboard with --clip.
     Get {
@@ -114,8 +115,9 @@ enum Cmd {
         /// Unlock via the recovery escrow instead of TPM+passphrase.
         #[arg(long)]
         recovery: bool,
+        /// Recovery code (requires --recovery). Prompted (no echo) if omitted.
         #[arg(long, requires = "recovery")]
-        recovery_passphrase: Option<String>,
+        recovery_code: Option<String>,
     },
     /// List record names (no DEK needed).
     List,
@@ -183,28 +185,23 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let path = cli.vault.as_path();
 
     match cli.cmd {
-        Cmd::Init { allow_no_tpm, passphrase, recovery, recovery_passphrase } => {
+        Cmd::Init { allow_no_tpm, passphrase, recovery } => {
             let pass = resolve_new_passphrase("unlock passphrase", passphrase)?;
-            let recovery_pw = if recovery {
-                Some(resolve_new_passphrase("recovery passphrase", recovery_passphrase)?)
-            } else {
-                None
-            };
-            cmd_init(path, allow_no_tpm, pass, recovery_pw)?;
+            cmd_init(path, allow_no_tpm, pass, recovery)?;
         }
-        Cmd::Unlock { passphrase, recovery, recovery_passphrase } => {
+        Cmd::Unlock { passphrase, recovery, recovery_code } => {
             let locked = LockedVault::load(path)?;
             // unlock_* verify the header MAC and fail closed.
-            let _vault = unlock_vault(locked, passphrase, recovery, recovery_passphrase)?;
+            let _vault = unlock_vault(locked, passphrase, recovery, recovery_code)?;
             println!("unlock OK");
         }
         Cmd::Lock => {
             // Stateless: there is no on-disk session to clear.
             println!("locked");
         }
-        Cmd::Add { name, value, force, passphrase, recovery, recovery_passphrase } => {
+        Cmd::Add { name, value, force, passphrase, recovery, recovery_code } => {
             let locked = LockedVault::load(path)?;
-            let mut vault = unlock_vault(locked, passphrase, recovery, recovery_passphrase)?;
+            let mut vault = unlock_vault(locked, passphrase, recovery, recovery_code)?;
             let value = match value {
                 Some(v) => {
                     eprintln!("warning: passing --value on the command line exposes it via the process list; prefer interactive entry");
@@ -223,9 +220,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             vault.save(path)?;
             println!("{} {name}", if force { "set" } else { "added" });
         }
-        Cmd::Rm { name, passphrase, recovery, recovery_passphrase } => {
+        Cmd::Rm { name, passphrase, recovery, recovery_code } => {
             let locked = LockedVault::load(path)?;
-            let mut vault = unlock_vault(locked, passphrase, recovery, recovery_passphrase)?;
+            let mut vault = unlock_vault(locked, passphrase, recovery, recovery_code)?;
             if vault.remove(&name) {
                 vault.save(path)?;
                 println!("removed {name}");
@@ -233,9 +230,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 return Err(Box::new(Error::NotFound(name)));
             }
         }
-        Cmd::Get { name, clip, passphrase, recovery, recovery_passphrase } => {
+        Cmd::Get { name, clip, passphrase, recovery, recovery_code } => {
             let locked = LockedVault::load(path)?;
-            let vault = unlock_vault(locked, passphrase, recovery, recovery_passphrase)?;
+            let vault = unlock_vault(locked, passphrase, recovery, recovery_code)?;
             let secret = vault.get(&name)?;
             if clip {
                 clip::copy_with_autoclear(secret.expose_str(), 15)?;
@@ -366,7 +363,7 @@ fn cmd_init(
     path: &std::path::Path,
     allow_no_tpm: bool,
     passphrase: String,
-    recovery: Option<String>,
+    recovery: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use vaultcore::flow::{create_vault, CreateOptions, TpmBinding};
 
@@ -375,7 +372,8 @@ fn cmd_init(
         CreateOptions {
             allow_no_tpm,
             passphrase: SecretString::from_string(passphrase),
-            recovery_passphrase: recovery.map(SecretString::from_string),
+            recovery,
+            kdf: kdf_strategy(),
         },
     )?;
 
@@ -401,9 +399,17 @@ fn cmd_init(
         eprintln!("reset/lost (or you run `deprovision`), this vault CANNOT be recovered.");
         eprintln!("Re-init with --recovery to add a passphrase-only escrow (weaker vs. theft).");
     }
-    if outcome.has_recovery {
-        eprintln!("WARNING: recovery escrow enabled. A STOLEN vault is only as strong as the");
-        eprintln!("recovery passphrase (it bypasses the TPM second factor by design).");
+    if let Some(code) = &outcome.recovery_code {
+        eprintln!("******************************************************************");
+        eprintln!("** RECOVERY CODE — SHOWN ONCE. WRITE IT DOWN AND STORE OFFLINE. **");
+        eprintln!("** It bypasses the TPM second factor by design, so anyone with  **");
+        eprintln!("** this code AND the vault file can decrypt it. It is 128-bit,  **");
+        eprintln!("** so it cannot be brute-forced — but it cannot be recovered if **");
+        eprintln!("** you lose it.                                                 **");
+        eprintln!("******************************************************************");
+        // The code goes to stdout so it can be captured deliberately; the loud
+        // warning above is on stderr.
+        println!("recovery code: {code}");
     }
 
     let factors = if outcome.hardware_bound {
@@ -413,6 +419,26 @@ fn cmd_init(
     };
     println!("initialized vault at {} (factors: {factors})", path.display());
     Ok(())
+}
+
+/// Choose how the KDF cost is set for a new vault. Production always calibrates.
+/// In DEBUG builds only, an env var lets the integration tests use a cheap fixed
+/// cost so they don't pay the (deliberately expensive) calibration on every
+/// `init`. Release binaries ignore the env var entirely, so it can never be used
+/// to weaken a real vault.
+fn kdf_strategy() -> vaultcore::flow::KdfStrategy {
+    #[cfg(debug_assertions)]
+    {
+        if std::env::var_os("ZTSV_KDF_FIXED_FOR_TESTS").is_some() {
+            return vaultcore::flow::KdfStrategy::Fixed(vaultcore::crypto::Argon2Params {
+                mem_kib: 8,
+                time: 1,
+                parallelism: 1,
+                salt: vaultcore::crypto::Argon2Params::random_salt(),
+            });
+        }
+    }
+    vaultcore::flow::KdfStrategy::Calibrate
 }
 
 /// Delete the persisted TPM wrapping key. Destructive: requires typed
@@ -464,11 +490,20 @@ fn unlock_vault(
     locked: LockedVault,
     passphrase: Option<String>,
     recovery: bool,
-    recovery_passphrase: Option<String>,
+    recovery_code: Option<String>,
 ) -> Result<Vault, Box<dyn std::error::Error>> {
     if recovery {
-        let pw = resolve_unlock_pw("recovery passphrase", recovery_passphrase)?;
-        return Ok(locked.unlock_recovery(&pw)?);
+        // The recovery code is normalized (case/dashes/spaces tolerant) inside
+        // `unlock_with_recovery_code`, so the user can type it however they saved
+        // it. Prompted without echo when not supplied on argv.
+        let code = match recovery_code {
+            Some(c) => {
+                eprintln!("warning: passing --recovery-code on the command line exposes it via the process list; prefer interactive entry");
+                c
+            }
+            None => prompt::read_secret_noecho("recovery code: ")?,
+        };
+        return Ok(vaultcore::flow::unlock_with_recovery_code(locked, &code)?);
     }
     // Acquire the TPM factor FIRST so a hardware-bound vault with an
     // unavailable TPM fails fast, before ever prompting for a passphrase

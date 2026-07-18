@@ -17,6 +17,30 @@ cannot defend against a compromised kernel, a debugger attached to the live
 already-unlocked machine. It aims to be as strong as is *actually achievable*
 below that ceiling, and to state honestly where the ceiling is.
 
+### Passphrase-factor hardening (hardening program, phase 1)
+
+The most realistic attack on a local vault is offline brute force of a *stolen
+file*. Three measures raise that floor, none of which change the on-disk format or
+add a dependency:
+
+- **Auto-calibrated Argon2id.** At vault creation the passphrase KDF cost is
+  benchmarked on the machine and set to the largest memory (256 MiB floor, 1 GiB
+  cap) that keeps unlock near ~0.75 s — typically 512 MiB–1 GiB on modern hardware,
+  up from a fixed 64 MiB. The floor wins over the latency target on a slow machine,
+  so a weak machine cannot silently mint a weak vault. Parameters live in the
+  authenticated header, bounded by the parser's DoS ceiling.
+- **Creation-time strength gate.** A passphrase below a length + character-class
+  entropy floor, or on an embedded common-password blocklist, is refused. The floor
+  is context-aware: stricter for a passphrase-only (`--allow-no-tpm`) vault, where
+  the passphrase is the sole factor, than for a two-factor vault. This is a *floor,
+  not a strength promise* — it catches weak passphrases, it does not certify strong
+  ones (the honest tradeoff for not adding a zxcvbn-grade dependency).
+- **Generated recovery code.** The optional escrow (still off by default) no longer
+  takes a human passphrase — the weakest link when enabled. It generates a 128-bit
+  code (Crockford base32, shown once, stored offline), so a stolen vault with the
+  escrow is still protected by 128 bits, not by whatever a human chose. The code
+  wraps the DEK through the same envelope construction; no new cryptography.
+
 ### New surfaces introduced by the GUI (slice 2)
 
 `vaultgui` inverts the CLI's stateless model on purpose: it is the long-lived

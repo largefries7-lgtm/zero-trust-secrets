@@ -48,6 +48,12 @@ use std::os::windows::io::AsRawHandle;
 
 type Res<T> = Result<T, Box<dyn Error>>;
 
+/// Passphrase used to provision every throwaway harness vault. It must clear the
+/// single-factor strength floor now enforced by `vaultctl init` (mixed classes,
+/// 22 chars). The same value is reused wherever a scenario later unlocks (`PostClip`,
+/// `GuiPostAutolock`), so provision and unlock always agree.
+const PROVISION_PASSPHRASE: &str = "Tq7!vK2m-Zp9x_Lw3r#Hs6";
+
 /// All verification scenarios: the original CLI (`vaultctl`) trio plus the
 /// GUI (`vaultgui --leaktest`) trio added by Task E2.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -486,7 +492,7 @@ fn run_scenario(
                     .arg("--vault")
                     .arg(&vault)
                     .arg("--passphrase")
-                    .arg("pw")
+                    .arg(PROVISION_PASSPHRASE)
                     .arg("--name")
                     .arg(&sentinel);
             }
@@ -507,7 +513,7 @@ fn run_scenario(
             }
             Scenario::PostClip => {
                 // Fetch by the sentinel record name.
-                c.args(["__hold-postclip", &sentinel, "--passphrase", "pw"]);
+                c.args(["__hold-postclip", &sentinel, "--passphrase", PROVISION_PASSPHRASE]);
             }
             Scenario::Leak => {
                 c.arg("__leak").arg(&canary);
@@ -581,14 +587,14 @@ fn provision(vaultctl: &Path, vault: &Path, name: &str, canary: &str) -> Res<()>
         Command::new(vaultctl)
             .arg("--vault")
             .arg(vault)
-            .args(["init", "--allow-no-tpm", "--passphrase", "pw"]),
+            .args(["init", "--allow-no-tpm", "--passphrase", PROVISION_PASSPHRASE]),
         "vaultctl init",
     )?;
     run_checked(
         Command::new(vaultctl)
             .arg("--vault")
             .arg(vault)
-            .args(["add", name, "--value", canary, "--passphrase", "pw"]),
+            .args(["add", name, "--value", canary, "--passphrase", PROVISION_PASSPHRASE]),
         "vaultctl add",
     )?;
     Ok(())

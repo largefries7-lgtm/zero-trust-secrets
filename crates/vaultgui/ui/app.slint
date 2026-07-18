@@ -29,6 +29,13 @@ export component App inherits Window {
     in-out property <bool> has_recovery: false;
     in-out property <string> provider_desc;
 
+    // ---- Create-flow feedback ---------------------------------------------
+    // Live passphrase-strength meter state (set by Rust on `check_strength`).
+    in-out property <string> strength_hint;
+    in-out property <bool> strength_ok: false;
+    // The generated recovery code, shown ONCE on the "recovery-code" screen.
+    in-out property <string> recovery_code;
+
     // ---- Records -----------------------------------------------------
     in-out property <[string]> record_names;
     in-out property <string> filter;
@@ -48,7 +55,9 @@ export component App inherits Window {
 
     // ---- Callbacks (handled in Rust; see src/main.rs, Task D3) -------------
     callback pick_vault();
-    callback create_vault(passphrase: string, confirm: string, allow_no_tpm: bool, use_recovery: bool, recovery_passphrase: string);
+    callback create_vault(passphrase: string, confirm: string, allow_no_tpm: bool, use_recovery: bool);
+    callback check_strength(passphrase: string, allow_no_tpm: bool);
+    callback copy_recovery_code();
     callback unlock(passphrase: string, recovery: bool);
     callback select(name: string);
     callback reveal(name: string);
@@ -72,8 +81,116 @@ export component App inherits Window {
         width: 100%;
         height: 100%;
 
-        create_vault(passphrase, confirm, allow_no_tpm, use_recovery, recovery_passphrase) => {
-            root.create_vault(passphrase, confirm, allow_no_tpm, use_recovery, recovery_passphrase);
+        strength_hint: root.strength_hint;
+        strength_ok: root.strength_ok;
+
+        create_vault(passphrase, confirm, allow_no_tpm, use_recovery) => {
+            root.create_vault(passphrase, confirm, allow_no_tpm, use_recovery);
+        }
+        check_strength(passphrase, allow_no_tpm) => {
+            root.check_strength(passphrase, allow_no_tpm);
+        }
+    }
+
+    // One-time recovery-code reveal after a vault is created with an escrow.
+    // Inlined (rather than its own screen file) because it is a single static
+    // panel with no reusable parts. `recovery_code` is display-only secret
+    // material; "I've saved it" clears it and moves on to unlock.
+    if root.screen == "recovery-code" : Rectangle {
+        x: 0;
+        y: 0;
+        width: 100%;
+        height: 100%;
+        background: Theme.bg-base;
+
+        VerticalLayout {
+            alignment: center;
+            HorizontalLayout {
+                alignment: center;
+                VerticalLayout {
+                    width: 460px;
+                    spacing: Theme.space-4;
+
+                    Text {
+                        text: "Your recovery code";
+                        color: Theme.text-primary;
+                        font-family: Theme.font-ui;
+                        font-size: Theme.text-display;
+                        font-weight: Theme.weight-display;
+                    }
+                    Text {
+                        text: "Shown ONCE. Write it down and store it offline. It is 128-bit (uncrackable) but cannot be recovered if lost, and anyone with it plus the vault file can decrypt the vault.";
+                        color: Theme.caution;
+                        font-family: Theme.font-ui;
+                        font-size: Theme.text-body;
+                        wrap: word-wrap;
+                    }
+                    Rectangle {
+                        height: 52px;
+                        background: Theme.bg-inset;
+                        border-radius: Theme.radius-field;
+                        border-width: 1px;
+                        border-color: Theme.line;
+                        Text {
+                            text: root.recovery_code;
+                            color: Theme.text-primary;
+                            font-family: Theme.font-mono;
+                            font-size: Theme.text-title;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                            width: 100%;
+                            height: 100%;
+                        }
+                    }
+                    TouchArea {
+                        height: 36px;
+                        clicked => { root.copy_recovery_code(); }
+                        Rectangle {
+                            width: 100%;
+                            height: 100%;
+                            border-radius: Theme.radius-field;
+                            border-width: 1px;
+                            border-color: Theme.line;
+                            background: parent.has-hover ? Theme.bg-inset : transparent;
+                            Text {
+                                text: "Copy code";
+                                color: Theme.text-secondary;
+                                font-family: Theme.font-ui;
+                                font-size: Theme.text-body;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                                width: 100%;
+                                height: 100%;
+                            }
+                        }
+                    }
+                    TouchArea {
+                        height: 40px;
+                        clicked => {
+                            root.recovery_code = "";
+                            root.screen = "unlock";
+                        }
+                        Rectangle {
+                            width: 100%;
+                            height: 100%;
+                            border-radius: Theme.radius-field;
+                            background: Theme.accent;
+                            opacity: parent.has-hover ? 0.88 : 1.0;
+                            Text {
+                                text: "I've saved it — continue";
+                                color: Theme.on-accent;
+                                font-family: Theme.font-ui;
+                                font-size: Theme.text-body;
+                                font-weight: 600;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                                width: 100%;
+                                height: 100%;
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 

@@ -33,6 +33,7 @@ component MaskedField inherits Rectangle {
     in property <string> placeholder;
     in-out property <string> text <=> input.text;
     in property <bool> field-enabled: true;
+    callback edited(string);
 
     height: 40px;
     background: Theme.bg-inset;
@@ -51,6 +52,7 @@ component MaskedField inherits Rectangle {
         color: Theme.text-primary;
         font-family: Theme.font-ui;
         font-size: Theme.text-body;
+        edited => { root.edited(self.text); }
     }
 
     if input.text == "" && !input.has-focus: Text {
@@ -154,7 +156,14 @@ component Choice inherits TouchArea {
 }
 
 export component CreateScreen inherits Rectangle {
-    callback create_vault(passphrase: string, confirm: string, allow_no_tpm: bool, use_recovery: bool, recovery_passphrase: string);
+    callback create_vault(passphrase: string, confirm: string, allow_no_tpm: bool, use_recovery: bool);
+    // Fired as the passphrase is edited (and when the factor choice changes) so
+    // Rust can score it and drive the meter + submit gate below.
+    callback check_strength(passphrase: string, allow_no_tpm: bool);
+
+    // Live strength feedback, set by Rust in response to `check_strength`.
+    in property <string> strength_hint;
+    in property <bool> strength_ok: false;
 
     // Local-only form state; nothing here is a secret except the field text,
     // which is read once (on submit) and passed straight to `create_vault`.
@@ -199,7 +208,12 @@ export component CreateScreen inherits Rectangle {
                     // Positive claim, never alarming: accent while it's the
                     // active choice, plain secondary otherwise.
                     tradeoff-color: root.allow-no-tpm ? Theme.text-secondary : Theme.accent;
-                    clicked => { root.allow-no-tpm = false; }
+                    // Switching factor changes the strength FLOOR (single-factor
+                    // is stricter), so re-score the current passphrase.
+                    clicked => {
+                        root.allow-no-tpm = false;
+                        root.check_strength(pw-field.text, false);
+                    }
                 }
 
                 Choice {
@@ -211,7 +225,10 @@ export component CreateScreen inherits Rectangle {
                     // neutral) exactly when the user has committed to it
                     // (root.allow-no-tpm true).
                     tradeoff-color: Theme.caution;
-                    clicked => { root.allow-no-tpm = true; }
+                    clicked => {
+                        root.allow-no-tpm = true;
+                        root.check_strength(pw-field.text, true);
+                    }
                 }
 
                 Checkbox {
@@ -221,7 +238,7 @@ export component CreateScreen inherits Rectangle {
                 }
 
                 if root.use-recovery: Text {
-                    text: "A stolen vault is only as strong as the recovery passphrase.";
+                    text: "A 128-bit recovery code will be generated and shown ONCE. Store it offline — it bypasses the TPM factor, so anyone with it and the file can decrypt the vault.";
                     color: Theme.caution;
                     font-family: Theme.font-ui;
                     font-size: Theme.text-body;
@@ -230,24 +247,32 @@ export component CreateScreen inherits Rectangle {
 
                 pw-field := MaskedField {
                     placeholder: "Passphrase";
+                    edited(t) => { root.check_strength(t, root.allow-no-tpm); }
+                }
+                // Live strength meter. Shown once the user starts typing; accent
+                // when it clears the floor, caution otherwise.
+                if pw-field.text != "": Text {
+                    text: root.strength_hint;
+                    color: root.strength_ok ? Theme.accent : Theme.caution;
+                    font-family: Theme.font-ui;
+                    font-size: Theme.text-body;
+                    wrap: word-wrap;
                 }
                 confirm-field := MaskedField {
                     placeholder: "Confirm passphrase";
                 }
-                recovery-field := MaskedField {
-                    placeholder: "Recovery passphrase";
-                    field-enabled: root.use-recovery;
-                }
 
                 PrimaryButton {
                     text: "Create vault";
+                    // Gate submit on the strength floor. Creation ALSO enforces it
+                    // server-side, but disabling here gives immediate feedback.
+                    enabled: root.strength_ok;
                     clicked => {
                         root.create_vault(
                             pw-field.text,
                             confirm-field.text,
                             root.allow-no-tpm,
                             root.use-recovery,
-                            recovery-field.text,
                         );
                     }
                 }
