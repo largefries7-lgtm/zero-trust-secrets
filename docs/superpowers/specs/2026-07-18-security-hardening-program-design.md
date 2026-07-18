@@ -153,11 +153,43 @@ interactive Windows session to execute (see TEST_PLAN).
 
 ## Phase 4 — TPM PCR sealing + PIN
 
-- Add a `tss-esapi` backend behind the existing `KeyProvider` trait that seals the
-  TPM secret under a **PCR policy** (boot-state binding) and an optional **TPM
-  PIN** (hardware anti-hammering), populating the already-present but unused
-  `pcr_selection` header field. `tss-esapi` is a **new dependency** — the surface
-  cost is disclosed. CNG path retained as the default/fallback.
+**Status: hardware core deferred with an evidence-based reason (2026-07-18); honest
+posture reporting delivered.**
+
+The intended design was a `tss-esapi` backend behind the existing `KeyProvider`
+trait sealing the TPM secret under a **PCR policy** (boot-state binding) + optional
+**TPM PIN** (hardware anti-hammering), populating the unused `pcr_selection` field.
+On investigation this is **not safely deliverable or verifiable on the Windows-first
+shipping target in this environment**, for three independently-confirmed reasons:
+
+1. **`tss-esapi` does not build on Windows here.** `tss-esapi-sys v0.6.0`'s build
+   script requires the `tpm2-tss` C libraries via pkg-config (Linux-oriented);
+   `cargo build` of a crate depending on `tss-esapi = "7"` fails on this host.
+   Adding it would break the build and the `cargo deny` supply-chain gate.
+2. **CNG cannot express PCR-policy sealing** (the pre-existing, documented
+   limitation) — so the current provider genuinely can't do it.
+3. **No usable TPM is accessible in this environment** (the CNG seal/unseal test
+   skips; `Get-Tpm`/WMI are unavailable), so *any* TPM code — a raw-TBS TPM2
+   implementation being the only Windows-viable route — cannot be validated here.
+   Shipping unvalidated raw-TPM2 command marshalling into a password manager risks
+   permanently locking users out of their vaults (data loss); that is not an
+   acceptable thing to ship unverified.
+
+**Delivered instead (safe + tested):** `seal-status` now states the hardware-binding
+ceiling explicitly and unmissably (`pcr_policy: none — device-bound …, NOT sealed to
+a PCR/boot state`), so a user can see exactly where the ceiling is rather than
+inferring it. Covered by a CLI test.
+
+**Concrete path for when hardware is available (the deferred work, now specified):**
+implement `TbsPcpProvider` using Windows **TBS** (`Tbsi_Context_Create`,
+`Tbsip_Submit_Command`) to submit hand-built TPM2 commands: `TPM2_StartAuthSession`
+(policy), `TPM2_PolicyPCR` over a chosen selection (e.g. PCRs 0/2/4/7 =
+firmware/option-ROM/boot-manager/secure-boot), `TPM2_Create`/`TPM2_Load` of a keyed
+object under that policy, and `TPM2_Unseal` gated by `TPM2_PolicyPCR` +
+`TPM2_PolicySecret` (the PIN/auth value, giving TPM-enforced dictionary-attack
+lockout). Populate `pcr_selection` from the real policy. This must be developed and
+validated against a real TPM (or the Microsoft TPM simulator) with data-loss tests
+before shipping — hence its deferral rather than an unverified merge.
 
 ---
 

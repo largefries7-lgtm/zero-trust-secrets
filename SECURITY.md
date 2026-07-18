@@ -71,6 +71,29 @@ the *unlocked* process still wins — stated plainly):
   **not** stop code executing inside the process (it can call `CryptUnprotectMemory`
   too) — the same ceiling, narrowed in time.
 
+### TPM PCR sealing (hardening program, phase 4) — status
+
+Binding the DEK to a **boot state** (PCR policy) and a **TPM PIN** (hardware
+dictionary-attack lockout) would be the deepest hardware hardening, but on the
+Windows CNG path it is **not available**, and the alternatives cannot be delivered
+safely in the current environment:
+
+- **CNG cannot express PCR-policy sealing** (documented limitation); the DEK stays
+  bound to the TPM's non-exportable *platform key* — device-bound, not boot-state
+  bound.
+- **`tss-esapi`** (the usual Rust TSS binding) targets the Linux `tpm2-tss` C
+  libraries and **fails to build on this Windows-first target**, so it cannot be
+  adopted without breaking the build and the supply-chain gate.
+- The only Windows-viable route is hand-built TPM2 commands over **TBS**, which
+  **must be validated against real TPM hardware** (with data-loss tests) before
+  shipping — an unverified implementation could permanently lock a vault.
+
+Rather than ship unverified TPM code, this remains **specified and deferred** (see
+the phase-4 section of the design spec for the concrete TBS/TPM2 plan). What ships
+now is honesty: `vaultctl seal-status` states the ceiling explicitly
+(`pcr_policy: none — device-bound …, NOT sealed to a PCR/boot state`) so it is never
+implied to be stronger than it is.
+
 ### Metadata encryption — format v3 (hardening program, phase 3)
 
 Previously a stolen `.ztsv` leaked its record **names** (authenticated, but stored

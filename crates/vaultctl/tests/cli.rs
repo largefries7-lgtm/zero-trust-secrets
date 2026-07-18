@@ -297,6 +297,29 @@ fn gen_without_symbols_is_alphanumeric_and_exact_length() {
 }
 
 #[test]
+fn seal_status_states_the_pcr_ceiling() {
+    // seal-status must be explicit that the DEK is device-bound, NOT PCR/boot-state
+    // sealed (the honest hardware-binding ceiling on the CNG path).
+    let dir = unique_dir("sealstatus-pcr");
+    let v = dir.join("v.ztsv");
+    let vs = v.to_str().unwrap();
+    assert!(bin()
+        .args(["--vault", vs, "init", "--allow-no-tpm", "--passphrase", PW])
+        .status()
+        .unwrap()
+        .success());
+    let out = bin().args(["--vault", vs, "seal-status"]).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("pcr_policy:"), "seal-status must report pcr_policy: {stdout}");
+    assert!(
+        stdout.to_lowercase().contains("not sealed to a pcr")
+            || stdout.to_lowercase().contains("device-bound"),
+        "seal-status must state the device-bound (non-PCR) ceiling: {stdout}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn seal_status_reports_no_hardware_binding() {
     let dir = unique_dir("sealstatus");
     let v = dir.join("v.ztsv");

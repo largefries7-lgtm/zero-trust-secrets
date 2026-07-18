@@ -292,6 +292,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             println!("recovery_escrow: {}", header.recovery_wrap.is_some());
             println!("provider: {}", vaultcore::flow::describe_provider(header));
             println!("pcr_selection: {:?}", header.pcr_selection);
+            // Make the hardware-binding ceiling explicit and unmissable: on the
+            // Windows CNG path the DEK is bound to the TPM's non-exportable platform
+            // key (device-bound), NOT sealed to a PCR/boot state. Real PCR-policy
+            // sealing is a documented CNG limitation (see SECURITY.md, phase 4).
+            println!(
+                "pcr_policy: {}",
+                if header.pcr_selection.is_empty() {
+                    "none — device-bound to the TPM platform key, NOT sealed to a PCR/boot state \
+                     (CNG limitation; see SECURITY.md)"
+                } else {
+                    "recorded (see pcr_selection above)"
+                }
+            );
             if !header.hardware_bound {
                 println!(
                     "warning: hardware binding is OFF; vault is protected by the passphrase only"
