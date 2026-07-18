@@ -263,10 +263,3 @@ export component Checkbox inherits TouchArea {
         }
     }
 }
-
-// ---- Temporary compatibility shim -------------------------------------------
-// unlock/vault screens still reference `Seal`; alias it onto the new `Dial` at
-// header-badge size until those screens are migrated to `Dial` directly.
-export component Seal inherits Dial {
-    size: 28px;
-}

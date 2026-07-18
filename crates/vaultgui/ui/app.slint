@@ -72,6 +72,13 @@ export component App inherits Window {
         width: 100%;
         height: 100%;
 
+        // Fade in on switch: `if` re-instantiates the screen, `init` flips
+        // opacity 0->1 which the `animate` picks up (a constant opacity:1
+        // would have nothing to animate from).
+        opacity: 0;
+        init => { self.opacity = 1; }
+        animate opacity { duration: 200ms; easing: ease-out; }
+
         create_vault(passphrase, confirm, allow_no_tpm, use_recovery, recovery_passphrase) => {
             root.create_vault(passphrase, confirm, allow_no_tpm, use_recovery, recovery_passphrase);
         }
@@ -82,6 +89,10 @@ export component App inherits Window {
         y: 0;
         width: 100%;
         height: 100%;
+
+        opacity: 0;
+        init => { self.opacity = 1; }
+        animate opacity { duration: 200ms; easing: ease-out; }
 
         vault_path: root.vault_path;
         posture: root.posture;
@@ -96,6 +107,10 @@ export component App inherits Window {
         y: 0;
         width: 100%;
         height: 100%;
+
+        opacity: 0;
+        init => { self.opacity = 1; }
+        animate opacity { duration: 200ms; easing: ease-out; }
 
         posture: root.posture;
         hardware_bound: root.hardware_bound;
@@ -126,6 +141,10 @@ export component App inherits Window {
         width: 100%;
         height: 100%;
 
+        opacity: 0;
+        init => { self.opacity = 1; }
+        animate opacity { duration: 200ms; easing: ease-out; }
+
         hardware_bound: root.hardware_bound;
         posture: root.posture;
         has_recovery: root.has_recovery;
@@ -145,19 +164,28 @@ export component App inherits Window {
         close_settings => { root.screen = "vault"; }
     }
 
-    // Dismissable error banner, always on top (declared last = highest
-    // z-order among siblings).
+    // Dismissable error toast: a floating rounded card near the top, always on
+    // top (declared last = highest z-order among siblings). Fades in on appear.
     if root.error != "" : Rectangle {
-        x: 0;
-        y: 0;
-        width: 100%;
-        height: 44px;
+        width: min(parent.width - 2 * Theme.space-6, 560px);
+        height: 48px;
+        x: (parent.width - self.width) / 2;
+        y: Theme.space-5;
         background: Theme.danger;
+        border-radius: Theme.radius-field;
+        drop-shadow-blur: 28px;
+        drop-shadow-color: #00000080;
+        drop-shadow-offset-y: 8px;
+
+        opacity: 0;
+        init => { self.opacity = 1; }
+        animate opacity { duration: 200ms; easing: ease-out; }
 
         HorizontalLayout {
             width: 100%;
             height: 100%;
-            padding: Theme.space-3;
+            padding-left: Theme.space-4;
+            padding-right: Theme.space-3;
             spacing: Theme.space-3;
 
             Text {
@@ -165,13 +193,14 @@ export component App inherits Window {
                 color: Theme.on-danger;
                 font-family: Theme.font-ui;
                 font-size: Theme.text-body;
+                font-weight: 600;
                 vertical-alignment: center;
                 horizontal-stretch: 1;
                 overflow: elide;
             }
 
             TouchArea {
-                width: 20px;
+                width: 24px;
                 clicked => { root.error = ""; }
 
                 Text {
