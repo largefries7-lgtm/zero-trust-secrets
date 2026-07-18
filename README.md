@@ -183,9 +183,10 @@ current recorded result in this environment.
   process listings). This is a property of the test/automation CLI; the GUI slice
   avoids argv. The `--clip` path routes the secret via stdin, not argv.
 - Record **names** are encrypted as of **format v3** (padded, with the count hidden
-  by tombstone padding). This format is not backward compatible: a pre-v3 vault must
-  be recreated (this build reads only v3, by design — one format, smaller parser
-  surface).
+  by tombstone padding). An existing **v2** vault is read and **auto-upgraded to v3
+  on the next save** (same crypto — only the record layout differs — so no data is
+  lost; a legacy human recovery passphrase keeps working too). A pre-v2 (v1,
+  single-factor) vault predates the current crypto and must be recreated.
 - **Not defended:** a debugger attached to the live *unlocked* process at
   decryption time, kernel keyloggers, or a compromised OS.
 

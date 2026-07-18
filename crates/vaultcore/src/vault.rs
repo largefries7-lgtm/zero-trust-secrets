@@ -149,14 +149,15 @@ impl VaultHeader {
             return Err(Error::Format("bad magic".into()));
         }
         let format_version = c.u16()?;
-        if format_version != FORMAT_VERSION {
-            // Only the current format is read. Older layouts (v1 single-factor, v2
-            // plaintext-name) predate this one; this build intentionally carries no
-            // legacy parser (reduced attack surface / one format to reason about),
-            // so an older vault must be recreated.
+        // v3 = current; v2 = readable so an existing vault can be opened and
+        // AUTO-UPGRADED to v3 on the next save (same crypto — only the record
+        // layout differs — so this is a benign metadata migration, not resurrecting
+        // legacy crypto). v1 (single-factor) stays unreadable: it is genuinely
+        // different, weaker crypto and must be recreated.
+        if format_version != FORMAT_VERSION && format_version != 2 {
             return Err(Error::Format(format!(
-                "unsupported vault format version {format_version} (this build reads v{FORMAT_VERSION}); \
-                 a pre-v{FORMAT_VERSION} vault must be recreated with `vaultctl init`"
+                "unsupported vault format version {format_version} (this build reads v2 and v{FORMAT_VERSION}); \
+                 a pre-v2 vault must be recreated with `vaultctl init`"
             )));
         }
         let hardware_bound = c.u8()? != 0;
@@ -230,6 +231,30 @@ impl VaultHeader {
     pub fn verify_mac(&self, dek: &SecretBytes, records: &[RawRecord]) -> bool {
         use subtle::ConstantTimeEq;
         self.compute_mac(dek, records).ct_eq(&self.header_mac).into()
+    }
+
+    /// HMAC over the header + the legacy v2 record set (plaintext names). Used only
+    /// to authenticate a v2 file before migrating it to v3.
+    fn compute_mac_v2(&self, dek: &SecretBytes, records: &[RawRecordV2]) -> [u8; 32] {
+        let mk = crypto::hkdf_subkey(dek, b"header-mac", KEY_LEN);
+        use hkdf::hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        let mut m = <Hmac<Sha256>>::new_from_slice(mk.expose()).expect("hmac accepts any key len");
+        m.update(&self.mac_input());
+        m.update(&(records.len() as u32).to_le_bytes());
+        for r in records {
+            m.update(&r.id.to_le_bytes());
+            m.update(&(r.name.len() as u32).to_le_bytes());
+            m.update(r.name.as_bytes());
+            m.update(&(r.ct.len() as u32).to_le_bytes());
+            m.update(&r.ct);
+        }
+        m.finalize().into_bytes().into()
+    }
+
+    fn verify_mac_v2(&self, dek: &SecretBytes, records: &[RawRecordV2]) -> bool {
+        use subtle::ConstantTimeEq;
+        self.compute_mac_v2(dek, records).ct_eq(&self.header_mac).into()
     }
 
     /// Build a fresh v2 header. `dek_wrap` is the primary two-factor wrap;
@@ -354,6 +379,39 @@ pub struct Record {
     pub id: u128,
     pub name: String,
     pub value_ct: Vec<u8>,
+}
+
+/// A legacy v2 record as stored on disk: plaintext name, and a single value
+/// ciphertext (no name encryption, no size/count padding). Read-only — kept solely
+/// to open and migrate an existing v2 vault to v3.
+struct RawRecordV2 {
+    id: u128,
+    name: String,
+    ct: Vec<u8>,
+}
+
+impl RawRecordV2 {
+    fn from_cursor(c: &mut Cursor) -> Result<Self> {
+        let id_bytes: [u8; 16] = c
+            .take(16)?
+            .try_into()
+            .map_err(|_| Error::Format("record id".into()))?;
+        let id = u128::from_le_bytes(id_bytes);
+        let name =
+            String::from_utf8(c.bytes()?).map_err(|_| Error::Format("record name utf8".into()))?;
+        let ct = c.bytes()?;
+        Ok(RawRecordV2 { id, name, ct })
+    }
+}
+
+/// AAD for a legacy v2 value ciphertext: `id ‖ version(2) ‖ name`. The name is part
+/// of the AAD in v2 (it was plaintext), unlike v3 where the name is encrypted.
+fn aad_v2(id: u128, name: &str) -> Vec<u8> {
+    let mut a = Vec::with_capacity(18 + name.len());
+    a.extend_from_slice(&id.to_le_bytes());
+    a.extend_from_slice(&2u16.to_le_bytes());
+    a.extend_from_slice(name.as_bytes());
+    a
 }
 
 // --- v3 record encryption / padding helpers ---
@@ -482,9 +540,16 @@ enum State {
 
 /// A vault whose header and record framing are known but which has not been
 /// authenticated/decrypted yet. Holds no DEK and no plaintext.
+/// Raw on-disk records, tagged by the format they were parsed from. A v2 vault is
+/// migrated to v3 at unlock; every save writes v3.
+enum RecordsRaw {
+    V2(Vec<RawRecordV2>),
+    V3(Vec<RawRecord>),
+}
+
 pub struct LockedVault {
     header: VaultHeader,
-    records: Vec<RawRecord>,
+    records: RecordsRaw,
     /// SHA-256 of the exact bytes read from disk, for optimistic-concurrency
     /// detection when a derived `Vault` is later saved (see `Vault::save`).
     fingerprint: [u8; 32],
@@ -502,39 +567,77 @@ impl LockedVault {
         let header = VaultHeader::from_bytes(header_bytes)?;
 
         let num_records = c.u32()? as usize;
-        // Do NOT pre-allocate from the untrusted `num_records`: a tiny file
-        // claiming a huge count would otherwise force a large up-front
-        // allocation (memory-amplification DoS) before parsing fails. Grow as
-        // records actually parse; each `from_cursor` is bounds-checked against
-        // the remaining bytes, so total work is bounded by the real file size.
-        let mut records = Vec::new();
-        for _ in 0..num_records {
-            records.push(RawRecord::from_cursor(&mut c)?);
-        }
+        // Do NOT pre-allocate from the untrusted `num_records`: a tiny file claiming
+        // a huge count would otherwise force a large up-front allocation
+        // (memory-amplification DoS) before parsing fails. Grow as records parse;
+        // each `from_cursor` is bounds-checked, so work is bounded by the file size.
+        // The framing differs by on-disk format (v2 = plaintext name; v3 = encrypted).
+        let records = if header.format_version == 2 {
+            let mut v = Vec::new();
+            for _ in 0..num_records {
+                v.push(RawRecordV2::from_cursor(&mut c)?);
+            }
+            RecordsRaw::V2(v)
+        } else {
+            let mut v = Vec::new();
+            for _ in 0..num_records {
+                v.push(RawRecord::from_cursor(&mut c)?);
+            }
+            RecordsRaw::V3(v)
+        };
         Ok(LockedVault { header, records, fingerprint })
     }
 
-    /// Verify the header MAC against the supplied DEK and, on success, decrypt
-    /// every record name (dropping tombstones) to produce the unlocked `Vault`.
-    /// Fails closed: on MAC mismatch this returns `Error::AuthFailed` and no usable
-    /// vault is produced. Values are NOT decrypted here — they stay as `value_ct`
-    /// until `get`, so an unlocked session never holds all secret values at once.
+    /// Verify the header MAC against the supplied DEK and, on success, produce the
+    /// unlocked `Vault`. A v3 vault: decrypt each record NAME (dropping tombstones);
+    /// values stay as `value_ct` until `get`. A v2 vault: authenticate under the
+    /// legacy MAC, decrypt each value under the v2 scheme and RE-ENCRYPT it as v3, so
+    /// the in-memory vault is v3 and the next `save` upgrades the file (no data loss).
+    /// Fails closed on MAC mismatch (`Error::AuthFailed`).
     pub fn unlock_with_dek(self, dek: SecretBytes) -> Result<Vault> {
-        if !self.header.verify_mac(&dek, &self.records) {
-            return Err(Error::AuthFailed);
-        }
-        let version = self.header.format_version;
-        let mut records = Vec::new();
-        for raw in &self.records {
-            // MAC already authenticated `name_ct`, so a correct-DEK open succeeds;
-            // a failure fails closed rather than guessing.
-            if let Some(name) = open_name(&dek, raw.id, version, &raw.name_ct)? {
-                records.push(Record { id: raw.id, name, value_ct: raw.value_ct.clone() });
+        let mut header = self.header;
+        let records = match self.records {
+            RecordsRaw::V3(raws) => {
+                if !header.verify_mac(&dek, &raws) {
+                    return Err(Error::AuthFailed);
+                }
+                let version = header.format_version;
+                let mut records = Vec::new();
+                for raw in &raws {
+                    // MAC already authenticated `name_ct`; a correct-DEK open
+                    // succeeds, a failure fails closed rather than guessing.
+                    if let Some(name) = open_name(&dek, raw.id, version, &raw.name_ct)? {
+                        records.push(Record { id: raw.id, name, value_ct: raw.value_ct.clone() });
+                    }
+                    // `None` => tombstone padding: dropped from the logical view.
+                }
+                records
             }
-            // `None` => tombstone padding: dropped from the logical view.
-        }
+            RecordsRaw::V2(raws) => {
+                if !header.verify_mac_v2(&dek, &raws) {
+                    return Err(Error::AuthFailed);
+                }
+                // Migrate each record: decrypt the value under the v2 scheme (name
+                // is in the AAD; no padding), then re-encrypt it as v3. The
+                // plaintext value exists only transiently here, in a page-locked
+                // buffer that drops immediately.
+                let mut records = Vec::new();
+                for raw in &raws {
+                    let value = crypto::aead_open(
+                        &subkey(&dek, b"record", raw.id),
+                        &aad_v2(raw.id, &raw.name),
+                        &raw.ct,
+                    )?;
+                    let value_ct = seal_value(&dek, raw.id, FORMAT_VERSION, value.expose())?;
+                    records.push(Record { id: raw.id, name: raw.name.clone(), value_ct });
+                }
+                // The vault is now v3-shaped in memory; mark it so `save` writes v3.
+                header.format_version = FORMAT_VERSION;
+                records
+            }
+        };
         Ok(Vault {
-            header: self.header,
+            header,
             records,
             state: State::Unlocked(ProtectedDek::new(dek)),
             loaded_fingerprint: Some(self.fingerprint),
@@ -545,11 +648,14 @@ impl LockedVault {
         &self.header
     }
 
-    /// Number of raw (encrypted) records on disk, including tombstone padding.
+    /// Number of raw records on disk (v3 includes tombstone padding).
     /// Test-only: the logical name list requires the DEK (names are encrypted).
     #[cfg(test)]
     pub fn raw_record_count(&self) -> usize {
-        self.records.len()
+        match &self.records {
+            RecordsRaw::V2(v) => v.len(),
+            RecordsRaw::V3(v) => v.len(),
+        }
     }
 
     /// v2 primary unlock: derive the DEK from the unlock passphrase (+ the TPM
@@ -573,15 +679,23 @@ impl LockedVault {
     /// v2 recovery unlock: derive the DEK from the recovery passphrase alone
     /// (single factor). Errors if this vault has no recovery escrow.
     pub fn unlock_recovery(self, recovery_pass: &SecretString) -> Result<Vault> {
+        let dek = self.recovery_dek(recovery_pass)?;
+        self.unlock_with_dek(dek)
+    }
+
+    /// Derive the DEK from the recovery escrow WITHOUT consuming `self`, so a caller
+    /// can try more than one candidate secret (e.g. a normalized recovery code and
+    /// the raw input, for legacy passphrase escrows) before committing to unlock.
+    /// Errors if this vault has no recovery escrow or the secret is wrong.
+    pub(crate) fn recovery_dek(&self, recovery_pass: &SecretString) -> Result<SecretBytes> {
         let (rw, rk) = match (
             self.header.recovery_wrap.as_ref(),
             self.header.recovery_kdf.as_ref(),
         ) {
-            (Some(rw), Some(rk)) => (rw.clone(), *rk),
+            (Some(rw), Some(rk)) => (rw, rk),
             _ => return Err(Error::Provider("this vault has no recovery escrow".into())),
         };
-        let dek = crate::envelope::unwrap_dek_recovery(&rw, recovery_pass, &rk)?;
-        self.unlock_with_dek(dek)
+        crate::envelope::unwrap_dek_recovery(rw, recovery_pass, rk)
     }
 }
 
@@ -1241,5 +1355,76 @@ mod tests {
     /// Substring search used by the on-disk-secrecy tests.
     fn contains(hay: &[u8], needle: &[u8]) -> bool {
         hay.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// Build a legacy v2 vault file (plaintext names, no padding), mirroring the
+    /// pre-v3 on-disk writer, so migration can be tested without an old binary.
+    fn build_v2_file(dek: &SecretBytes, entries: &[(&str, &str)]) -> Vec<u8> {
+        let mut header = test_header();
+        header.format_version = 2;
+        let mut v2recs = Vec::new();
+        for (name, value) in entries {
+            let id = random_id();
+            let ct =
+                crypto::aead_seal(&subkey(dek, b"record", id), &aad_v2(id, name), value.as_bytes())
+                    .unwrap();
+            v2recs.push(RawRecordV2 { id, name: name.to_string(), ct });
+        }
+        header.header_mac = header.compute_mac_v2(dek, &v2recs);
+        let header_bytes = header.to_bytes();
+        let mut out = Vec::new();
+        put_bytes(&mut out, &header_bytes);
+        put_u32(&mut out, v2recs.len() as u32);
+        for r in &v2recs {
+            out.extend_from_slice(&r.id.to_le_bytes());
+            put_bytes(&mut out, r.name.as_bytes());
+            put_bytes(&mut out, &r.ct);
+        }
+        out
+    }
+
+    #[test]
+    fn migrates_v2_vault_to_v3_on_save() {
+        let dek = SecretBytes::from_exact(&[21u8; 32]);
+        let bytes = build_v2_file(&dek, &[("email", "hunter2"), ("bank", "1234")]);
+
+        let mut path = std::env::temp_dir();
+        path.push(format!("vaultcore_v2mig_{}.ztsv", std::process::id()));
+        std::fs::write(&path, &bytes).unwrap();
+
+        // A v2 file loads as v2 (exact count, plaintext names on disk).
+        let locked = LockedVault::load(&path).unwrap();
+        assert_eq!(locked.raw_record_count(), 2);
+        assert!(contains(&bytes, b"email"), "v2 stores names in plaintext");
+
+        // Unlock migrates in memory; the secrets are recoverable.
+        let vault = locked.unlock_with_dek(SecretBytes::from_exact(&[21u8; 32])).unwrap();
+        assert_eq!(vault.list().len(), 2);
+        assert_eq!(vault.get("email").unwrap().expose_str(), "hunter2");
+        assert_eq!(vault.get("bank").unwrap().expose_str(), "1234");
+
+        // A wrong DEK fails closed on the v2 MAC, before any migration.
+        let bad = LockedVault::load(&path).unwrap();
+        assert!(matches!(
+            bad.unlock_with_dek(SecretBytes::from_exact(&[9u8; 32])),
+            Err(Error::AuthFailed)
+        ));
+
+        // Saving upgrades the file to v3: version bumped, names + values encrypted,
+        // count padded with tombstones.
+        let mut vault = vault;
+        vault.save(&path).unwrap();
+        let after = std::fs::read(&path).unwrap();
+        assert_eq!(u16::from_le_bytes(after[8..10].try_into().unwrap()), FORMAT_VERSION);
+        assert!(!contains(&after, b"email"), "v3 must not store names in plaintext");
+        assert!(!contains(&after, b"hunter2"), "value must not be plaintext");
+
+        // The upgraded file reloads as v3 and still yields the secrets.
+        let locked3 = LockedVault::load(&path).unwrap();
+        assert_eq!(locked3.raw_record_count(), COUNT_BUCKET); // 2 real -> padded to 8
+        let v3 = locked3.unlock_with_dek(SecretBytes::from_exact(&[21u8; 32])).unwrap();
+        assert_eq!(v3.get("email").unwrap().expose_str(), "hunter2");
+        assert_eq!(v3.get("bank").unwrap().expose_str(), "1234");
+        std::fs::remove_file(&path).ok();
     }
 }

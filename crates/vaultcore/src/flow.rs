@@ -189,14 +189,25 @@ pub fn unlock(locked: LockedVault, factors: UnlockFactors) -> Result<Vault> {
     }
 }
 
-/// Unlock via the recovery escrow using the human-entered recovery CODE. The input
-/// is normalized (case, dashes and spacing tolerated; ambiguous O/I/L corrected)
-/// before deriving, so it matches however the user transcribed it. Fails closed on
-/// a wrong code or a vault with no recovery escrow. Both the CLI and GUI route
-/// recovery unlock through here so normalization lives in exactly one place.
-pub fn unlock_with_recovery_code(locked: LockedVault, code_input: &str) -> Result<Vault> {
-    let code = RecoveryCode::from_user_input(code_input);
-    locked.unlock_recovery(code.secret())
+/// Unlock via the recovery escrow using whatever the user typed. It first tries the
+/// input as a generated recovery CODE (normalized: case/dashes/spacing tolerated,
+/// ambiguous O/I/L corrected), then falls back to the RAW input as a passphrase —
+/// so a legacy human recovery passphrase (from a pre-code vault now migrating to v3)
+/// still works. Fails closed on a wrong secret or a vault with no recovery escrow.
+/// Both the CLI and GUI route recovery unlock through here.
+pub fn unlock_with_recovery_code(locked: LockedVault, input: &str) -> Result<Vault> {
+    // Try the normalized code form first (current scheme), then the raw input
+    // (legacy passphrase escrow). `recovery_dek` borrows, so both candidates can be
+    // tried before `unlock_with_dek` consumes `locked`.
+    let code = RecoveryCode::from_user_input(input);
+    let dek = match locked.recovery_dek(code.secret()) {
+        Ok(dek) => dek,
+        Err(_) => {
+            let raw = SecretString::from_string(input.to_string());
+            locked.recovery_dek(&raw)?
+        }
+    };
+    locked.unlock_with_dek(dek)
 }
 
 /// Acquires the TPM secret factor for a hardware-bound vault (unseals via the
@@ -341,6 +352,34 @@ mod tests {
         // A wrong code fails closed.
         let locked = LockedVault::load(&path).unwrap();
         assert!(unlock_with_recovery_code(locked, "0000-0000-0000-0000-0000-0000-00").is_err());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn recovery_accepts_legacy_passphrase_escrow() {
+        // Simulate a pre-code vault: recovery wrapped under a HUMAN passphrase.
+        // `unlock_with_recovery_code` must still open it (normalized-code attempt
+        // fails, raw-passphrase fallback succeeds).
+        let path = tmp("legacyrec");
+        let dek = SecretBytes::generate(32);
+        let kdf = Argon2Params { mem_kib: 8, time: 1, parallelism: 1, salt: [3u8; 16] };
+        let rkdf = Argon2Params { mem_kib: 8, time: 1, parallelism: 1, salt: [4u8; 16] };
+        let pass = SecretString::from_string(STRONG.into());
+        let legacy_rec = SecretString::from_string("my old recovery passphrase".into());
+        let dek_wrap = crate::envelope::wrap_dek(&dek, &pass, &kdf, None).unwrap();
+        let rec_wrap = crate::envelope::wrap_dek_recovery(&dek, &legacy_rec, &rkdf).unwrap();
+        let header = VaultHeader::new_v2(false, kdf, None, dek_wrap, Some((rec_wrap, rkdf)));
+        let mut v = Vault::new_unlocked(SecretBytes::from_exact(dek.expose()), header);
+        v.add("email", SecretString::from_string("hunter2".into())).unwrap();
+        v.save(&path).unwrap();
+
+        let locked = LockedVault::load(&path).unwrap();
+        let unlocked = unlock_with_recovery_code(locked, "my old recovery passphrase").unwrap();
+        assert_eq!(unlocked.get("email").unwrap().expose_str(), "hunter2");
+
+        // A wrong recovery secret still fails closed.
+        let locked = LockedVault::load(&path).unwrap();
+        assert!(unlock_with_recovery_code(locked, "not the passphrase").is_err());
         std::fs::remove_file(&path).ok();
     }
 

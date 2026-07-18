@@ -135,9 +135,12 @@ the DEK is non-plaintext between ops (needs an interactive Windows session).
 names + values padded to buckets (64 / 256 B), record count padded with tombstones
 to a multiple of 8 (min 8) and shuffled each save; header MAC now over the raw
 (encrypted) on-disk set. `LockedVault::record_names` removed (names encrypted → CLI
-`list` now unlocks; names are authenticated). No v2 read path (recreate-only, per
-project stance). "Values stay ciphertext in RAM until `get()`" preserved (only names
-decrypt at unlock). Verified empirically (name + value absent from the raw file;
+`list` now unlocks; names are authenticated). **v2 vaults are read and auto-migrated
+to v3 on the next save** (authenticated under the legacy MAC, values re-encrypted
+into the v3 layout; a legacy human recovery passphrase is still accepted via a
+raw-input fallback in `unlock_with_recovery_code`) — lossless, no recreate needed;
+only v1 stays recreate-only. "Values stay ciphertext in RAM until `get()`" preserved
+(only names decrypt at unlock). Verified empirically (name + value absent from the raw file;
 count padded) and by unit tests (65 vaultcore lib, +4; fuzz/proptest still total).
 Harness reworked: the "dump is real" sentinel is now the vault PATH (names no longer
 plaintext in a locked process) — code updated but the dump harness itself needs an
