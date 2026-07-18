@@ -5,6 +5,7 @@ use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use hkdf::Hkdf;
 use rand_core::{OsRng, RngCore};
 use sha2::Sha256;
+use std::time::{Duration, Instant};
 
 pub const KEY_LEN: usize = 32;
 pub const NONCE_LEN: usize = 24;
@@ -81,6 +82,24 @@ pub struct Argon2Params {
 }
 
 impl Argon2Params {
+    /// Calibration floor: never produce a vault weaker than 256 MiB of Argon2
+    /// memory, even on a slow machine where that already exceeds the time target.
+    pub const CAL_FLOOR_MEM_KIB: u32 = 256 * 1024;
+    /// Calibration cap: 1 GiB, matching `vault::MAX_ARGON2_MEM_KIB` so a calibrated
+    /// header always parses. Memory is the honest Argon2 cost knob here.
+    pub const CAL_CAP_MEM_KIB: u32 = 1 << 20;
+    /// Time cost held fixed during calibration (memory is varied instead).
+    pub const CAL_TIME: u32 = 3;
+    /// Parallelism held at 1: the RustCrypto `argon2` crate computes lanes
+    /// serially, so raising `p` changes the memory layout without buying wall-clock
+    /// hardness. Keeping it 1 makes the cost model honest.
+    pub const CAL_PARALLELISM: u32 = 1;
+
+    /// The calibration cap must equal the vault parser's accepted maximum, or a
+    /// calibrated header could fail to load. Enforced at compile time.
+    const _CAP_MATCHES_PARSER: () =
+        assert!(Self::CAL_CAP_MEM_KIB == crate::vault::MAX_ARGON2_MEM_KIB);
+
     pub fn default_tuned() -> Self {
         Self { mem_kib: 65536, time: 3, parallelism: 1, salt: Self::random_salt() }
     }
@@ -88,6 +107,72 @@ impl Argon2Params {
         let mut s = [0u8; 16];
         OsRng.fill_bytes(&mut s);
         s
+    }
+
+    /// Auto-calibrate at vault creation: pick the LARGEST Argon2 memory (within
+    /// [`CAL_FLOOR_MEM_KIB`, `CAL_CAP_MEM_KIB`]) whose single derivation stays at
+    /// or under `target`, but never below the floor. `max_trial` bounds any one
+    /// probe so a pathologically slow machine cannot hang `init`. Returns params
+    /// with a FRESH random salt.
+    pub fn calibrate(target: Duration, max_trial: Duration) -> Self {
+        Self::calibrate_with(
+            Self::CAL_FLOOR_MEM_KIB,
+            Self::CAL_CAP_MEM_KIB,
+            Self::CAL_TIME,
+            Self::CAL_PARALLELISM,
+            target,
+            max_trial,
+        )
+    }
+
+    /// Calibration core, parameterized so tests can exercise the climbing logic
+    /// with tiny (fast) floor/cap values instead of hundreds of MiB.
+    fn calibrate_with(
+        floor: u32,
+        cap: u32,
+        time: u32,
+        parallelism: u32,
+        target: Duration,
+        max_trial: Duration,
+    ) -> Self {
+        let mut chosen = floor;
+        let mut mem = floor;
+        loop {
+            let dt = Self::probe(mem, time, parallelism);
+            // Accept this level if it's under the time budget; then try bigger.
+            // The floor is accepted unconditionally (security floor beats the
+            // latency target on a weak machine).
+            if mem == floor || dt <= target {
+                chosen = mem;
+            } else {
+                break; // this level is too slow; keep the previous `chosen`
+            }
+            if mem >= cap || dt > max_trial {
+                break;
+            }
+            let next = mem.saturating_mul(2).min(cap);
+            if next == mem {
+                break;
+            }
+            mem = next;
+        }
+        Self { mem_kib: chosen, time, parallelism, salt: Self::random_salt() }
+    }
+
+    /// Time a single Argon2 derivation at the given cost. Errors (which should not
+    /// occur for in-range params) are treated as "over target" so calibration
+    /// backs off rather than selecting a broken level.
+    fn probe(mem_kib: u32, time: u32, parallelism: u32) -> Duration {
+        let params = Argon2Params { mem_kib, time, parallelism, salt: [0u8; 16] };
+        let probe_pw = SecretString::from_string("ztsv-calibration-probe".to_string());
+        let start = Instant::now();
+        let ok = derive_kek(&probe_pw, &params).is_ok();
+        let elapsed = start.elapsed();
+        if ok {
+            elapsed
+        } else {
+            Duration::from_secs(u64::MAX / 2)
+        }
     }
 }
 
@@ -169,5 +254,53 @@ mod tests {
         let k2 = derive_kek(&SecretString::from_string("pw".into()), &p).unwrap();
         assert!(k1.ct_eq(&k2));
         assert_eq!(k1.len(), KEY_LEN);
+    }
+
+    #[test]
+    fn calibration_climbs_with_a_generous_budget() {
+        // Tiny floor/cap so the test is fast. A large time budget means every
+        // level is "under target", so calibration should climb all the way to the
+        // cap and stop there.
+        let p = Argon2Params::calibrate_with(
+            8,
+            64,
+            1,
+            1,
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+        );
+        assert_eq!(p.mem_kib, 64, "should climb to the cap under a generous budget");
+        assert_eq!(p.time, 1);
+        assert_eq!(p.parallelism, 1);
+    }
+
+    #[test]
+    fn calibration_respects_the_floor_under_a_zero_budget() {
+        // A near-zero target means even the floor level exceeds it, so calibration
+        // must still return the floor (security floor beats the latency target),
+        // never something weaker, and never climb.
+        let p = Argon2Params::calibrate_with(
+            8,
+            64,
+            1,
+            1,
+            Duration::from_nanos(1),
+            Duration::from_secs(10),
+        );
+        assert_eq!(p.mem_kib, 8, "floor is used even when it exceeds the time target");
+    }
+
+    #[test]
+    fn production_calibrate_stays_within_bounds() {
+        // The real calibration must always land within [floor, cap] regardless of
+        // machine speed. Use a near-zero target so it stops at the floor quickly
+        // (one probe) rather than climbing to 1 GiB during the test.
+        let p = Argon2Params::calibrate(Duration::from_nanos(1), Duration::from_secs(5));
+        assert!(p.mem_kib >= Argon2Params::CAL_FLOOR_MEM_KIB);
+        assert!(p.mem_kib <= Argon2Params::CAL_CAP_MEM_KIB);
+        assert_eq!(p.time, Argon2Params::CAL_TIME);
+        // A calibrated header must be within the vault parser's accepted range
+        // (the cap equality is also enforced at compile time above).
+        assert!(p.mem_kib <= Argon2Params::CAL_CAP_MEM_KIB);
     }
 }

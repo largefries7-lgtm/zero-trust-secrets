@@ -3,10 +3,13 @@
 pub mod crypto;
 pub mod envelope;
 pub mod flow;
+pub mod hardening;
 pub mod keyprovider;
 pub mod memlock;
 pub mod passgen;
+pub mod recovery;
 pub mod secret;
+pub mod strength;
 pub mod vault;
 
 use thiserror::Error;
@@ -25,6 +28,10 @@ pub enum Error {
     Provider(String),
     #[error("vault is locked")]
     Locked,
+    /// The chosen passphrase failed the creation-time strength policy. Carries a
+    /// user-facing reason (never the passphrase itself).
+    #[error("weak passphrase: {0}")]
+    WeakPassphrase(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }

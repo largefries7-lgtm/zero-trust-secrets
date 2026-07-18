@@ -102,7 +102,7 @@ export component UnlockScreen inherits Rectangle {
                     }
 
                     pw := Field {
-                        placeholder: root.use-recovery ? "Recovery passphrase" : "Passphrase";
+                        placeholder: root.use-recovery ? "Recovery code" : "Passphrase";
                         masked: true;
                         accepted => { root.unlock(self.text, root.use-recovery); }
                     }
@@ -115,7 +115,7 @@ export component UnlockScreen inherits Rectangle {
                     HorizontalLayout {
                         alignment: center;
                         GhostButton {
-                            text: root.use-recovery ? "Use regular passphrase" : "Use recovery key";
+                            text: root.use-recovery ? "Use regular passphrase" : "Use recovery code";
                             width: 240px;
                             clicked => { root.use-recovery = !root.use-recovery; }
                         }

@@ -7,6 +7,18 @@ default-members = ["crates/vaultcore", "crates/vaultctl", "verify/dumper"]
 edition = "2021"
 rust-version = "1.96"
 
+# Release-build hardening (hardening program, phase 2).
+#
+# NOTE on panic strategy: we deliberately KEEP the default `panic = "unwind"`,
+# NOT "abort". Unwinding runs every `ZeroizeOnDrop` destructor on the way out, so
+# a panic still scrubs secrets from RAM — which is this project's central claim.
+# `abort` would skip destructors and leave plaintext in the dying process's pages.
+[profile.release]
+overflow-checks = true   # trap integer overflow (defends the untrusted-header parser) — panics unwind + zeroize
+lto = true               # whole-program optimization; also shrinks the attack surface
+codegen-units = 1        # better optimization determinism at the cost of build time
+strip = true             # ship no PDB/symbol info
+
 [workspace.dependencies]
 zeroize = { version = "1", features = ["derive"] }
 chacha20poly1305 = "0.10"

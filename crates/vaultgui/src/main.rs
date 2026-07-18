@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use slint::{ComponentHandle, SharedString, VecModel};
-use vaultcore::flow::{self, describe_provider, CreateOptions, UnlockFactors};
+use vaultcore::flow::{self, describe_provider, CreateOptions, KdfStrategy, UnlockFactors};
 use vaultcore::vault::{LockedVault, Vault};
 use vaultgui::prefs::{Prefs, Theme};
 use vaultgui::session::{AppState, Session};
@@ -131,6 +131,12 @@ fn do_lock(
 }
 
 fn main() -> Result<(), slint::PlatformError> {
+    // Best-effort process hardening, applied as early as possible: Windows
+    // exploit-mitigation policies (block extension-point / remote / low-integrity
+    // DLL injection into this long-lived, DEK-holding process) and suppress the
+    // crash UI. No-op on other platforms. See vaultcore::hardening.
+    let _ = vaultcore::hardening::harden_process();
+
     // Verification-harness-only entry point (see leaktest.rs). Checked FIRST,
     // before any normal UI is built, so the harness can drive this process
     // into a precise state without ever running the real event loop. Not
@@ -278,7 +284,9 @@ fn main() -> Result<(), slint::PlatformError> {
             match LockedVault::load(vault_path.borrow().as_path()) {
                 Ok(locked) => {
                     let outcome = if recovery {
-                        flow::unlock(locked, UnlockFactors::Recovery { recovery_passphrase: &pass })
+                        // Recovery input is a generated CODE: normalize (case /
+                        // dashes / spacing tolerant) inside the shared helper.
+                        flow::unlock_with_recovery_code(locked, pass.expose_str())
                     } else {
                         flow::unlock(locked, UnlockFactors::TwoFactor { passphrase: &pass })
                     };
@@ -317,21 +325,21 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let w = app.as_weak();
         let vault_path = vault_path.clone();
-        app.on_create_vault(move |passphrase, confirm, allow_no_tpm, use_recovery, recovery_passphrase| {
+        app.on_create_vault(move |passphrase, confirm, allow_no_tpm, use_recovery| {
             let app = w.unwrap();
             if passphrase != confirm {
                 app.set_error("Passphrases do not match.".into());
                 return;
             }
             let pass = input::drain_to_secret(&mut passphrase.to_string());
-            let rec = if use_recovery {
-                Some(input::drain_to_secret(&mut recovery_passphrase.to_string()))
-            } else {
-                None
-            };
             match flow::create_vault(
                 vault_path.borrow().as_path(),
-                CreateOptions { allow_no_tpm, passphrase: pass, recovery_passphrase: rec },
+                CreateOptions {
+                    allow_no_tpm,
+                    passphrase: pass,
+                    recovery: use_recovery,
+                    kdf: KdfStrategy::Calibrate,
+                },
             ) {
                 Ok(outcome) => {
                     app.set_error("".into());
@@ -341,9 +349,57 @@ fn main() -> Result<(), slint::PlatformError> {
                         posture_string(outcome.hardware_bound, outcome.has_recovery).into(),
                     );
                     app.set_posture_authenticated(false);
-                    app.set_screen("unlock".into());
+                    // If an escrow was requested, reveal the generated code ONCE
+                    // before moving on to unlock; otherwise go straight to unlock.
+                    match outcome.recovery_code {
+                        Some(code) => {
+                            app.set_recovery_code(code.into());
+                            app.set_screen("recovery-code".into());
+                        }
+                        None => app.set_screen("unlock".into()),
+                    }
                 }
                 Err(e) => app.set_error(format!("Could not create vault: {e}").into()),
+            }
+        });
+    }
+
+    // Live passphrase-strength scoring for the create screen. Reads a transient
+    // &str view of the typed passphrase (no owned secret copy is retained) and
+    // drives the meter + submit gate. The floor depends on the factor choice.
+    {
+        let w = app.as_weak();
+        app.on_check_strength(move |passphrase, allow_no_tpm| {
+            let app = w.unwrap();
+            let policy = if allow_no_tpm {
+                vaultcore::strength::Policy::single_factor()
+            } else {
+                vaultcore::strength::Policy::two_factor()
+            };
+            match vaultcore::strength::check(passphrase.as_str(), &policy) {
+                Ok(()) => {
+                    let bits = vaultcore::strength::estimate(passphrase.as_str()).bits;
+                    app.set_strength_ok(true);
+                    app.set_strength_hint(format!("Strong enough (~{bits:.0} bits)").into());
+                }
+                Err(weakness) => {
+                    app.set_strength_ok(false);
+                    app.set_strength_hint(format!("Too weak — {weakness}").into());
+                }
+            }
+        });
+    }
+
+    // Copy the one-time recovery code to the clipboard (30s auto-clear; longer
+    // than a secret value's 15s because the code is longer to transcribe).
+    {
+        let w = app.as_weak();
+        app.on_copy_recovery_code(move || {
+            let app = w.unwrap();
+            let code = app.get_recovery_code();
+            if !code.is_empty() {
+                let _ = clipboard::copy_with_autoclear(&code, 30);
+                app.set_clip_remaining(30);
             }
         });
     }

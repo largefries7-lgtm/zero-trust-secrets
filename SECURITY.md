@@ -17,6 +17,108 @@ cannot defend against a compromised kernel, a debugger attached to the live
 already-unlocked machine. It aims to be as strong as is *actually achievable*
 below that ceiling, and to state honestly where the ceiling is.
 
+### Passphrase-factor hardening (hardening program, phase 1)
+
+The most realistic attack on a local vault is offline brute force of a *stolen
+file*. Three measures raise that floor, none of which change the on-disk format or
+add a dependency:
+
+- **Auto-calibrated Argon2id.** At vault creation the passphrase KDF cost is
+  benchmarked on the machine and set to the largest memory (256 MiB floor, 1 GiB
+  cap) that keeps unlock near ~0.75 s — typically 512 MiB–1 GiB on modern hardware,
+  up from a fixed 64 MiB. The floor wins over the latency target on a slow machine,
+  so a weak machine cannot silently mint a weak vault. Parameters live in the
+  authenticated header, bounded by the parser's DoS ceiling.
+- **Creation-time strength gate.** A passphrase below a length + character-class
+  entropy floor, or on an embedded common-password blocklist, is refused. The floor
+  is context-aware: stricter for a passphrase-only (`--allow-no-tpm`) vault, where
+  the passphrase is the sole factor, than for a two-factor vault. This is a *floor,
+  not a strength promise* — it catches weak passphrases, it does not certify strong
+  ones (the honest tradeoff for not adding a zxcvbn-grade dependency).
+- **Generated recovery code.** The optional escrow (still off by default) no longer
+  takes a human passphrase — the weakest link when enabled. It generates a 128-bit
+  code (Crockford base32, shown once, stored offline), so a stolen vault with the
+  escrow is still protected by 128 bits, not by whatever a human chose. The code
+  wraps the DEK through the same envelope construction; no new cryptography.
+
+### Process & RAM hardening (hardening program, phase 2)
+
+Windows-specific measures that raise the bar against same-user attackers, all
+strictly below the userspace ceiling (a compromised kernel or code injected into
+the *unlocked* process still wins — stated plainly):
+
+- **Build-time exploit mitigations.** The shipped binaries are compiled with
+  Control Flow Guard (`-Ccontrol-flow-guard`) and marked CET-compatible
+  (`/CETCOMPAT`) for a hardware shadow stack; ASLR, high-entropy VA and DEP/NX are
+  MSVC defaults. Verified present in the release image (`DllCharacteristics`
+  includes `GUARD_CF | DYNAMIC_BASE | HIGH_ENTROPY_VA | NX_COMPAT`). The release
+  profile also enables `overflow-checks` (traps integer overflow in the untrusted-
+  header parser), LTO, and symbol stripping. Panic strategy stays **unwind** on
+  purpose, so `ZeroizeOnDrop` still scrubs secrets even on a panic.
+- **Runtime mitigation policies.** At startup both binaries call
+  `SetProcessMitigationPolicy` to disable extension points (legacy AppInit /
+  `SetWindowsHookEx` DLL injection) and to refuse loading DLLs from remote or
+  low-integrity locations, and `SetErrorMode` to suppress the crash UI. ACG
+  (dynamic-code prohibition) and signature-only image loading are deliberately
+  **not** enabled — they can break the GUI's third-party GPU-driver DLL loads; that
+  tradeoff is stated rather than risked silently.
+- **DEK encrypted at rest in RAM.** `vaultgui` holds the DEK for a whole unlocked
+  session — the GUI's headline new surface. The DEK is now kept
+  `CryptProtectMemory`-encrypted (`SAME_PROCESS`) between operations and decrypted
+  only transiently, for the microseconds of a single crypto op, into a page-locked
+  buffer that is zeroized immediately after. This shrinks the cold-boot / passive-
+  scrape window: between operations there is no plaintext DEK in memory. It does
+  **not** stop code executing inside the process (it can call `CryptUnprotectMemory`
+  too) — the same ceiling, narrowed in time.
+
+### TPM PCR sealing (hardening program, phase 4) — status
+
+Binding the DEK to a **boot state** (PCR policy) and a **TPM PIN** (hardware
+dictionary-attack lockout) would be the deepest hardware hardening, but on the
+Windows CNG path it is **not available**, and the alternatives cannot be delivered
+safely in the current environment:
+
+- **CNG cannot express PCR-policy sealing** (documented limitation); the DEK stays
+  bound to the TPM's non-exportable *platform key* — device-bound, not boot-state
+  bound.
+- **`tss-esapi`** (the usual Rust TSS binding) targets the Linux `tpm2-tss` C
+  libraries and **fails to build on this Windows-first target**, so it cannot be
+  adopted without breaking the build and the supply-chain gate.
+- The only Windows-viable route is hand-built TPM2 commands over **TBS**, which
+  **must be validated against real TPM hardware** (with data-loss tests) before
+  shipping — an unverified implementation could permanently lock a vault.
+
+Rather than ship unverified TPM code, this remains **specified and deferred** (see
+the phase-4 section of the design spec for the concrete TBS/TPM2 plan). What ships
+now is honesty: `vaultctl seal-status` states the ceiling explicitly
+(`pcr_policy: none — device-bound …, NOT sealed to a PCR/boot state`) so it is never
+implied to be stronger than it is.
+
+### Metadata encryption — format v3 (hardening program, phase 3)
+
+Previously a stolen `.ztsv` leaked its record **names** (authenticated, but stored
+in plaintext), the exact size of every name and value, and the record count.
+Format v3 closes all three:
+
+- **Encrypted names.** Each record's name is encrypted under its own per-record
+  HKDF subkey (distinct from the value's), so the file no longer reveals what
+  accounts it holds. Listing names now requires unlocking — and the names shown are
+  therefore *authenticated*, eliminating the old "unauthenticated metadata" caveat.
+- **Padded sizes.** Names and values are padded to fixed size buckets before
+  encryption, so a record's on-disk length reveals only a coarse bucket, not the
+  real length.
+- **Padded count.** The record set is padded with indistinguishable *tombstone*
+  records up to a count bucket (minimum 8, so even an empty vault looks like 8
+  records), and real vs tombstone positions are shuffled on every save. The count
+  is revealed only to a coarse bucket. Tombstones are inside the authenticated
+  set and filtered out at unlock.
+
+The DEK envelope and AEAD/MAC constructions are unchanged; no new primitive. This
+is a breaking on-disk change — consistent with this project's "recreate to upgrade"
+stance, the build reads only v3 (one format, minimal parser surface), so a pre-v3
+vault must be recreated. Verified empirically: a distinctive record name and value
+do not appear anywhere in the raw file, and the on-disk record count is padded.
+
 ### New surfaces introduced by the GUI (slice 2)
 
 `vaultgui` inverts the CLI's stateless model on purpose: it is the long-lived

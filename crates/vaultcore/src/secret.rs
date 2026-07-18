@@ -111,6 +111,72 @@ impl fmt::Debug for SecretString {
     }
 }
 
+/// A key held ENCRYPTED at rest in process RAM (Windows: `CryptProtectMemory`,
+/// `SAME_PROCESS`), decrypted only transiently — for the duration of a single
+/// crypto operation — via [`ProtectedDek::reveal`]. Between operations no
+/// plaintext key sits in memory, shrinking the cold-boot / passive-scrape window.
+///
+/// Threat scope (hardening program, phase 2): this defends against PASSIVE reads
+/// of this process's memory (a cold-boot attack, a memory dump, another process
+/// reading our pages) *between* operations. It does NOT defend against code
+/// executing INSIDE this process (injection/debugger), which can call
+/// `CryptUnprotectMemory` itself — that remains the documented userspace ceiling.
+/// On non-Windows targets there is no OS memory encryption, so the key is held in
+/// the same page-locked, zeroize-on-drop buffer as everything else (still scrubbed
+/// on drop) and `reveal` simply copies it.
+pub struct ProtectedDek {
+    /// The key, padded to a multiple of the CryptProtectMemory block size and, when
+    /// `protected`, encrypted in place. Always page-locked + zeroized on drop.
+    blob: SecretBytes,
+    /// The original (unpadded) key length.
+    len: usize,
+    /// Whether OS memory encryption is actually active over `blob`.
+    protected: bool,
+}
+
+impl ProtectedDek {
+    /// Wrap `dek`, encrypting it at rest if the OS supports it. Consumes and
+    /// zeroizes the incoming `dek`.
+    pub fn new(dek: SecretBytes) -> Self {
+        let len = dek.len();
+        let block = crate::hardening::BLOCK;
+        let padded = len.div_ceil(block).max(1) * block;
+        let mut blob = SecretBytes::zeros(padded);
+        blob.expose_mut()[..len].copy_from_slice(dek.expose());
+        // `dek` drops here, zeroized.
+        let protected = crate::hardening::protect_in_place(blob.expose_mut());
+        ProtectedDek { blob, len, protected }
+    }
+
+    /// Reveal a transient plaintext copy of the key for one operation. The returned
+    /// `SecretBytes` is page-locked and zeroized on drop; keep it alive only as long
+    /// as the operation needs it.
+    pub fn reveal(&self) -> SecretBytes {
+        let mut work = SecretBytes::from_exact(self.blob.expose());
+        if self.protected {
+            // Best-effort: if this fails the bytes stay as-is (ciphertext) and the
+            // downstream AEAD/MAC will simply fail closed rather than use a wrong key.
+            let _ = crate::hardening::unprotect_in_place(work.expose_mut());
+        }
+        let out = SecretBytes::from_exact(&work.expose()[..self.len]);
+        out
+        // `work` drops here, zeroized.
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+impl fmt::Debug for ProtectedDek {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ProtectedDek(***{} bytes, protected={}***)", self.len, self.protected)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

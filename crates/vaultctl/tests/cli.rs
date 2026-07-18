@@ -4,14 +4,33 @@
 
 use std::process::Command;
 
+/// A passphrase that clears the single-factor strength floor (mixed classes, 22
+/// chars). Vault creation now rejects weak passphrases, so the fixtures use this.
+const PW: &str = "Tq7!vK2m-Zp9x_Lw3r#Hs6";
+
 fn bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_vaultctl"))
+    let mut c = Command::new(env!("CARGO_BIN_EXE_vaultctl"));
+    // DEBUG-only escape hatch: use a cheap fixed Argon2 cost so `init` doesn't pay
+    // the (deliberately expensive) production calibration on every spawn. Release
+    // binaries ignore this env var entirely.
+    c.env("ZTSV_KDF_FIXED_FOR_TESTS", "1");
+    c
 }
 
 fn unique_dir(tag: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("ztsv-cli-{}-{}", tag, std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     dir
+}
+
+/// Pull the one-time recovery code out of `init --recovery` stdout.
+fn extract_recovery_code(stdout: &str) -> String {
+    stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("recovery code: "))
+        .expect("init --recovery should print a recovery code")
+        .trim()
+        .to_string()
 }
 
 #[test]
@@ -21,24 +40,24 @@ fn init_add_get_list_roundtrip() {
     let vs = v.to_str().unwrap();
 
     assert!(bin()
-        .args(["--vault", vs, "init", "--allow-no-tpm", "--passphrase", "pw"])
+        .args(["--vault", vs, "init", "--allow-no-tpm", "--passphrase", PW])
         .status()
         .unwrap()
         .success());
     assert!(bin()
-        .args(["--vault", vs, "add", "email", "--value", "hunter2", "--passphrase", "pw"])
+        .args(["--vault", vs, "add", "email", "--value", "hunter2", "--passphrase", PW])
         .status()
         .unwrap()
         .success());
 
     let out = bin()
-        .args(["--vault", vs, "get", "email", "--passphrase", "pw"])
+        .args(["--vault", vs, "get", "email", "--passphrase", PW])
         .output()
         .unwrap();
     assert!(out.status.success());
     assert!(String::from_utf8_lossy(&out.stdout).contains("hunter2"));
 
-    let list = bin().args(["--vault", vs, "list"]).output().unwrap();
+    let list = bin().args(["--vault", vs, "list", "--passphrase", PW]).output().unwrap();
     assert!(list.status.success());
     assert!(String::from_utf8_lossy(&list.stdout).contains("email"));
 
@@ -53,37 +72,58 @@ fn init_add_get_list_roundtrip() {
 }
 
 #[test]
-fn recovery_escrow_unlocks_and_seal_status_reports_it() {
+fn weak_passphrase_is_rejected_on_init() {
+    let dir = unique_dir("weakpw");
+    let v = dir.join("v.ztsv");
+    let vs = v.to_str().unwrap();
+
+    // A common passphrase must be refused, and no vault file left behind.
+    let out = bin()
+        .args(["--vault", vs, "init", "--allow-no-tpm", "--passphrase", "password1"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).to_lowercase().contains("weak"));
+    assert!(!v.exists(), "a rejected init must not leave a vault file");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn recovery_code_unlocks_and_seal_status_reports_it() {
     let dir = unique_dir("recovery");
     let v = dir.join("v.ztsv");
     let vs = v.to_str().unwrap();
 
-    // Vault with an opt-in recovery escrow (separate recovery passphrase).
+    // Vault with an opt-in recovery escrow: a 128-bit code is generated + printed.
+    let init = bin()
+        .args(["--vault", vs, "init", "--allow-no-tpm", "--passphrase", PW, "--recovery"])
+        .output()
+        .unwrap();
+    assert!(init.status.success());
+    let code = extract_recovery_code(&String::from_utf8_lossy(&init.stdout));
+
     assert!(bin()
-        .args([
-            "--vault", vs, "init", "--allow-no-tpm", "--passphrase", "unlockpw", "--recovery",
-            "--recovery-passphrase", "recpw",
-        ])
-        .status()
-        .unwrap()
-        .success());
-    assert!(bin()
-        .args(["--vault", vs, "add", "email", "--value", "hunter2", "--passphrase", "unlockpw"])
+        .args(["--vault", vs, "add", "email", "--value", "hunter2", "--passphrase", PW])
         .status()
         .unwrap()
         .success());
 
-    // Unlock via the recovery escrow (single factor).
+    // Unlock via the recovery code (single factor) — lower-cased to prove the
+    // CLI normalizes user input.
     let out = bin()
-        .args(["--vault", vs, "get", "email", "--recovery", "--recovery-passphrase", "recpw"])
+        .args(["--vault", vs, "get", "email", "--recovery", "--recovery-code", &code.to_lowercase()])
         .output()
         .unwrap();
     assert!(out.status.success());
     assert!(String::from_utf8_lossy(&out.stdout).contains("hunter2"));
 
-    // Wrong recovery passphrase fails.
+    // Wrong recovery code fails.
     assert!(!bin()
-        .args(["--vault", vs, "get", "email", "--recovery", "--recovery-passphrase", "wrong"])
+        .args([
+            "--vault", vs, "get", "email", "--recovery", "--recovery-code",
+            "0000-0000-0000-0000-0000-0000-00",
+        ])
         .status()
         .unwrap()
         .success());
@@ -102,53 +142,53 @@ fn add_rejects_duplicate_force_replaces_and_rm_removes() {
     let vs = v.to_str().unwrap();
 
     assert!(bin()
-        .args(["--vault", vs, "init", "--allow-no-tpm", "--passphrase", "pw"])
+        .args(["--vault", vs, "init", "--allow-no-tpm", "--passphrase", PW])
         .status()
         .unwrap()
         .success());
     assert!(bin()
-        .args(["--vault", vs, "add", "email", "--value", "old", "--passphrase", "pw"])
+        .args(["--vault", vs, "add", "email", "--value", "old", "--passphrase", PW])
         .status()
         .unwrap()
         .success());
 
     // A second plain `add` of the same name must FAIL (no silent shadowing)...
     assert!(!bin()
-        .args(["--vault", vs, "add", "email", "--value", "new", "--passphrase", "pw"])
+        .args(["--vault", vs, "add", "email", "--value", "new", "--passphrase", PW])
         .status()
         .unwrap()
         .success());
     // ...and the original value is untouched.
     let out = bin()
-        .args(["--vault", vs, "get", "email", "--passphrase", "pw"])
+        .args(["--vault", vs, "get", "email", "--passphrase", PW])
         .output()
         .unwrap();
     assert!(String::from_utf8_lossy(&out.stdout).contains("old"));
 
     // `add --force` rotates the value in place.
     assert!(bin()
-        .args(["--vault", vs, "add", "email", "--value", "new", "--force", "--passphrase", "pw"])
+        .args(["--vault", vs, "add", "email", "--value", "new", "--force", "--passphrase", PW])
         .status()
         .unwrap()
         .success());
     let out = bin()
-        .args(["--vault", vs, "get", "email", "--passphrase", "pw"])
+        .args(["--vault", vs, "get", "email", "--passphrase", PW])
         .output()
         .unwrap();
     let got = String::from_utf8_lossy(&out.stdout);
     assert!(got.contains("new"), "expected rotated value, got: {got}");
     // Exactly one record named `email` remains (no duplicate left behind).
-    let list = bin().args(["--vault", vs, "list"]).output().unwrap();
+    let list = bin().args(["--vault", vs, "list", "--passphrase", PW]).output().unwrap();
     assert_eq!(String::from_utf8_lossy(&list.stdout).matches("email").count(), 1);
 
     // `rm` deletes the record; a subsequent `get` fails.
     assert!(bin()
-        .args(["--vault", vs, "rm", "email", "--passphrase", "pw"])
+        .args(["--vault", vs, "rm", "email", "--passphrase", PW])
         .status()
         .unwrap()
         .success());
     assert!(!bin()
-        .args(["--vault", vs, "get", "email", "--passphrase", "pw"])
+        .args(["--vault", vs, "get", "email", "--passphrase", PW])
         .status()
         .unwrap()
         .success());
@@ -157,23 +197,24 @@ fn add_rejects_duplicate_force_replaces_and_rm_removes() {
 }
 
 #[test]
-fn init_recovery_passphrase_requires_recovery_flag() {
+fn recovery_code_requires_recovery_flag() {
     let dir = unique_dir("requires-recovery");
     let v = dir.join("v.ztsv");
     let vs = v.to_str().unwrap();
 
-    // Passing --recovery-passphrase without --recovery must be rejected, not
-    // silently ignored (which would leave the user believing they set up an
-    // escrow that does not exist).
-    assert!(!bin()
-        .args([
-            "--vault", vs, "init", "--allow-no-tpm", "--passphrase", "pw",
-            "--recovery-passphrase", "recpw",
-        ])
+    assert!(bin()
+        .args(["--vault", vs, "init", "--allow-no-tpm", "--passphrase", PW])
         .status()
         .unwrap()
         .success());
-    assert!(!v.exists(), "no vault should be created on a rejected init");
+
+    // Passing --recovery-code without --recovery must be rejected by clap, not
+    // silently ignored (which could mislead the user about which factor is used).
+    assert!(!bin()
+        .args(["--vault", vs, "get", "email", "--recovery-code", "XXXX-XXXX"])
+        .status()
+        .unwrap()
+        .success());
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -185,13 +226,13 @@ fn init_refuses_to_clobber_existing_vault() {
     let vs = v.to_str().unwrap();
 
     assert!(bin()
-        .args(["--vault", vs, "init", "--allow-no-tpm", "--passphrase", "pw"])
+        .args(["--vault", vs, "init", "--allow-no-tpm", "--passphrase", PW])
         .status()
         .unwrap()
         .success());
     // second init on the same path must fail (do not overwrite).
     assert!(!bin()
-        .args(["--vault", vs, "init", "--allow-no-tpm", "--passphrase", "pw"])
+        .args(["--vault", vs, "init", "--allow-no-tpm", "--passphrase", PW])
         .status()
         .unwrap()
         .success());
@@ -200,33 +241,34 @@ fn init_refuses_to_clobber_existing_vault() {
 }
 
 #[test]
-fn list_flags_names_as_unauthenticated_metadata() {
-    let dir = unique_dir("list-unauth");
+fn list_requires_unlock_and_shows_authenticated_names() {
+    let dir = unique_dir("list-unlock");
     let v = dir.join("v.ztsv");
     let vs = v.to_str().unwrap();
 
     assert!(bin()
-        .args(["--vault", vs, "init", "--allow-no-tpm", "--passphrase", "pw"])
+        .args(["--vault", vs, "init", "--allow-no-tpm", "--passphrase", PW])
         .status()
         .unwrap()
         .success());
     assert!(bin()
-        .args(["--vault", vs, "add", "email", "--value", "x", "--passphrase", "pw"])
+        .args(["--vault", vs, "add", "email", "--value", "x", "--passphrase", PW])
         .status()
         .unwrap()
         .success());
 
-    let out = bin().args(["--vault", vs, "list"]).output().unwrap();
+    // As of format v3 names are encrypted, so `list` unlocks: with the passphrase
+    // the (decrypted + authenticated) name is shown on clean stdout.
+    let out = bin().args(["--vault", vs, "list", "--passphrase", PW]).output().unwrap();
     assert!(out.status.success());
-    // Names stay on clean stdout (pipe-friendly)...
     assert!(String::from_utf8_lossy(&out.stdout).contains("email"));
-    // ...and the trust-boundary advisory goes to stderr, so `list` never
-    // presents unauthenticated names as if they were verified.
-    let stderr = String::from_utf8_lossy(&out.stderr).to_lowercase();
-    assert!(
-        stderr.contains("unauthenticated"),
-        "list should flag names as unauthenticated; stderr was: {stderr:?}"
-    );
+
+    // Without the correct passphrase, names cannot be decrypted -> list fails.
+    assert!(!bin()
+        .args(["--vault", vs, "list", "--passphrase", "wrong"])
+        .status()
+        .unwrap()
+        .success());
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -255,13 +297,36 @@ fn gen_without_symbols_is_alphanumeric_and_exact_length() {
 }
 
 #[test]
+fn seal_status_states_the_pcr_ceiling() {
+    // seal-status must be explicit that the DEK is device-bound, NOT PCR/boot-state
+    // sealed (the honest hardware-binding ceiling on the CNG path).
+    let dir = unique_dir("sealstatus-pcr");
+    let v = dir.join("v.ztsv");
+    let vs = v.to_str().unwrap();
+    assert!(bin()
+        .args(["--vault", vs, "init", "--allow-no-tpm", "--passphrase", PW])
+        .status()
+        .unwrap()
+        .success());
+    let out = bin().args(["--vault", vs, "seal-status"]).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("pcr_policy:"), "seal-status must report pcr_policy: {stdout}");
+    assert!(
+        stdout.to_lowercase().contains("not sealed to a pcr")
+            || stdout.to_lowercase().contains("device-bound"),
+        "seal-status must state the device-bound (non-PCR) ceiling: {stdout}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn seal_status_reports_no_hardware_binding() {
     let dir = unique_dir("sealstatus");
     let v = dir.join("v.ztsv");
     let vs = v.to_str().unwrap();
 
     assert!(bin()
-        .args(["--vault", vs, "init", "--allow-no-tpm", "--passphrase", "pw"])
+        .args(["--vault", vs, "init", "--allow-no-tpm", "--passphrase", PW])
         .status()
         .unwrap()
         .success());
@@ -285,7 +350,7 @@ fn seal_status_recovery_only_does_not_claim_tpm() {
     let vs = v.to_str().unwrap();
 
     assert!(bin()
-        .args(["--vault", vs, "init", "--allow-no-tpm", "--passphrase", "pw"])
+        .args(["--vault", vs, "init", "--allow-no-tpm", "--passphrase", PW])
         .status()
         .unwrap()
         .success());

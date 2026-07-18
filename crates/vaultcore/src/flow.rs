@@ -5,10 +5,39 @@
 
 use crate::crypto::Argon2Params;
 use crate::envelope;
+use crate::recovery::RecoveryCode;
 use crate::secret::{SecretBytes, SecretString};
+use crate::strength::{self, Policy};
 use crate::vault::{LockedVault, Vault, VaultHeader};
 use crate::{Error, Result};
 use std::path::Path;
+use std::time::Duration;
+
+/// Target unlock latency the KDF auto-calibration aims for at vault creation.
+const KDF_CALIBRATION_TARGET: Duration = Duration::from_millis(750);
+/// Per-probe safety bound so calibration can't hang `init` on a very slow machine.
+const KDF_CALIBRATION_MAX_TRIAL: Duration = Duration::from_secs(3);
+
+/// How the Argon2id passphrase KDF cost is chosen for a new vault.
+pub enum KdfStrategy {
+    /// Auto-calibrate at creation to `KDF_CALIBRATION_TARGET` (floor 256 MiB, cap
+    /// 1 GiB). This is what production callers use.
+    Calibrate,
+    /// Use exactly these parameters. For tests and advanced callers that must
+    /// avoid the (deliberately expensive) calibration.
+    Fixed(Argon2Params),
+}
+
+impl KdfStrategy {
+    fn resolve(&self) -> Argon2Params {
+        match self {
+            KdfStrategy::Calibrate => {
+                Argon2Params::calibrate(KDF_CALIBRATION_TARGET, KDF_CALIBRATION_MAX_TRIAL)
+            }
+            KdfStrategy::Fixed(p) => *p,
+        }
+    }
+}
 
 #[cfg(windows)]
 use crate::keyprovider::{CngPcpProvider, KeyProvider, RecoveryProvider, SealedBlob};
@@ -31,13 +60,22 @@ pub enum TpmBinding {
 pub struct CreateOptions {
     pub allow_no_tpm: bool,
     pub passphrase: SecretString,
-    pub recovery_passphrase: Option<SecretString>,
+    /// Opt in to a single-factor recovery escrow. When set, `create_vault`
+    /// generates a 128-bit recovery CODE (not a human passphrase) and returns it
+    /// once in `CreateOutcome::recovery_code`.
+    pub recovery: bool,
+    /// How to choose the Argon2id cost. Production uses `Calibrate`.
+    pub kdf: KdfStrategy,
 }
 
 pub struct CreateOutcome {
     pub hardware_bound: bool,
     pub has_recovery: bool,
     pub tpm: TpmBinding,
+    /// The generated recovery code in its human-facing grouped form, present iff
+    /// `recovery` was requested. Shown to the user ONCE and never stored; the
+    /// caller must display it and then let it drop.
+    pub recovery_code: Option<String>,
 }
 
 pub enum UnlockFactors<'a> {
@@ -93,28 +131,43 @@ pub fn create_vault(path: &Path, opts: CreateOptions) -> Result<CreateOutcome> {
 
     let result = (|| -> Result<CreateOutcome> {
         let dek = SecretBytes::generate(32);
-        let kdf = Argon2Params::default_tuned();
 
+        // Acquire the TPM factor FIRST so we know whether the vault will be
+        // hardware-bound, which selects the passphrase-strength policy: a
+        // single-factor (no-TPM) vault must clear a higher floor than a
+        // two-factor one, because the passphrase is then the ONLY thing between a
+        // stolen file and the secrets.
         let (tpm_wrap, tpm_secret, tpm) = acquire_tpm_factor(opts.allow_no_tpm);
         let hardware_bound = matches!(tpm, TpmBinding::Bound);
 
+        let policy = if hardware_bound { Policy::two_factor() } else { Policy::single_factor() };
+        strength::check(opts.passphrase.expose_str(), &policy)
+            .map_err(|w| Error::WeakPassphrase(w.to_string()))?;
+
+        // Auto-calibrated (or fixed, for tests) Argon2id cost.
+        let kdf = opts.kdf.resolve();
+
         let dek_wrap = envelope::wrap_dek(&dek, &opts.passphrase, &kdf, tpm_secret.as_ref())?;
 
-        let has_recovery = opts.recovery_passphrase.is_some();
-        let recovery_pair = match &opts.recovery_passphrase {
-            Some(rp) => {
-                let rkdf = Argon2Params::default_tuned();
-                let rw = envelope::wrap_dek_recovery(&dek, rp, &rkdf)?;
-                Some((rw, rkdf))
-            }
-            None => None,
+        // Optional recovery escrow: a generated 128-bit code, not a human
+        // passphrase. Reuse the primary KDF's cost with a fresh salt (the code is
+        // already 128-bit, so the KDF here is defense-in-depth) to avoid a second
+        // expensive calibration pass.
+        let (recovery_pair, recovery_code) = if opts.recovery {
+            let code = RecoveryCode::generate();
+            let rkdf = Argon2Params { salt: Argon2Params::random_salt(), ..kdf };
+            let rw = envelope::wrap_dek_recovery(&dek, code.secret(), &rkdf)?;
+            (Some((rw, rkdf)), Some(code.display()))
+        } else {
+            (None, None)
         };
+        let has_recovery = recovery_pair.is_some();
 
         let header = VaultHeader::new_v2(hardware_bound, kdf, tpm_wrap, dek_wrap, recovery_pair);
         let mut vault = Vault::new_unlocked(dek, header);
         vault.save(path)?;
 
-        Ok(CreateOutcome { hardware_bound, has_recovery, tpm })
+        Ok(CreateOutcome { hardware_bound, has_recovery, tpm, recovery_code })
     })();
 
     if result.is_err() {
@@ -134,6 +187,16 @@ pub fn unlock(locked: LockedVault, factors: UnlockFactors) -> Result<Vault> {
             locked.unlock_two_factor(passphrase, tpm_secret.as_ref())
         }
     }
+}
+
+/// Unlock via the recovery escrow using the human-entered recovery CODE. The input
+/// is normalized (case, dashes and spacing tolerated; ambiguous O/I/L corrected)
+/// before deriving, so it matches however the user transcribed it. Fails closed on
+/// a wrong code or a vault with no recovery escrow. Both the CLI and GUI route
+/// recovery unlock through here so normalization lives in exactly one place.
+pub fn unlock_with_recovery_code(locked: LockedVault, code_input: &str) -> Result<Vault> {
+    let code = RecoveryCode::from_user_input(code_input);
+    locked.unlock_recovery(code.secret())
 }
 
 /// Acquires the TPM secret factor for a hardware-bound vault (unseals via the
@@ -189,6 +252,10 @@ pub fn describe_provider(header: &VaultHeader) -> String {
 mod tests {
     use super::*;
 
+    /// A passphrase comfortably above the single-factor floor (mixed classes, 22
+    /// chars ≈ 140+ bits), so it clears the creation strength gate in tests.
+    const STRONG: &str = "Gv7!kQ2m-Zp9x_Lw3r#Ht6";
+
     fn tmp(tag: &str) -> std::path::PathBuf {
         let mut p = std::env::temp_dir();
         p.push(format!("vaultcore_flow_{}_{}.ztsv", tag, std::process::id()));
@@ -196,76 +263,84 @@ mod tests {
         p
     }
 
+    /// Cheap fixed KDF so tests don't pay the (deliberately expensive) production
+    /// calibration.
+    fn fast_kdf() -> KdfStrategy {
+        KdfStrategy::Fixed(Argon2Params { mem_kib: 8, time: 1, parallelism: 1, salt: [7u8; 16] })
+    }
+
+    fn create_opts(recovery: bool) -> CreateOptions {
+        CreateOptions {
+            allow_no_tpm: true,
+            passphrase: SecretString::from_string(STRONG.into()),
+            recovery,
+            kdf: fast_kdf(),
+        }
+    }
+
     #[test]
     fn create_no_tpm_then_unlock_roundtrip() {
         let path = tmp("roundtrip");
-        let out = create_vault(
-            &path,
-            CreateOptions {
-                allow_no_tpm: true,
-                passphrase: SecretString::from_string("pw".into()),
-                recovery_passphrase: None,
-            },
-        )
-        .unwrap();
+        let out = create_vault(&path, create_opts(false)).unwrap();
         assert!(!out.hardware_bound);
         assert!(!out.has_recovery);
+        assert!(out.recovery_code.is_none());
         assert!(matches!(out.tpm, TpmBinding::OptedOut));
 
         let locked = LockedVault::load(&path).unwrap();
-        let pass = SecretString::from_string("pw".into());
+        let pass = SecretString::from_string(STRONG.into());
         let v = unlock(locked, UnlockFactors::TwoFactor { passphrase: &pass }).unwrap();
         assert!(v.is_unlocked());
         std::fs::remove_file(&path).ok();
     }
 
     #[test]
-    fn wrong_passphrase_fails_closed() {
-        let path = tmp("wrongpw");
-        create_vault(
+    fn weak_passphrase_is_rejected_at_creation() {
+        let path = tmp("weakpw");
+        let out = create_vault(
             &path,
             CreateOptions {
                 allow_no_tpm: true,
-                passphrase: SecretString::from_string("right".into()),
-                recovery_passphrase: None,
+                passphrase: SecretString::from_string("password1".into()),
+                recovery: false,
+                kdf: fast_kdf(),
             },
-        )
-        .unwrap();
+        );
+        assert!(matches!(out, Err(Error::WeakPassphrase(_))));
+        // The placeholder file must be cleaned up so a retry isn't blocked.
+        assert!(!path.exists(), "weak-passphrase failure must not leave a vault file");
+    }
+
+    #[test]
+    fn wrong_passphrase_fails_closed() {
+        let path = tmp("wrongpw");
+        create_vault(&path, create_opts(false)).unwrap();
         let locked = LockedVault::load(&path).unwrap();
-        let wrong = SecretString::from_string("wrong".into());
+        let wrong = SecretString::from_string("wrong-but-unchecked-on-unlock".into());
         assert!(unlock(locked, UnlockFactors::TwoFactor { passphrase: &wrong }).is_err());
         std::fs::remove_file(&path).ok();
     }
 
     #[test]
-    fn recovery_escrow_unlocks_and_create_refuses_clobber() {
+    fn recovery_code_unlocks_and_create_refuses_clobber() {
         let path = tmp("recovery");
-        let out = create_vault(
-            &path,
-            CreateOptions {
-                allow_no_tpm: true,
-                passphrase: SecretString::from_string("unlockpw".into()),
-                recovery_passphrase: Some(SecretString::from_string("recpw".into())),
-            },
-        )
-        .unwrap();
+        let out = create_vault(&path, create_opts(true)).unwrap();
         assert!(out.has_recovery);
+        let code = out.recovery_code.expect("recovery requested -> code returned");
 
         // create refuses to clobber an existing file
-        assert!(create_vault(
-            &path,
-            CreateOptions {
-                allow_no_tpm: true,
-                passphrase: SecretString::from_string("x".into()),
-                recovery_passphrase: None,
-            },
-        )
-        .is_err());
+        assert!(create_vault(&path, create_opts(false)).is_err());
 
+        // Unlock via the generated code (through the shared normalizing helper),
+        // even with formatting noise the user might introduce.
+        let noisy = format!(" {} ", code.to_lowercase());
         let locked = LockedVault::load(&path).unwrap();
-        let rec = SecretString::from_string("recpw".into());
-        let v = unlock(locked, UnlockFactors::Recovery { recovery_passphrase: &rec }).unwrap();
+        let v = unlock_with_recovery_code(locked, &noisy).unwrap();
         assert!(v.is_unlocked());
+
+        // A wrong code fails closed.
+        let locked = LockedVault::load(&path).unwrap();
+        assert!(unlock_with_recovery_code(locked, "0000-0000-0000-0000-0000-0000-00").is_err());
         std::fs::remove_file(&path).ok();
     }
 
@@ -295,15 +370,7 @@ mod tests {
     #[test]
     fn describe_provider_is_honest_for_no_hardware() {
         let path = tmp("describe");
-        create_vault(
-            &path,
-            CreateOptions {
-                allow_no_tpm: true,
-                passphrase: SecretString::from_string("pw".into()),
-                recovery_passphrase: None,
-            },
-        )
-        .unwrap();
+        create_vault(&path, create_opts(false)).unwrap();
         let locked = LockedVault::load(&path).unwrap();
         let s = describe_provider(locked.header());
         assert!(s.contains("NO hardware binding"));

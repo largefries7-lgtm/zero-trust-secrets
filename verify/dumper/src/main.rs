@@ -48,6 +48,12 @@ use std::os::windows::io::AsRawHandle;
 
 type Res<T> = Result<T, Box<dyn Error>>;
 
+/// Passphrase used to provision every throwaway harness vault. It must clear the
+/// single-factor strength floor now enforced by `vaultctl init` (mixed classes,
+/// 22 chars). The same value is reused wherever a scenario later unlocks (`PostClip`,
+/// `GuiPostAutolock`), so provision and unlock always agree.
+const PROVISION_PASSPHRASE: &str = "Tq7!vK2m-Zp9x_Lw3r#Hs6";
+
 /// All verification scenarios: the original CLI (`vaultctl`) trio plus the
 /// GUI (`vaultgui --leaktest`) trio added by Task E2.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -128,8 +134,11 @@ impl Scenario {
 
 struct ScenarioResult {
     scenario: Scenario,
-    /// The random record NAME planted for this run; doubles as a non-secret
-    /// sentinel that must appear in the dump of any vault-loading scenario.
+    /// The "dump is real" sentinel: the vault PATH, a known non-secret string the
+    /// loaded process always holds (argv + the PathBuf it opened). Must appear in
+    /// any vault-loading scenario's dump. (Record NAMES are encrypted on disk as of
+    /// format v3, so a name is no longer a usable plaintext sentinel in a locked
+    /// process.)
     sentinel: String,
     /// The random secret VALUE; must NOT survive in the heap when not in use.
     canary: String,
@@ -446,12 +455,14 @@ fn run_single(args: &[String]) -> Res<ExitCode> {
 /// Provisioning always goes through `vaultctl` (both binaries share the same
 /// `.ztsv` on-disk format), even for GUI scenarios.
 ///
-/// The sentinel (record name) is stored as plaintext metadata and is loaded into
-/// the child's heap by any vault-loading scenario, so it MUST appear in those
-/// dumps — self-validating that the dump+scan pipeline works on that very dump.
-/// The canary (secret value) is encrypted at rest and zeroized after use, so it
-/// MUST NOT appear in the locked/post-clip/gui-locked heaps. (`gui-post-autolock`
-/// is the one exception — see its `passed()`/`gui_residual_note` docs.)
+/// The sentinel is the vault PATH — a known non-secret string the loaded process
+/// always holds (argv + the opened PathBuf) — so it MUST appear in any vault-
+/// loading scenario's dump, self-validating that the dump+scan pipeline works on
+/// that very dump. (Record NAMES are encrypted on disk as of format v3, so a name
+/// is not a usable plaintext sentinel in a locked process.) The canary (secret
+/// value) is encrypted at rest and zeroized after use, so it MUST NOT appear in
+/// the locked/post-clip/gui-locked heaps. (`gui-post-autolock` is the one
+/// exception — see its `passed()`/`gui_residual_note` docs.)
 fn run_scenario(
     vaultctl: &Path,
     vaultgui: &Path,
@@ -464,10 +475,17 @@ fn run_scenario(
         fs::create_dir_all(parent)?;
     }
     let vault = sdir.join("vault.ztsv");
-    let sentinel = generate_sentinel()?;
+    let record_name = generate_sentinel()?;
     let canary = generate_canary()?;
+    // As of on-disk format v3 record NAMES are encrypted, so a locked (never-
+    // unlocked) process holds no plaintext record name. The "dump is real"
+    // sentinel is therefore the vault PATH — a known non-secret string the loaded
+    // process always holds (argv + the PathBuf it opened) regardless of unlock —
+    // rather than the record name. It proves the dump/scan pipeline works on THIS
+    // dump, so a canary==0 result is meaningful and not vacuous.
+    let sentinel = vault.to_string_lossy().to_string();
 
-    provision(vaultctl, &vault, &sentinel, &canary)?;
+    provision(vaultctl, &vault, &record_name, &canary)?;
 
     // Build the hold subcommand for this scenario: CLI scenarios spawn
     // vaultctl's hidden `__hold-*`/`__leak` subcommands; GUI scenarios spawn
@@ -486,9 +504,9 @@ fn run_scenario(
                     .arg("--vault")
                     .arg(&vault)
                     .arg("--passphrase")
-                    .arg("pw")
+                    .arg(PROVISION_PASSPHRASE)
                     .arg("--name")
-                    .arg(&sentinel);
+                    .arg(&record_name);
             }
             Scenario::GuiLeak => {
                 c.arg("gui-leak").arg("--canary").arg(&canary);
@@ -506,8 +524,8 @@ fn run_scenario(
                 c.arg("__hold-locked");
             }
             Scenario::PostClip => {
-                // Fetch by the sentinel record name.
-                c.args(["__hold-postclip", &sentinel, "--passphrase", "pw"]);
+                // Fetch by the record name.
+                c.args(["__hold-postclip", &record_name, "--passphrase", PROVISION_PASSPHRASE]);
             }
             Scenario::Leak => {
                 c.arg("__leak").arg(&canary);
@@ -581,14 +599,14 @@ fn provision(vaultctl: &Path, vault: &Path, name: &str, canary: &str) -> Res<()>
         Command::new(vaultctl)
             .arg("--vault")
             .arg(vault)
-            .args(["init", "--allow-no-tpm", "--passphrase", "pw"]),
+            .args(["init", "--allow-no-tpm", "--passphrase", PROVISION_PASSPHRASE]),
         "vaultctl init",
     )?;
     run_checked(
         Command::new(vaultctl)
             .arg("--vault")
             .arg(vault)
-            .args(["add", name, "--value", canary, "--passphrase", "pw"]),
+            .args(["add", name, "--value", canary, "--passphrase", PROVISION_PASSPHRASE]),
         "vaultctl add",
     )?;
     Ok(())

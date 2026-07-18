@@ -2,13 +2,17 @@
 //!
 //! Layout: a versioned, authenticated header (HMAC-SHA256 over the header
 //! bytes, keyed by an HKDF subkey of the DEK) followed by a sequence of
-//! records, each individually encrypted with XChaCha20-Poly1305 under a
-//! per-record HKDF subkey. Tamper anywhere in the header or a record must
-//! fail closed (`Error::AuthFailed`), never silently return partial or
-//! wrong data.
+//! records. As of format v3 each record is `id ‖ name_ct ‖ value_ct`, where the
+//! record NAME *and* value are each encrypted with XChaCha20-Poly1305 under
+//! distinct per-record HKDF subkeys and padded to fixed size buckets, and the
+//! record set is padded with indistinguishable tombstone records up to a count
+//! bucket. A stolen `.ztsv` therefore leaks neither what accounts exist, their
+//! sizes, nor (beyond a coarse bucket) how many there are. Tamper anywhere in the
+//! header or a record must fail closed (`Error::AuthFailed`), never silently
+//! return partial or wrong data.
 
 use crate::crypto::{self, Argon2Params, KEY_LEN};
-use crate::secret::{SecretBytes, SecretString};
+use crate::secret::{ProtectedDek, SecretBytes, SecretString};
 use crate::{Error, Result};
 use std::path::Path;
 
@@ -22,15 +26,30 @@ const MAGIC: [u8; 4] = *b"ZTSV";
 // memory/CPU DoS. The ceilings are generous versus `default_tuned` (64 MiB / t=3)
 // yet keep the worst case survivable. A header outside these bounds is rejected
 // at parse time, before any Argon2 work happens.
-const MAX_ARGON2_MEM_KIB: u32 = 1 << 20; // 1 GiB
+pub(crate) const MAX_ARGON2_MEM_KIB: u32 = 1 << 20; // 1 GiB
 const MAX_ARGON2_TIME: u32 = 64;
 const MAX_ARGON2_PARALLELISM: u32 = 64;
-/// Current on-disk format version. v2 = two-factor envelope (see `envelope.rs`).
-/// v1 (single-factor: TPM-wraps-DEK *or* passphrase-wraps-DEK) is intentionally
-/// not read by this build — there is no migration command (a v1 reader would
-/// resurrect legacy single-factor crypto); a pre-v2 vault must be recreated with
-/// `vaultctl init` (or the GUI's create flow).
-pub const FORMAT_VERSION: u16 = 2;
+/// Current on-disk format version. v3 = encrypted record names + padded name/value
+/// sizes + tombstone-padded record count (see this module's docs). The two-factor
+/// DEK envelope (see `envelope.rs`) is unchanged. Older formats (v1 single-factor,
+/// v2 plaintext-name) are intentionally NOT read by this build — there is no
+/// migration path (consistent with this project's "recreate to upgrade" stance,
+/// which keeps the parser to a single format and avoids resurrecting legacy
+/// layouts); a pre-v3 vault must be recreated with `vaultctl init` or the GUI.
+pub const FORMAT_VERSION: u16 = 3;
+
+/// Record names are padded to a multiple of this many bytes before encryption, so
+/// a record's on-disk `name_ct` length reveals only a coarse bucket, not the exact
+/// name length.
+const NAME_BUCKET: usize = 64;
+/// Record values are padded to a multiple of this many bytes before encryption.
+const VALUE_BUCKET: usize = 256;
+/// The record set is padded with tombstones up to a multiple of this many records
+/// (minimum one bucket), so the on-disk record count reveals only a coarse bucket.
+const COUNT_BUCKET: usize = 8;
+/// Defensive ceiling on a decoded name length (from a decrypted, authenticated
+/// plaintext) — guards against a corrupt length prefix driving a bad slice.
+const MAX_NAME_LEN: usize = 4096;
 
 /// Authenticated vault header (format v2).
 ///
@@ -131,12 +150,13 @@ impl VaultHeader {
         }
         let format_version = c.u16()?;
         if format_version != FORMAT_VERSION {
-            // Only the current two-factor format is read. A v1 file predates it
-            // and is single-factor; this build intentionally carries no legacy
-            // v1 crypto path (reduced attack surface), so it must be recreated.
+            // Only the current format is read. Older layouts (v1 single-factor, v2
+            // plaintext-name) predate this one; this build intentionally carries no
+            // legacy parser (reduced attack surface / one format to reason about),
+            // so an older vault must be recreated.
             return Err(Error::Format(format!(
                 "unsupported vault format version {format_version} (this build reads v{FORMAT_VERSION}); \
-                 a pre-two-factor vault must be recreated with `vaultctl init`"
+                 a pre-v{FORMAT_VERSION} vault must be recreated with `vaultctl init`"
             )));
         }
         let hardware_bound = c.u8()? != 0;
@@ -185,7 +205,11 @@ impl VaultHeader {
         h.to_bytes()
     }
 
-    pub fn compute_mac(&self, dek: &SecretBytes, records: &[Record]) -> [u8; 32] {
+    /// HMAC over the header bytes and the full on-disk record set (count, then each
+    /// raw record's id, `name_ct`, `value_ct` in order). Authenticates every byte
+    /// that hits the disk — including the tombstone padding — so any relabel /
+    /// delete / reorder / inject fails closed at unlock.
+    pub fn compute_mac(&self, dek: &SecretBytes, records: &[RawRecord]) -> [u8; 32] {
         let mk = crypto::hkdf_subkey(dek, b"header-mac", KEY_LEN);
         use hkdf::hmac::{Hmac, Mac};
         use sha2::Sha256;
@@ -195,15 +219,15 @@ impl VaultHeader {
         m.update(&(records.len() as u32).to_le_bytes());
         for r in records {
             m.update(&r.id.to_le_bytes());
-            m.update(&(r.name.len() as u32).to_le_bytes());
-            m.update(r.name.as_bytes());
-            m.update(&(r.ciphertext.len() as u32).to_le_bytes());
-            m.update(&r.ciphertext);
+            m.update(&(r.name_ct.len() as u32).to_le_bytes());
+            m.update(&r.name_ct);
+            m.update(&(r.value_ct.len() as u32).to_le_bytes());
+            m.update(&r.value_ct);
         }
         m.finalize().into_bytes().into()
     }
 
-    pub fn verify_mac(&self, dek: &SecretBytes, records: &[Record]) -> bool {
+    pub fn verify_mac(&self, dek: &SecretBytes, records: &[RawRecord]) -> bool {
         use subtle::ConstantTimeEq;
         self.compute_mac(dek, records).ct_eq(&self.header_mac).into()
     }
@@ -296,17 +320,19 @@ impl<'a> Cursor<'a> {
     }
 }
 
-pub struct Record {
+/// A record as it lives on disk (and in a still-locked vault): an opaque id plus
+/// the encrypted, padded name and value. Nothing here is plaintext.
+pub struct RawRecord {
     pub id: u128,
-    pub name: String,
-    pub ciphertext: Vec<u8>,
+    pub name_ct: Vec<u8>,
+    pub value_ct: Vec<u8>,
 }
 
-impl Record {
+impl RawRecord {
     fn to_bytes(&self, b: &mut Vec<u8>) {
         b.extend_from_slice(&self.id.to_le_bytes());
-        put_bytes(b, self.name.as_bytes());
-        put_bytes(b, &self.ciphertext);
+        put_bytes(b, &self.name_ct);
+        put_bytes(b, &self.value_ct);
     }
 
     fn from_cursor(c: &mut Cursor) -> Result<Self> {
@@ -315,24 +341,150 @@ impl Record {
             .try_into()
             .map_err(|_| Error::Format("record id".into()))?;
         let id = u128::from_le_bytes(id_bytes);
-        let name_bytes = c.bytes()?;
-        let name =
-            String::from_utf8(name_bytes).map_err(|_| Error::Format("record name utf8".into()))?;
-        let ciphertext = c.bytes()?;
-        Ok(Record { id, name, ciphertext })
+        let name_ct = c.bytes()?;
+        let value_ct = c.bytes()?;
+        Ok(RawRecord { id, name_ct, value_ct })
+    }
+}
+
+/// A record in an UNLOCKED vault: its name is decrypted (for lookup/listing), but
+/// its value stays encrypted (`value_ct`) in RAM until `get` is called — so an
+/// unlocked session never holds every secret value in plaintext at once.
+pub struct Record {
+    pub id: u128,
+    pub name: String,
+    pub value_ct: Vec<u8>,
+}
+
+// --- v3 record encryption / padding helpers ---
+
+fn padded_len(unpadded: usize, bucket: usize) -> usize {
+    unpadded.div_ceil(bucket).max(1) * bucket
+}
+
+/// AAD binding a record's name/value ciphertext to its id and the format version.
+fn record_aad(id: u128, version: u16) -> Vec<u8> {
+    let mut a = Vec::with_capacity(18);
+    a.extend_from_slice(&id.to_le_bytes());
+    a.extend_from_slice(&version.to_le_bytes());
+    a
+}
+
+fn subkey(dek: &SecretBytes, label: &[u8], id: u128) -> SecretBytes {
+    let mut info = Vec::with_capacity(label.len() + 16);
+    info.extend_from_slice(label);
+    info.extend_from_slice(&id.to_le_bytes());
+    crypto::hkdf_subkey(dek, &info, KEY_LEN)
+}
+
+/// Encode `[kind ‖ len ‖ name ‖ zero-pad]` to a `NAME_BUCKET` multiple. `kind` is
+/// 0 for a real record, 1 for a tombstone (name empty).
+fn encode_name_plaintext(kind: u8, name: &str) -> Vec<u8> {
+    let nb = name.as_bytes();
+    let target = padded_len(1 + 4 + nb.len(), NAME_BUCKET);
+    let mut p = Vec::with_capacity(target);
+    p.push(kind);
+    p.extend_from_slice(&(nb.len() as u32).to_le_bytes());
+    p.extend_from_slice(nb);
+    p.resize(target, 0);
+    p
+}
+
+/// Returns `Ok(None)` for a tombstone, `Ok(Some(name))` for a real record.
+fn decode_name_plaintext(p: &[u8]) -> Result<Option<String>> {
+    if p.len() < 5 {
+        return Err(Error::Format("name plaintext too short".into()));
+    }
+    let kind = p[0];
+    let len = u32::from_le_bytes(p[1..5].try_into().unwrap()) as usize;
+    if len > MAX_NAME_LEN || 5 + len > p.len() {
+        return Err(Error::Format("name length out of range".into()));
+    }
+    match kind {
+        1 => Ok(None),
+        0 => {
+            let name = std::str::from_utf8(&p[5..5 + len])
+                .map_err(|_| Error::Format("record name utf8".into()))?
+                .to_string();
+            Ok(Some(name))
+        }
+        _ => Err(Error::Format("bad record kind".into())),
+    }
+}
+
+/// Build `[len ‖ value ‖ zero-pad]` to a `VALUE_BUCKET` multiple, in a page-locked
+/// secret buffer.
+fn encode_value_plaintext(value: &[u8]) -> SecretBytes {
+    let target = padded_len(4 + value.len(), VALUE_BUCKET);
+    let mut sb = SecretBytes::zeros(target);
+    let m = sb.expose_mut();
+    m[0..4].copy_from_slice(&(value.len() as u32).to_le_bytes());
+    m[4..4 + value.len()].copy_from_slice(value);
+    sb
+}
+
+fn decode_value_plaintext(p: &[u8]) -> Result<SecretBytes> {
+    if p.len() < 4 {
+        return Err(Error::Format("value plaintext too short".into()));
+    }
+    let len = u32::from_le_bytes(p[0..4].try_into().unwrap()) as usize;
+    if 4 + len > p.len() {
+        return Err(Error::Format("value length out of range".into()));
+    }
+    Ok(SecretBytes::from_exact(&p[4..4 + len]))
+}
+
+fn seal_name(dek: &SecretBytes, id: u128, version: u16, kind: u8, name: &str) -> Result<Vec<u8>> {
+    crypto::aead_seal(
+        &subkey(dek, b"record-name-v3", id),
+        &record_aad(id, version),
+        &encode_name_plaintext(kind, name),
+    )
+}
+
+fn seal_value(dek: &SecretBytes, id: u128, version: u16, value: &[u8]) -> Result<Vec<u8>> {
+    crypto::aead_seal(
+        &subkey(dek, b"record-value-v3", id),
+        &record_aad(id, version),
+        encode_value_plaintext(value).expose(),
+    )
+}
+
+fn open_name(dek: &SecretBytes, id: u128, version: u16, name_ct: &[u8]) -> Result<Option<String>> {
+    let pt = crypto::aead_open(&subkey(dek, b"record-name-v3", id), &record_aad(id, version), name_ct)?;
+    decode_name_plaintext(pt.expose())
+}
+
+fn random_id() -> u128 {
+    let mut b = [0u8; 16];
+    rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut b);
+    u128::from_le_bytes(b)
+}
+
+/// Fisher–Yates shuffle so real vs tombstone record positions don't correlate
+/// across saves (order carries no meaning — records are keyed by name after
+/// decryption; the header MAC still binds the exact on-disk order).
+fn shuffle_raw(v: &mut [RawRecord]) {
+    for i in (1..v.len()).rev() {
+        let mut b = [0u8; 8];
+        rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut b);
+        let j = (u64::from_le_bytes(b) % (i as u64 + 1)) as usize;
+        v.swap(i, j);
     }
 }
 
 enum State {
     Locked,
-    Unlocked(SecretBytes),
+    /// The DEK, held encrypted at rest in RAM (see `ProtectedDek`) and revealed
+    /// transiently only for the duration of a single crypto operation.
+    Unlocked(ProtectedDek),
 }
 
 /// A vault whose header and record framing are known but which has not been
 /// authenticated/decrypted yet. Holds no DEK and no plaintext.
 pub struct LockedVault {
     header: VaultHeader,
-    records: Vec<Record>,
+    records: Vec<RawRecord>,
     /// SHA-256 of the exact bytes read from disk, for optimistic-concurrency
     /// detection when a derived `Vault` is later saved (see `Vault::save`).
     fingerprint: [u8; 32],
@@ -357,22 +509,34 @@ impl LockedVault {
         // the remaining bytes, so total work is bounded by the real file size.
         let mut records = Vec::new();
         for _ in 0..num_records {
-            records.push(Record::from_cursor(&mut c)?);
+            records.push(RawRecord::from_cursor(&mut c)?);
         }
         Ok(LockedVault { header, records, fingerprint })
     }
 
-    /// Verify the header MAC against the supplied DEK and, on success,
-    /// return an unlocked `Vault`. Fails closed: on MAC mismatch this
-    /// returns `Error::AuthFailed` and no usable vault is produced.
+    /// Verify the header MAC against the supplied DEK and, on success, decrypt
+    /// every record name (dropping tombstones) to produce the unlocked `Vault`.
+    /// Fails closed: on MAC mismatch this returns `Error::AuthFailed` and no usable
+    /// vault is produced. Values are NOT decrypted here — they stay as `value_ct`
+    /// until `get`, so an unlocked session never holds all secret values at once.
     pub fn unlock_with_dek(self, dek: SecretBytes) -> Result<Vault> {
         if !self.header.verify_mac(&dek, &self.records) {
             return Err(Error::AuthFailed);
         }
+        let version = self.header.format_version;
+        let mut records = Vec::new();
+        for raw in &self.records {
+            // MAC already authenticated `name_ct`, so a correct-DEK open succeeds;
+            // a failure fails closed rather than guessing.
+            if let Some(name) = open_name(&dek, raw.id, version, &raw.name_ct)? {
+                records.push(Record { id: raw.id, name, value_ct: raw.value_ct.clone() });
+            }
+            // `None` => tombstone padding: dropped from the logical view.
+        }
         Ok(Vault {
             header: self.header,
-            records: self.records,
-            state: State::Unlocked(dek),
+            records,
+            state: State::Unlocked(ProtectedDek::new(dek)),
             loaded_fingerprint: Some(self.fingerprint),
         })
     }
@@ -381,10 +545,11 @@ impl LockedVault {
         &self.header
     }
 
-    /// Record names as stored (authenticated plaintext metadata). Read-only;
-    /// exposes no key material and does not require the DEK. Used by `list`.
-    pub fn record_names(&self) -> Vec<&str> {
-        self.records.iter().map(|r| r.name.as_str()).collect()
+    /// Number of raw (encrypted) records on disk, including tombstone padding.
+    /// Test-only: the logical name list requires the DEK (names are encrypted).
+    #[cfg(test)]
+    pub fn raw_record_count(&self) -> usize {
+        self.records.len()
     }
 
     /// v2 primary unlock: derive the DEK from the unlock passphrase (+ the TPM
@@ -435,32 +600,21 @@ impl Vault {
         Vault {
             header,
             records: Vec::new(),
-            state: State::Unlocked(dek),
+            state: State::Unlocked(ProtectedDek::new(dek)),
             loaded_fingerprint: None,
         }
     }
-    fn dek(&self) -> Result<&SecretBytes> {
+    /// Reveal a transient plaintext copy of the DEK for one operation. Returns an
+    /// owned, page-locked `SecretBytes` that the caller drops (zeroized) as soon as
+    /// the operation completes, so the plaintext key exists in RAM only fleetingly.
+    fn dek(&self) -> Result<SecretBytes> {
         match &self.state {
-            State::Unlocked(d) => Ok(d),
+            State::Unlocked(d) => Ok(d.reveal()),
             State::Locked => Err(Error::Locked),
         }
     }
     pub fn is_unlocked(&self) -> bool {
         matches!(self.state, State::Unlocked(_))
-    }
-
-    fn record_key(dek: &SecretBytes, id: u128) -> SecretBytes {
-        let mut info = Vec::with_capacity(6 + 16);
-        info.extend_from_slice(b"record");
-        info.extend_from_slice(&id.to_le_bytes());
-        crypto::hkdf_subkey(dek, &info, KEY_LEN)
-    }
-    fn aad(id: u128, version: u16, name: &str) -> Vec<u8> {
-        let mut a = Vec::with_capacity(18 + name.len());
-        a.extend_from_slice(&id.to_le_bytes());
-        a.extend_from_slice(&version.to_le_bytes());
-        a.extend_from_slice(name.as_bytes());
-        a
     }
 
     /// Add a NEW secret. Fails with [`Error::Duplicate`] if `name` already
@@ -492,20 +646,16 @@ impl Vault {
         self.records.len() != before
     }
 
-    /// Encrypt `value` under a fresh per-record key and append it. Assumes the
-    /// caller has already enforced whatever name-uniqueness policy applies.
+    /// Encrypt `value` (padded) under a fresh per-record value key and append the
+    /// record, keeping its name in plaintext in memory for lookup. Assumes the
+    /// caller has already enforced whatever name-uniqueness policy applies. The
+    /// name is encrypted only when the vault is saved (see `save`).
     fn insert_record(&mut self, name: &str, value: SecretString) -> Result<()> {
         let dek = self.dek()?;
-        let mut idb = [0u8; 16];
-        rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut idb);
-        let id = u128::from_le_bytes(idb);
-        let rk = Self::record_key(dek, id);
-        let ct = crypto::aead_seal(
-            &rk,
-            &Self::aad(id, self.header.format_version, name),
-            value.expose_str().as_bytes(),
-        )?;
-        self.records.push(Record { id, name: name.to_string(), ciphertext: ct });
+        let id = random_id();
+        let value_ct =
+            seal_value(&dek, id, self.header.format_version, value.expose_str().as_bytes())?;
+        self.records.push(Record { id, name: name.to_string(), value_ct });
         Ok(())
     }
 
@@ -516,15 +666,15 @@ impl Vault {
             .iter()
             .find(|r| r.name == name)
             .ok_or_else(|| Error::NotFound(name.to_string()))?;
-        let rk = Self::record_key(dek, rec.id);
-        let pt = crypto::aead_open(
-            &rk,
-            &Self::aad(rec.id, self.header.format_version, &rec.name),
-            &rec.ciphertext,
+        let padded = crypto::aead_open(
+            &subkey(&dek, b"record-value-v3", rec.id),
+            &record_aad(rec.id, self.header.format_version),
+            &rec.value_ct,
         )?;
-        // Wrap the already-locked plaintext in place: no `to_vec()` copy into
-        // ordinary heap, and on non-UTF-8 the buffer is zeroized on drop.
-        SecretString::from_secret_bytes(pt)
+        // `padded` is the padded value plaintext (page-locked); slice out the exact
+        // value into a fresh locked buffer and wrap it. `padded` drops zeroized.
+        let value = decode_value_plaintext(padded.expose())?;
+        SecretString::from_secret_bytes(value)
             .ok_or_else(|| Error::Format("record value is not valid utf8".into()))
     }
 
@@ -548,9 +698,12 @@ impl Vault {
     // its MAC. Removed as a deliberate encapsulation boundary.
 
     /// Persist the vault to disk. Requires the vault to be unlocked, since
-    /// writing a fresh header MAC needs the DEK. On-disk layout:
+    /// writing a fresh header MAC (and re-encrypting names + generating tombstones)
+    /// needs the DEK. On-disk layout:
     /// `u32 len(header) || header_bytes || u32 num_records ||
-    ///  [ id(16 LE) || u32 len(name) || name_utf8 || u32 len(ct) || ct ]*`
+    ///  [ id(16 LE) || u32 len(name_ct) || name_ct || u32 len(value_ct) || value_ct ]*`
+    /// where `num_records` includes tombstone padding and each `*_ct` is an
+    /// XChaCha20-Poly1305 blob over the padded name/value.
     ///
     /// Writes are atomic and durable: the serialized vault is written to a
     /// unique temp file in the same directory as `path`, `fsync`ed, then renamed
@@ -563,15 +716,35 @@ impl Vault {
     /// DEK (which lives solely in this file's header).
     pub fn save(&mut self, path: &Path) -> Result<()> {
         let dek = self.dek()?;
+        let version = self.header.format_version;
+
+        // Build the on-disk raw record set: re-encrypt each real record's name
+        // under a fresh nonce, keep its already-encrypted value, then pad with
+        // indistinguishable tombstone records up to a count bucket and shuffle, so
+        // a stolen file leaks neither the names, the sizes, nor (beyond a coarse
+        // bucket) the count — and real vs tombstone positions don't correlate.
+        let target = padded_len(self.records.len(), COUNT_BUCKET);
+        let mut raws: Vec<RawRecord> = Vec::with_capacity(target);
+        for r in &self.records {
+            let name_ct = seal_name(&dek, r.id, version, 0, &r.name)?;
+            raws.push(RawRecord { id: r.id, name_ct, value_ct: r.value_ct.clone() });
+        }
+        while raws.len() < target {
+            let id = random_id();
+            let name_ct = seal_name(&dek, id, version, 1, "")?;
+            let value_ct = seal_value(&dek, id, version, &[])?;
+            raws.push(RawRecord { id, name_ct, value_ct });
+        }
+        shuffle_raw(&mut raws);
 
         let mut header = self.header.clone();
-        header.header_mac = header.compute_mac(dek, &self.records);
+        header.header_mac = header.compute_mac(&dek, &raws);
         let header_bytes = header.to_bytes();
 
         let mut out = Vec::new();
         put_bytes(&mut out, &header_bytes);
-        put_u32(&mut out, self.records.len() as u32);
-        for r in &self.records {
+        put_u32(&mut out, raws.len() as u32);
+        for r in &raws {
             r.to_bytes(&mut out);
         }
 
@@ -693,11 +866,13 @@ mod tests {
     fn header_mac_detects_record_relabel_delete_and_reorder() {
         let dek = SecretBytes::from_exact(&[4u8; 32]);
         let mut h = test_header();
-        let recs = vec![Record { id: 1, name: "email".into(), ciphertext: vec![9, 9] }];
+        let raw =
+            |id, n: &[u8], v: &[u8]| RawRecord { id, name_ct: n.to_vec(), value_ct: v.to_vec() };
+        let recs = vec![raw(1, &[9, 9], &[7])];
         h.header_mac = h.compute_mac(&dek, &recs);
 
-        // relabel same (id, ciphertext) under a new name -> fails
-        let relabeled = vec![Record { id: 1, name: "other".into(), ciphertext: vec![9, 9] }];
+        // tamper the encrypted name blob (a relabel attempt) -> fails
+        let relabeled = vec![raw(1, &[8, 8], &[7])];
         assert!(!h.verify_mac(&dek, &relabeled));
         // delete the record -> fails
         assert!(!h.verify_mac(&dek, &[]));
@@ -705,15 +880,9 @@ mod tests {
         assert!(h.verify_mac(&dek, &recs));
 
         // reorder two records -> fails
-        let two = vec![
-            Record { id: 1, name: "a".into(), ciphertext: vec![1] },
-            Record { id: 2, name: "b".into(), ciphertext: vec![2] },
-        ];
+        let two = vec![raw(1, &[1], &[1]), raw(2, &[2], &[2])];
         h.header_mac = h.compute_mac(&dek, &two);
-        let swapped = vec![
-            Record { id: 2, name: "b".into(), ciphertext: vec![2] },
-            Record { id: 1, name: "a".into(), ciphertext: vec![1] },
-        ];
+        let swapped = vec![raw(2, &[2], &[2]), raw(1, &[1], &[1])];
         assert!(!h.verify_mac(&dek, &swapped));
         assert!(h.verify_mac(&dek, &two));
     }
@@ -812,9 +981,8 @@ mod tests {
 
         let dek2 = SecretBytes::from_exact(&[6u8; 32]);
         let unlocked = locked.unlock_with_dek(dek2).unwrap();
-        assert!(unlocked
-            .header()
-            .verify_mac(&SecretBytes::from_exact(&[6u8; 32]), unlocked.records()));
+        // A successful unlock already proves the header MAC (unlock fails closed on
+        // mismatch). Tombstone padding is filtered from the logical record view.
         assert_eq!(unlocked.records().len(), 2);
         assert_eq!(unlocked.get("email").unwrap().expose_str(), "hunter2");
         assert_eq!(unlocked.get("bank_pin").unwrap().expose_str(), "1234");
@@ -993,11 +1161,85 @@ mod tests {
 
         let dek2 = SecretBytes::from_exact(&[10u8; 32]);
         let unlocked = locked.unlock_with_dek(dek2).unwrap();
-        assert!(unlocked
-            .header()
-            .verify_mac(&SecretBytes::from_exact(&[10u8; 32]), unlocked.records()));
+        // Successful unlock proves the MAC; tombstones are filtered from the view.
         assert_eq!(unlocked.records().len(), 2);
         assert_eq!(unlocked.get("email").unwrap().expose_str(), "hunter2");
         assert_eq!(unlocked.get("bank_pin").unwrap().expose_str(), "1234");
+    }
+
+    // --- v3 metadata-encryption properties ---
+
+    #[test]
+    fn record_names_are_encrypted_on_disk() {
+        let dek = SecretBytes::from_exact(&[12u8; 32]);
+        let mut v = Vault::new_unlocked(dek, test_header());
+        v.add("my-secret-account-name", SecretString::from_string("hunter2".into())).unwrap();
+
+        let mut path = std::env::temp_dir();
+        path.push(format!("vaultcore_v3_names_{}.ztsv", std::process::id()));
+        v.save(&path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        // Neither the name nor the value may appear in cleartext anywhere in the file.
+        assert!(
+            !contains(&bytes, b"my-secret-account-name"),
+            "record name must not be plaintext on disk"
+        );
+        assert!(!contains(&bytes, b"hunter2"), "value must not be plaintext on disk");
+    }
+
+    #[test]
+    fn count_is_padded_with_tombstones_and_filtered_on_unlock() {
+        let dek = SecretBytes::from_exact(&[13u8; 32]);
+        let mut v = Vault::new_unlocked(dek, test_header());
+        v.add("only-one", SecretString::from_string("x".into())).unwrap();
+
+        let mut path = std::env::temp_dir();
+        path.push(format!("vaultcore_v3_count_{}.ztsv", std::process::id()));
+        v.save(&path).unwrap();
+
+        let locked = LockedVault::load(&path).unwrap();
+        // On disk: padded up to a multiple of COUNT_BUCKET (>= COUNT_BUCKET).
+        assert_eq!(locked.raw_record_count(), COUNT_BUCKET);
+        assert!(locked.raw_record_count() % COUNT_BUCKET == 0);
+
+        let unlocked = locked.unlock_with_dek(SecretBytes::from_exact(&[13u8; 32])).unwrap();
+        // Logical view drops tombstones: exactly the one real record.
+        assert_eq!(unlocked.records().len(), 1);
+        assert_eq!(unlocked.get("only-one").unwrap().expose_str(), "x");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn empty_vault_is_all_tombstones() {
+        let dek = SecretBytes::from_exact(&[14u8; 32]);
+        let mut v = Vault::new_unlocked(dek, test_header());
+        let mut path = std::env::temp_dir();
+        path.push(format!("vaultcore_v3_empty_{}.ztsv", std::process::id()));
+        v.save(&path).unwrap();
+        let locked = LockedVault::load(&path).unwrap();
+        assert_eq!(locked.raw_record_count(), COUNT_BUCKET);
+        let unlocked = locked.unlock_with_dek(SecretBytes::from_exact(&[14u8; 32])).unwrap();
+        assert_eq!(unlocked.records().len(), 0);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn short_values_share_a_size_bucket() {
+        // Two different-length short values must produce equal-length value
+        // ciphertexts (same VALUE_BUCKET), so a stolen file leaks no size info.
+        let dek = SecretBytes::from_exact(&[15u8; 32]);
+        let mut v = Vault::new_unlocked(dek, test_header());
+        v.add("a", SecretString::from_string("x".into())).unwrap();
+        v.add("b", SecretString::from_string("a-much-longer-but-still-sub-bucket-value".into()))
+            .unwrap();
+        let lens: Vec<usize> = v.records().iter().map(|r| r.value_ct.len()).collect();
+        assert_eq!(lens[0], lens[1], "sub-bucket values must have equal ciphertext length");
+    }
+
+    /// Substring search used by the on-disk-secrecy tests.
+    fn contains(hay: &[u8], needle: &[u8]) -> bool {
+        hay.windows(needle.len()).any(|w| w == needle)
     }
 }

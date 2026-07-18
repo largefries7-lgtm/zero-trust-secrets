@@ -1,0 +1,17 @@
+# Build-time exploit mitigations for the shipped Windows binaries (hardening
+# program, phase 2). These apply to the whole workspace build, including
+# dependencies, so the Slint/image decoding stack (the largest memory-safety
+# surface) is compiled with them too.
+#
+#   -Ccontrol-flow-guard : Control Flow Guard — the compiler inserts checks on
+#                          indirect calls so a corrupted function pointer cannot
+#                          jump to an arbitrary address. A stable rustc codegen
+#                          option; the MSVC loader enforces the emitted guard.
+#   /CETCOMPAT           : mark the image CET-compatible so Windows enables a
+#                          hardware shadow stack (return-address integrity) on
+#                          CPUs that support Intel CET / equivalent.
+#
+# ASLR (/DYNAMICBASE), high-entropy VA (/HIGHENTROPYVA) and DEP/NX (/NXCOMPAT)
+# are already MSVC defaults for 64-bit Rust binaries and need no flag here.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-Ccontrol-flow-guard", "-Clink-arg=/CETCOMPAT"]
