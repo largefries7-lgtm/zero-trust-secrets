@@ -57,7 +57,7 @@ fn init_add_get_list_roundtrip() {
     assert!(out.status.success());
     assert!(String::from_utf8_lossy(&out.stdout).contains("hunter2"));
 
-    let list = bin().args(["--vault", vs, "list"]).output().unwrap();
+    let list = bin().args(["--vault", vs, "list", "--passphrase", PW]).output().unwrap();
     assert!(list.status.success());
     assert!(String::from_utf8_lossy(&list.stdout).contains("email"));
 
@@ -178,7 +178,7 @@ fn add_rejects_duplicate_force_replaces_and_rm_removes() {
     let got = String::from_utf8_lossy(&out.stdout);
     assert!(got.contains("new"), "expected rotated value, got: {got}");
     // Exactly one record named `email` remains (no duplicate left behind).
-    let list = bin().args(["--vault", vs, "list"]).output().unwrap();
+    let list = bin().args(["--vault", vs, "list", "--passphrase", PW]).output().unwrap();
     assert_eq!(String::from_utf8_lossy(&list.stdout).matches("email").count(), 1);
 
     // `rm` deletes the record; a subsequent `get` fails.
@@ -241,8 +241,8 @@ fn init_refuses_to_clobber_existing_vault() {
 }
 
 #[test]
-fn list_flags_names_as_unauthenticated_metadata() {
-    let dir = unique_dir("list-unauth");
+fn list_requires_unlock_and_shows_authenticated_names() {
+    let dir = unique_dir("list-unlock");
     let v = dir.join("v.ztsv");
     let vs = v.to_str().unwrap();
 
@@ -257,17 +257,18 @@ fn list_flags_names_as_unauthenticated_metadata() {
         .unwrap()
         .success());
 
-    let out = bin().args(["--vault", vs, "list"]).output().unwrap();
+    // As of format v3 names are encrypted, so `list` unlocks: with the passphrase
+    // the (decrypted + authenticated) name is shown on clean stdout.
+    let out = bin().args(["--vault", vs, "list", "--passphrase", PW]).output().unwrap();
     assert!(out.status.success());
-    // Names stay on clean stdout (pipe-friendly)...
     assert!(String::from_utf8_lossy(&out.stdout).contains("email"));
-    // ...and the trust-boundary advisory goes to stderr, so `list` never
-    // presents unauthenticated names as if they were verified.
-    let stderr = String::from_utf8_lossy(&out.stderr).to_lowercase();
-    assert!(
-        stderr.contains("unauthenticated"),
-        "list should flag names as unauthenticated; stderr was: {stderr:?}"
-    );
+
+    // Without the correct passphrase, names cannot be decrypted -> list fails.
+    assert!(!bin()
+        .args(["--vault", vs, "list", "--passphrase", "wrong"])
+        .status()
+        .unwrap()
+        .success());
 
     std::fs::remove_dir_all(&dir).ok();
 }

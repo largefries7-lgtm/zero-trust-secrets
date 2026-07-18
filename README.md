@@ -103,7 +103,7 @@ passphrase becomes the sole factor; pass `--passphrase` (prompted if omitted) to
 | `add <name> [--value <v>] [--force] [--passphrase <pw>]` | Add a secret; refuses an existing name unless `--force` (rotate in place) |
 | `rm <name> [--passphrase <pw>]` | Remove a secret record |
 | `get <name> [--clip] [--passphrase <pw>]` | Read a secret (stdout, or clipboard with auto-clear) |
-| `list` | List secret names (metadata only) |
+| `list [--passphrase <pw>] [--recovery --recovery-code <code>]` | List record names — unlocks, since names are encrypted metadata as of format v3 |
 | `gen [--len N] [--symbols]` | Generate a password and report entropy |
 | `seal-status` | Show `hardware_bound`, factors, the active key provider, and warnings |
 | `deprovision [--yes]` | Delete the persisted TPM wrapping key (destructive) |
@@ -132,10 +132,15 @@ argument — the code is generated and shown once.
   refuses weak passphrases: a length + character-class entropy floor plus a
   common-password blocklist, stricter for a passphrase-only vault than a two-factor
   one.
-- **Tamper-evident.** The vault header and the whole record set (count, order,
-  names, ciphertext) are authenticated by an HKDF-keyed HMAC; each secret is also
-  bound to its name via AEAD AAD. Relabel / delete / reorder / inject all fail
-  closed at unlock. `save` is atomic and durable (temp file, `fsync`, then rename).
+- **Encrypted metadata (format v3).** Record names are *encrypted*, not merely
+  authenticated; name and value sizes are padded to fixed buckets; and the record
+  count is padded with indistinguishable tombstone records. A stolen `.ztsv`
+  therefore leaks neither what accounts it holds, their sizes, nor (beyond a coarse
+  bucket) how many. Listing names requires unlocking.
+- **Tamper-evident.** The vault header and the whole on-disk record set (count,
+  order, every encrypted record including padding) are authenticated by an
+  HKDF-keyed HMAC. Relabel / delete / reorder / inject all fail closed at unlock.
+  `save` is atomic and durable (temp file, `fsync`, then rename).
 - **Memory hygiene.** All secret material lives in `ZeroizeOnDrop`, page-locked
   (`VirtualLock`), exact-capacity buffers and is zeroized the moment it's dropped.
   The CLI is **stateless**: the DEK is never written to disk.
@@ -177,8 +182,10 @@ current recorded result in this environment.
 - `--value` / `--recovery-code` travel on the command line (visible in
   process listings). This is a property of the test/automation CLI; the GUI slice
   avoids argv. The `--clip` path routes the secret via stdin, not argv.
-- Record **names** are authenticated but stored as plaintext metadata (values are
-  encrypted).
+- Record **names** are encrypted as of **format v3** (padded, with the count hidden
+  by tombstone padding). This format is not backward compatible: a pre-v3 vault must
+  be recreated (this build reads only v3, by design — one format, smaller parser
+  surface).
 - **Not defended:** a debugger attached to the live *unlocked* process at
   decryption time, kernel keyloggers, or a compromised OS.
 
@@ -198,7 +205,7 @@ docs/               design spec + implementation plan
 ## Test
 
 ```sh
-cargo test --workspace   # vaultcore 59 (lib) + codec-fuzz 3 + proptest 1, vaultctl CLI 11, vaultgui 20
+cargo test --workspace   # vaultcore 65 (lib) + codec-fuzz 3 + proptest 1, vaultctl CLI 11, vaultgui 20
 bash verify/run.sh       # empirical memory-dump proof (CLI + GUI scenarios)
 ```
 

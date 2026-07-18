@@ -119,8 +119,19 @@ enum Cmd {
         #[arg(long, requires = "recovery")]
         recovery_code: Option<String>,
     },
-    /// List record names (no DEK needed).
-    List,
+    /// List record names. As of format v3 names are ENCRYPTED metadata, so this
+    /// now requires unlocking (the DEK decrypts the names); they are authenticated.
+    List {
+        /// Unlock passphrase. Prompted if omitted.
+        #[arg(long)]
+        passphrase: Option<String>,
+        /// Unlock via the recovery escrow instead of TPM+passphrase.
+        #[arg(long)]
+        recovery: bool,
+        /// Recovery code (requires --recovery). Prompted (no echo) if omitted.
+        #[arg(long, requires = "recovery")]
+        recovery_code: Option<String>,
+    },
     /// Generate a random password (standalone; no vault).
     Gen {
         /// Password length.
@@ -246,19 +257,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             // secret drops (zeroized) at scope end.
         }
-        Cmd::List => {
+        Cmd::List { passphrase, recovery, recovery_code } => {
             let locked = LockedVault::load(path)?;
-            for name in locked.record_names() {
+            // v3 names are encrypted, so listing unlocks: the names shown are
+            // decrypted AND authenticated (unlock fails closed on tamper). No more
+            // "unauthenticated metadata" caveat — reading names now proves the key.
+            let vault = unlock_vault(locked, passphrase, recovery, recovery_code)?;
+            for name in vault.list() {
                 println!("{name}");
             }
-            // `list` reads names without the DEK, so the header MAC cannot be
-            // checked here: the names shown are unauthenticated until an unlock
-            // (get/unlock) verifies the MAC. Flag that on stderr so stdout stays
-            // pipe-clean but the trust boundary is never silently elided.
-            eprintln!(
-                "note: names are unauthenticated metadata read without unlocking; \
-                 tampering is detected only at unlock (get/unlock)"
-            );
         }
         Cmd::Gen { len, symbols } => {
             let (secret, charset_size) = vaultcore::passgen::generate_password(len, symbols);

@@ -130,6 +130,21 @@ the DEK is non-plaintext between ops (needs an interactive Windows session).
 
 ## Phase 3 — Metadata encryption (format v3)
 
+**Status: implemented (2026-07-18).** As-built: `FORMAT_VERSION=3`; per-record
+`name_ct`/`value_ct` under distinct HKDF subkeys (`record-name-v3`/`record-value-v3`),
+names + values padded to buckets (64 / 256 B), record count padded with tombstones
+to a multiple of 8 (min 8) and shuffled each save; header MAC now over the raw
+(encrypted) on-disk set. `LockedVault::record_names` removed (names encrypted → CLI
+`list` now unlocks; names are authenticated). No v2 read path (recreate-only, per
+project stance). "Values stay ciphertext in RAM until `get()`" preserved (only names
+decrypt at unlock). Verified empirically (name + value absent from the raw file;
+count padded) and by unit tests (65 vaultcore lib, +4; fuzz/proptest still total).
+Harness reworked: the "dump is real" sentinel is now the vault PATH (names no longer
+plaintext in a locked process) — code updated but the dump harness itself needs an
+interactive Windows session to execute (see TEST_PLAN).
+
+
+
 - Encrypt record **names** (currently authenticated plaintext) under a per-vault
   HKDF name-subkey, and **pad** names + record ciphertext to size buckets so a
   stolen file leaks neither what accounts exist nor their sizes; pad the record

@@ -71,6 +71,31 @@ the *unlocked* process still wins — stated plainly):
   **not** stop code executing inside the process (it can call `CryptUnprotectMemory`
   too) — the same ceiling, narrowed in time.
 
+### Metadata encryption — format v3 (hardening program, phase 3)
+
+Previously a stolen `.ztsv` leaked its record **names** (authenticated, but stored
+in plaintext), the exact size of every name and value, and the record count.
+Format v3 closes all three:
+
+- **Encrypted names.** Each record's name is encrypted under its own per-record
+  HKDF subkey (distinct from the value's), so the file no longer reveals what
+  accounts it holds. Listing names now requires unlocking — and the names shown are
+  therefore *authenticated*, eliminating the old "unauthenticated metadata" caveat.
+- **Padded sizes.** Names and values are padded to fixed size buckets before
+  encryption, so a record's on-disk length reveals only a coarse bucket, not the
+  real length.
+- **Padded count.** The record set is padded with indistinguishable *tombstone*
+  records up to a count bucket (minimum 8, so even an empty vault looks like 8
+  records), and real vs tombstone positions are shuffled on every save. The count
+  is revealed only to a coarse bucket. Tombstones are inside the authenticated
+  set and filtered out at unlock.
+
+The DEK envelope and AEAD/MAC constructions are unchanged; no new primitive. This
+is a breaking on-disk change — consistent with this project's "recreate to upgrade"
+stance, the build reads only v3 (one format, minimal parser surface), so a pre-v3
+vault must be recreated. Verified empirically: a distinctive record name and value
+do not appear anywhere in the raw file, and the on-disk record count is padded.
+
 ### New surfaces introduced by the GUI (slice 2)
 
 `vaultgui` inverts the CLI's stateless model on purpose: it is the long-lived
