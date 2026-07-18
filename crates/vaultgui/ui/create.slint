@@ -3,7 +3,7 @@
 // single `create_vault` callback carrying everything so no long-lived property
 // holds a secret. Scrollable so a tall form never clips on a short window.
 import { Theme } from "theme.slint";
-import { Seal, Card, Field, PrimaryButton, Checkbox, SectionLabel } from "widgets.slint";
+import { Dial, Card, Field, PrimaryButton, Checkbox, SectionLabel } from "widgets.slint";
 
 // One security-model choice card (two-factor vs --allow-no-tpm). `selected` and
 // `tradeoff-color` are caller-driven; the caller handles `clicked`.
@@ -17,10 +17,12 @@ component Choice inherits TouchArea {
     Rectangle {
         width: 100%;
         height: 100%;
-        background: root.selected ? Theme.accent-soft : Theme.bg-inset;
+        background: root.selected ? Theme.cyan-soft : Theme.bg-inset;
         border-radius: Theme.radius-panel;
         border-width: root.selected ? 1.5px : 1px;
-        border-color: root.selected ? Theme.accent : Theme.line;
+        border-color: root.selected ? Theme.cyan : Theme.line;
+        drop-shadow-blur: root.selected ? 10px : 0px;
+        drop-shadow-color: Theme.cyan-glow;
 
         HorizontalLayout {
             padding: Theme.space-4;
@@ -33,7 +35,7 @@ component Choice inherits TouchArea {
                 border-radius: self.width / 2;
                 background: transparent;
                 border-width: root.selected ? 6px : 1.5px;
-                border-color: root.selected ? Theme.accent : Theme.line;
+                border-color: root.selected ? Theme.cyan : Theme.line;
             }
 
             VerticalLayout {
@@ -89,7 +91,7 @@ export component CreateScreen inherits Rectangle {
 
                         HorizontalLayout {
                             spacing: Theme.space-3;
-                            Seal { size: 34px; engaged: false; }
+                            Dial { size: 34px; engaged: false; center-label: ""; }
                             Text {
                                 text: "Create a vault";
                                 color: Theme.text-primary;
@@ -109,14 +111,14 @@ export component CreateScreen inherits Rectangle {
                                 title: "Two-factor · TPM + passphrase";
                                 tradeoff: "Strongest: unlocking needs this machine's TPM and your passphrase.";
                                 selected: !root.allow-no-tpm;
-                                tradeoff-color: root.allow-no-tpm ? Theme.text-secondary : Theme.accent;
+                                tradeoff-color: root.allow-no-tpm ? Theme.text-secondary : Theme.cyan;
                                 clicked => { root.allow-no-tpm = false; }
                             }
                             Choice {
                                 title: "Passphrase only";
                                 tradeoff: "Hardware binding off — anyone with the file and passphrase can decrypt it on any machine.";
                                 selected: root.allow-no-tpm;
-                                tradeoff-color: Theme.caution;
+                                tradeoff-color: Theme.amber;
                                 clicked => { root.allow-no-tpm = true; }
                             }
                         }
@@ -131,7 +133,7 @@ export component CreateScreen inherits Rectangle {
                             }
                             if root.use-recovery: Text {
                                 text: "Survives TPM loss — but a stolen vault is then only as strong as the recovery passphrase.";
-                                color: Theme.caution;
+                                color: Theme.amber;
                                 font-family: Theme.font-ui;
                                 font-size: Theme.text-small;
                                 wrap: word-wrap;
