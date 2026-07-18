@@ -99,6 +99,20 @@ Slint display-residual caveat. No `verify/` change (no new secret residency).
 
 ## Phase 2 — Process & RAM hardening (Windows)
 
+**Status: implemented (2026-07-18).** As-built: `.cargo/config.toml` (CFG +
+`/CETCOMPAT`) and a hardened `[profile.release]` (overflow-checks, LTO, strip;
+panic stays unwind so drops zeroize) — verified in the PE image
+(`DllCharacteristics=0xC160`: GUARD_CF | DYNAMIC_BASE | HIGH_ENTROPY_VA | NX).
+`vaultcore::hardening::harden_process()` (extension-point-disable + image-load
+restrict + no-crash-UI), called from both binaries' `main`. `ProtectedDek`
+(secret.rs) keeps the DEK `CryptProtectMemory`-encrypted at rest inside `Vault`,
+revealed transiently per op; verified by the hardening round-trip test and the full
+vault suite (61 lib tests, +2). ACG / signature-only policies intentionally left
+off (GPU-driver DLL risk). Deferred: a `gui-idle-protected` dump scenario asserting
+the DEK is non-plaintext between ops (needs an interactive Windows session).
+
+
+
 - **Build mitigations:** add `.cargo/config.toml` RUSTFLAGS enabling Control Flow
   Guard (`/guard:cf`), CET shadow stack (`/CETCOMPAT`), high-entropy ASLR; add a
   release profile (`panic = "abort"`, `overflow-checks = true`, `lto`, `strip`).

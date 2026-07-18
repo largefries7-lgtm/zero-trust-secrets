@@ -170,6 +170,10 @@ enum Cmd {
 }
 
 fn main() -> ExitCode {
+    // Best-effort process hardening: Windows exploit-mitigation policies (block
+    // extension-point / remote / low-integrity DLL injection) and suppress the
+    // crash UI. No-op on other platforms. See vaultcore::hardening.
+    let _ = vaultcore::hardening::harden_process();
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {

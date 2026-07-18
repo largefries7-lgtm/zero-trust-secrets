@@ -41,6 +41,36 @@ add a dependency:
   escrow is still protected by 128 bits, not by whatever a human chose. The code
   wraps the DEK through the same envelope construction; no new cryptography.
 
+### Process & RAM hardening (hardening program, phase 2)
+
+Windows-specific measures that raise the bar against same-user attackers, all
+strictly below the userspace ceiling (a compromised kernel or code injected into
+the *unlocked* process still wins — stated plainly):
+
+- **Build-time exploit mitigations.** The shipped binaries are compiled with
+  Control Flow Guard (`-Ccontrol-flow-guard`) and marked CET-compatible
+  (`/CETCOMPAT`) for a hardware shadow stack; ASLR, high-entropy VA and DEP/NX are
+  MSVC defaults. Verified present in the release image (`DllCharacteristics`
+  includes `GUARD_CF | DYNAMIC_BASE | HIGH_ENTROPY_VA | NX_COMPAT`). The release
+  profile also enables `overflow-checks` (traps integer overflow in the untrusted-
+  header parser), LTO, and symbol stripping. Panic strategy stays **unwind** on
+  purpose, so `ZeroizeOnDrop` still scrubs secrets even on a panic.
+- **Runtime mitigation policies.** At startup both binaries call
+  `SetProcessMitigationPolicy` to disable extension points (legacy AppInit /
+  `SetWindowsHookEx` DLL injection) and to refuse loading DLLs from remote or
+  low-integrity locations, and `SetErrorMode` to suppress the crash UI. ACG
+  (dynamic-code prohibition) and signature-only image loading are deliberately
+  **not** enabled — they can break the GUI's third-party GPU-driver DLL loads; that
+  tradeoff is stated rather than risked silently.
+- **DEK encrypted at rest in RAM.** `vaultgui` holds the DEK for a whole unlocked
+  session — the GUI's headline new surface. The DEK is now kept
+  `CryptProtectMemory`-encrypted (`SAME_PROCESS`) between operations and decrypted
+  only transiently, for the microseconds of a single crypto op, into a page-locked
+  buffer that is zeroized immediately after. This shrinks the cold-boot / passive-
+  scrape window: between operations there is no plaintext DEK in memory. It does
+  **not** stop code executing inside the process (it can call `CryptUnprotectMemory`
+  too) — the same ceiling, narrowed in time.
+
 ### New surfaces introduced by the GUI (slice 2)
 
 `vaultgui` inverts the CLI's stateless model on purpose: it is the long-lived

@@ -97,6 +97,12 @@ fn do_lock(app: &App, state: &Rc<RefCell<AppState>>, full_names: &Rc<RefCell<Vec
 }
 
 fn main() -> Result<(), slint::PlatformError> {
+    // Best-effort process hardening, applied as early as possible: Windows
+    // exploit-mitigation policies (block extension-point / remote / low-integrity
+    // DLL injection into this long-lived, DEK-holding process) and suppress the
+    // crash UI. No-op on other platforms. See vaultcore::hardening.
+    let _ = vaultcore::hardening::harden_process();
+
     // Verification-harness-only entry point (see leaktest.rs). Checked FIRST,
     // before any normal UI is built, so the harness can drive this process
     // into a precise state without ever running the real event loop. Not

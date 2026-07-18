@@ -8,7 +8,7 @@
 //! wrong data.
 
 use crate::crypto::{self, Argon2Params, KEY_LEN};
-use crate::secret::{SecretBytes, SecretString};
+use crate::secret::{ProtectedDek, SecretBytes, SecretString};
 use crate::{Error, Result};
 use std::path::Path;
 
@@ -325,7 +325,9 @@ impl Record {
 
 enum State {
     Locked,
-    Unlocked(SecretBytes),
+    /// The DEK, held encrypted at rest in RAM (see `ProtectedDek`) and revealed
+    /// transiently only for the duration of a single crypto operation.
+    Unlocked(ProtectedDek),
 }
 
 /// A vault whose header and record framing are known but which has not been
@@ -372,7 +374,7 @@ impl LockedVault {
         Ok(Vault {
             header: self.header,
             records: self.records,
-            state: State::Unlocked(dek),
+            state: State::Unlocked(ProtectedDek::new(dek)),
             loaded_fingerprint: Some(self.fingerprint),
         })
     }
@@ -435,13 +437,16 @@ impl Vault {
         Vault {
             header,
             records: Vec::new(),
-            state: State::Unlocked(dek),
+            state: State::Unlocked(ProtectedDek::new(dek)),
             loaded_fingerprint: None,
         }
     }
-    fn dek(&self) -> Result<&SecretBytes> {
+    /// Reveal a transient plaintext copy of the DEK for one operation. Returns an
+    /// owned, page-locked `SecretBytes` that the caller drops (zeroized) as soon as
+    /// the operation completes, so the plaintext key exists in RAM only fleetingly.
+    fn dek(&self) -> Result<SecretBytes> {
         match &self.state {
-            State::Unlocked(d) => Ok(d),
+            State::Unlocked(d) => Ok(d.reveal()),
             State::Locked => Err(Error::Locked),
         }
     }
@@ -499,7 +504,7 @@ impl Vault {
         let mut idb = [0u8; 16];
         rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut idb);
         let id = u128::from_le_bytes(idb);
-        let rk = Self::record_key(dek, id);
+        let rk = Self::record_key(&dek, id);
         let ct = crypto::aead_seal(
             &rk,
             &Self::aad(id, self.header.format_version, name),
@@ -516,7 +521,7 @@ impl Vault {
             .iter()
             .find(|r| r.name == name)
             .ok_or_else(|| Error::NotFound(name.to_string()))?;
-        let rk = Self::record_key(dek, rec.id);
+        let rk = Self::record_key(&dek, rec.id);
         let pt = crypto::aead_open(
             &rk,
             &Self::aad(rec.id, self.header.format_version, &rec.name),
@@ -565,7 +570,7 @@ impl Vault {
         let dek = self.dek()?;
 
         let mut header = self.header.clone();
-        header.header_mac = header.compute_mac(dek, &self.records);
+        header.header_mac = header.compute_mac(&dek, &self.records);
         let header_bytes = header.to_bytes();
 
         let mut out = Vec::new();
