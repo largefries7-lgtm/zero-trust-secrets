@@ -32,6 +32,35 @@ const KEY_NAME: windows::core::PCWSTR = windows::core::w!("ZeroTrustSecretsDEKWr
 /// RSA-2048 wrapping key. RSA-OAEP(SHA-256) leaves ample room for a 32-byte DEK.
 const RSA_KEY_BITS: u32 = 2048;
 
+/// Validate a provider-reported output length against the buffer we actually
+/// allocated, before it is used as a slice bound.
+///
+/// The CNG two-call pattern is: ask for the required size (`needed`), allocate
+/// exactly that, then call again and receive `written`. Nothing in the API
+/// contract is enforced by the type system — `written` is a `u32` that comes
+/// back across an FFI boundary from a third-party TPM driver, and a
+/// malfunctioning or hostile one can report anything.
+///
+/// Using it unchecked as a slice bound (`&buf[..written as usize]`) is an
+/// out-of-bounds index and panics. That is not memory-unsafe — Rust bounds-checks
+/// it — but on the unseal path it is a remote-ish DoS reachable through a driver
+/// we do not control, and a panic inside a library embedding is worse still.
+///
+/// We fail closed rather than clamp: a provider that claims to have written more
+/// than its buffer held is malfunctioning, and silently truncating to a
+/// plausible-looking length would hand back a plaintext prefix as if it were
+/// correct. Bubbling an error lets the caller's existing fail-closed path run.
+fn checked_written(written: u32, capacity: usize, what: &str) -> Result<usize> {
+    let n = written as usize;
+    if n > capacity {
+        return Err(Error::Provider(format!(
+            "{what}: provider reported {n} bytes written into a {capacity}-byte buffer \
+             (malfunctioning TPM/CNG provider)"
+        )));
+    }
+    Ok(n)
+}
+
 /// TPM-backed key provider using the Windows CNG Platform Crypto Provider.
 pub struct CngPcpProvider {
     prov: NCRYPT_PROV_HANDLE,
@@ -238,7 +267,11 @@ impl KeyProvider for CngPcpProvider {
         }
         .map_err(|e| prov_err("NCryptEncrypt", &e))?;
 
-        out.truncate(written as usize);
+        // `Vec::truncate` happens to be benign for an over-large `written` (it is
+        // a no-op), but that would silently yield a `needed`-length blob the
+        // provider never filled. Validate explicitly instead.
+        let n = checked_written(written, out.len(), "NCryptEncrypt")?;
+        out.truncate(n);
         Ok(SealedBlob(out))
     }
 
@@ -283,7 +316,17 @@ impl KeyProvider for CngPcpProvider {
             return Err(prov_err("NCryptDecrypt", &e));
         }
 
-        let plaintext = SecretBytes::from_exact(&transient[..written as usize]);
+        // `written` is driver-reported and lands directly in a slice bound below.
+        // Scrub before bailing, exactly as the error path above does.
+        let n = match checked_written(written, transient.len(), "NCryptDecrypt") {
+            Ok(n) => n,
+            Err(e) => {
+                transient.zeroize();
+                return Err(e);
+            }
+        };
+
+        let plaintext = SecretBytes::from_exact(&transient[..n]);
         transient.zeroize(); // scrub the transient plaintext copy
         Ok(plaintext)
     }
@@ -311,6 +354,37 @@ impl Drop for CngPcpProvider {
 mod tests {
     use super::*;
     use crate::secret::SecretBytes;
+
+    // A real malfunctioning driver cannot be injected here (the NCrypt handles
+    // are opaque and the provider is chosen by the OS), so these pin the
+    // boundary check itself — the single place where a driver-reported length
+    // becomes a slice bound.
+
+    #[test]
+    fn checked_written_accepts_lengths_within_the_buffer() {
+        assert_eq!(checked_written(0, 256, "t").unwrap(), 0);
+        assert_eq!(checked_written(32, 256, "t").unwrap(), 32);
+        // Exactly filling the buffer is legal, not off-by-one.
+        assert_eq!(checked_written(256, 256, "t").unwrap(), 256);
+    }
+
+    #[test]
+    fn checked_written_rejects_overlong_report() {
+        // One past the end: the case that would have panicked at
+        // `&transient[..written as usize]`.
+        let e = checked_written(257, 256, "NCryptDecrypt").unwrap_err();
+        assert!(matches!(e, Error::Provider(_)), "must fail closed, got {e:?}");
+
+        // A wildly bogus value must also be an error, never a wrapping index.
+        assert!(checked_written(u32::MAX, 256, "NCryptDecrypt").is_err());
+    }
+
+    #[test]
+    fn checked_written_rejects_against_an_empty_buffer() {
+        // `needed == 0` allocates nothing; any claimed write is out of bounds.
+        assert_eq!(checked_written(0, 0, "t").unwrap(), 0);
+        assert!(checked_written(1, 0, "t").is_err());
+    }
 
     #[test]
     fn tpm_seal_unseal_roundtrip_if_available() {
