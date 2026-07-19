@@ -7,6 +7,12 @@ Cargo.lock.orig
 *.dmp
 verify/**/dumps/
 
+# Security-scan artifacts (large / regenerated; not source)
+/codeql-db*/
+codeql-results.sarif
+semgrep-results.json
+OWASP_ASVS_5.0.csv
+
 # Editor / OS
 .DS_Store
 Thumbs.db

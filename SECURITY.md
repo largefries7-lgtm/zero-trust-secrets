@@ -229,7 +229,77 @@ before; the GUI's footprint is larger because a real rendering stack is now in t
 tree. State this plainly rather than let the aggregate dependency count imply the
 crypto core grew — it didn't.
 
-## Reporting
+## Reporting a vulnerability
 
-This is a personal/reference project. If you are reviewing it and find a flaw,
-open an issue describing the impact and a reproduction.
+**Please report privately, not in a public issue.**
+
+### Primary channel: GitHub Private Vulnerability Reporting
+
+Open a private report here:
+
+> https://github.com/largefries7-lgtm/zero-trust-secrets/security/advisories/new
+
+This creates a private advisory visible only to you and the maintainers. It
+supports threaded discussion, private draft patches, and — once a fix is ready —
+coordinated publication. Nothing you write there is public until the advisory is
+published.
+
+If that link returns a 404, Private Vulnerability Reporting has not been enabled
+on the repository yet; see [`CONTRIBUTING.md`](CONTRIBUTING.md) for the enabling
+steps, and in the meantime email the address in the repository owner's GitHub
+profile rather than filing a public issue.
+
+### What to include
+
+- The impact, stated concretely: what an attacker gains, and what access they
+  need to start with. This project already concedes a broad class of attacker
+  (see **Threat model** above) — a report that assumes kernel compromise or an
+  attacker already executing inside the process is describing a documented
+  limitation, not a vulnerability.
+- A reproduction: exact steps, the build/commit, and your Windows version.
+  A failing test or a `.ztsv` fixture is ideal.
+- Whether you intend to publish, and on what timeline.
+
+### What happens next
+
+This is a personal project, not a funded product, so these are honest targets
+rather than a contractual SLA:
+
+| Stage | Target |
+|---|---|
+| Acknowledgement | 5 business days |
+| Initial assessment (valid / not / need more) | 14 days |
+| Fix or documented mitigation for a confirmed issue | 90 days, sooner when the severity warrants |
+
+If a report is going to take longer than that, you will be told why rather than
+left waiting.
+
+### CVE assignment
+
+**Confirmed vulnerabilities get a CVE.** GitHub is a CVE Numbering Authority,
+and this project requests a CVE through the GitHub Security Advisory once a
+report is validated — regardless of whether the reporter asks for one. The
+advisory is published together with the fix, crediting the reporter unless they
+ask otherwise.
+
+We do not silently patch security bugs. A vulnerability that is real enough to
+fix is real enough to disclose.
+
+### Scope
+
+**In scope** — anything that breaks a claim this document makes: recovering
+plaintext from a `.ztsv` without the passphrase, a parser flaw reachable from a
+hostile vault file, secrets surviving in memory where **Empirical verification**
+says they do not, the vault failing open instead of closed, or a supply-chain
+weakness in the release pipeline (see [`VERIFICATION.md`](VERIFICATION.md)).
+
+**Out of scope** — the limitations this document already concedes, principally:
+a compromised kernel, an attacker with code execution in the vault process, and
+the absence of PCR-policy binding (see **TPM PCR sealing — status**). These are
+documented ceilings, not bugs. If you believe one is understated, that argument
+is itself in scope and worth making.
+
+### Safe harbor
+
+Good-faith research against your own installation is welcome and will not draw a
+legal complaint. Do not test against other people's data or systems.

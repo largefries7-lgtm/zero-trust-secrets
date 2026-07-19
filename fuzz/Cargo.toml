@@ -1,0 +1,58 @@
+[package]
+name = "vaultcore-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+# Detached from the parent workspace on purpose: the fuzz crate needs nightly and
+# a libFuzzer-instrumented build, and `cargo build --workspace` on stable must not
+# try to compile it. `cargo fuzz` always runs from inside this directory.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+
+[dependencies.vaultcore]
+path = "../crates/vaultcore"
+# `fuzzing` exposes vault::fuzz_support (the legacy-v2 image builder). It is not a
+# default feature and nothing else in the workspace turns it on.
+features = ["fuzzing"]
+
+# Mirrors the shipped [profile.release] in the root Cargo.toml where it matters:
+#
+#   overflow-checks - the root profile enables these precisely so a hostile header
+#     traps instead of wrapping. Fuzzing without them would exercise a DIFFERENT
+#     binary than we ship and silently miss the overflow class entirely.
+#
+#   panic = "unwind" (the default, left unset deliberately) - do NOT set "abort".
+#     Unwinding is what runs the ZeroizeOnDrop destructors that scrub secrets on a
+#     panic path, which is this project's central claim. libfuzzer-sys installs a
+#     panic hook that reports and aborts, so panics are still caught as crashes.
+[profile.release]
+debug = true
+overflow-checks = true
+
+[[bin]]
+name = "vault_header_parse"
+path = "fuzz_targets/vault_header_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "locked_vault_load"
+path = "fuzz_targets/locked_vault_load.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "v2_to_v3_migration"
+path = "fuzz_targets/v2_to_v3_migration.rs"
+test = false
+doc = false
+bench = false

@@ -560,8 +560,21 @@ impl LockedVault {
     /// without authenticating or decrypting anything.
     pub fn load(path: &Path) -> Result<LockedVault> {
         let data = std::fs::read(path)?;
-        let fingerprint = file_fingerprint(&data);
-        let mut c = Cursor { d: &data, i: 0 };
+        Self::load_from_bytes(&data)
+    }
+
+    /// Parse a vault image already in memory. This is the real parser — [`load`]
+    /// is just `read` + this. Split out so the coverage-guided fuzzer can drive
+    /// the parser directly (see `fuzz/fuzz_targets/locked_vault_load.rs`) without
+    /// a filesystem round-trip per iteration.
+    ///
+    /// Parses untrusted input: it must return `Ok` or `Err` for ANY byte string
+    /// and never panic, over-read, or allocate from an unvalidated length.
+    ///
+    /// [`load`]: LockedVault::load
+    pub fn load_from_bytes(data: &[u8]) -> Result<LockedVault> {
+        let fingerprint = file_fingerprint(data);
+        let mut c = Cursor { d: data, i: 0 };
         let header_len = c.u32()? as usize;
         let header_bytes = c.take(header_len)?;
         let header = VaultHeader::from_bytes(header_bytes)?;
@@ -925,6 +938,275 @@ impl Vault {
         match path.parent() {
             Some(dir) => dir.join(&file_name),
             None => std::path::PathBuf::from(&file_name),
+        }
+    }
+}
+
+/// Kani proof harnesses for the codec's size arithmetic and bounds checks.
+///
+/// SCOPE — read before trusting these:
+///
+/// Kani verifies pure Rust. It has no semantics for `extern "system"` calls, so
+/// NOTHING here says anything about the CNG/TPM FFI in `keyprovider::cng_pcp` or
+/// the `CryptProtectMemory` calls in `hardening`. Kani also does not run on
+/// Windows, where that FFI is `#[cfg(windows)]`-gated — on the Linux host Kani
+/// requires, those modules compile to the no-op stubs. FFI soundness is covered
+/// by a different mechanism entirely (ASan + Application Verifier on the Windows
+/// CI job); see VERIFICATION.md.
+///
+/// What these harnesses DO establish, exhaustively over the stated input
+/// domains rather than for sampled values: the untrusted-input size arithmetic
+/// cannot overflow, and the decoders cannot panic or slice out of bounds.
+///
+/// Every property here is mirrored by a `kani_mirror_*` proptest in this
+/// module's `tests` submodule, which runs on stable everywhere. The proptests
+/// sample; these prove. Kani cannot run on Windows, so on a developer's machine
+/// the mirrors are the only executable check — if the two ever disagree, the
+/// proptest is the one telling the truth about the shipped binary.
+#[cfg(kani)]
+mod verification {
+    use super::*;
+
+    /// `padded_len` is the codec's core size computation, applied to lengths
+    /// derived from untrusted input. Proves it cannot overflow, and that its
+    /// three call-site invariants hold.
+    #[kani::proof]
+    fn padded_len_is_sound() {
+        let unpadded: usize = kani::any();
+        let bucket: usize = kani::any();
+
+        // Buckets are compile-time constants, all positive.
+        kani::assume(bucket > 0);
+        kani::assume(bucket == NAME_BUCKET || bucket == VALUE_BUCKET || bucket == COUNT_BUCKET);
+
+        // Sufficient precondition for the trailing `* bucket` not to overflow.
+        // Real call sites pass `5 + name.len()` or `4 + value.len()`, which are
+        // bounded by what the allocator handed out and so sit many orders of
+        // magnitude below this. The assumption is what makes the proof exact
+        // rather than vacuous.
+        kani::assume(unpadded <= usize::MAX - bucket);
+
+        let padded = padded_len(unpadded, bucket);
+
+        // 1. Never truncates: callers copy `unpadded` bytes into a `padded`
+        //    buffer, so `padded < unpadded` would be an out-of-bounds write.
+        assert!(padded >= unpadded);
+        // 2. Always a whole number of buckets (the padding's entire purpose:
+        //    on-disk length must reveal only a coarse bucket).
+        assert!(padded % bucket == 0);
+        // 3. The `.max(1)` floor: even a zero-length input occupies one bucket,
+        //    so an empty value is not distinguishable by its ciphertext length.
+        assert!(padded >= bucket);
+    }
+
+    /// `Cursor::take` is the single bounds-checked read primitive the whole
+    /// untrusted parser is built from. If it is sound, no parser path can
+    /// over-read. Proves the offset arithmetic cannot overflow and that a
+    /// successful read is always fully inside the buffer.
+    #[kani::proof]
+    #[kani::unwind(9)]
+    fn cursor_take_never_over_reads() {
+        let data: [u8; 8] = kani::any();
+        let start: usize = kani::any();
+        let n: usize = kani::any();
+
+        let mut c = Cursor { d: &data, i: start };
+        let before = c.i;
+
+        match c.take(n) {
+            Ok(s) => {
+                // Exactly `n` bytes, and the cursor advanced by exactly `n`.
+                assert!(s.len() == n);
+                assert!(c.i == before + n);
+                // Still inside the buffer: the invariant every caller relies on.
+                assert!(c.i <= c.d.len());
+            }
+            Err(_) => {
+                // A rejected read must not have moved the cursor, or a caller
+                // that recovers from an error would resume at a bogus offset.
+                assert!(c.i == before);
+            }
+        }
+    }
+
+    /// `decode_name_plaintext` runs on AEAD-decrypted, authenticated bytes — but
+    /// "authenticated" only means the DEK holder produced them, not that they
+    /// are well-formed. A corrupt length prefix must not drive a bad slice.
+    #[kani::proof]
+    #[kani::unwind(13)]
+    fn decode_name_plaintext_never_panics() {
+        let buf: [u8; 12] = kani::any();
+        if let Ok(Some(name)) = decode_name_plaintext(&buf) {
+            // The `MAX_NAME_LEN` ceiling is a real bound, not decoration.
+            assert!(name.len() <= MAX_NAME_LEN);
+            // A decoded name cannot exceed what the buffer physically held.
+            assert!(name.len() + 5 <= buf.len());
+        }
+    }
+
+    /// As above for the value decoder. Note this one has no `MAX` ceiling — its
+    /// only defense is the `4 + len > p.len()` check, so that check is load-bearing.
+    #[kani::proof]
+    #[kani::unwind(13)]
+    fn decode_value_plaintext_never_panics() {
+        let buf: [u8; 12] = kani::any();
+        if let Ok(v) = decode_value_plaintext(&buf) {
+            assert!(v.len() + 4 <= buf.len());
+        }
+    }
+}
+
+/// Builders that construct well-formed vault images for the coverage-guided
+/// fuzzer. Gated behind the non-default `fuzzing` feature so none of this — in
+/// particular the legacy-v2 *writer*, which production code deliberately does not
+/// have — can ever link into a shipped binary.
+///
+/// Why a builder rather than raw bytes: the v2 migration path sits behind a
+/// header MAC and then a per-record AEAD open. A byte-oriented fuzzer cannot
+/// forge either, so feeding it arbitrary v2 frames only ever exercises "MAC
+/// rejects garbage" — which the proptests already cover. Sealing fuzzer-chosen
+/// names/values under a known DEK puts arbitrary *semantic* content through the
+/// real migration logic, which is where the reachable bugs are.
+#[cfg(feature = "fuzzing")]
+pub mod fuzz_support {
+    use super::*;
+
+    /// A deterministic DEK. Fuzzing must be reproducible from a corpus input
+    /// alone, so this is fixed rather than random. It protects nothing.
+    pub fn fixed_dek() -> SecretBytes {
+        SecretBytes::from_exact(&[0x42u8; KEY_LEN])
+    }
+
+    /// Serialize a genuine, MAC-valid legacy-v2 vault image whose records carry
+    /// `records` as (name, value) pairs, each value sealed under the v2 scheme.
+    ///
+    /// The result is a complete file image: feed it to
+    /// [`LockedVault::load_from_bytes`] and then [`LockedVault::unlock_with_dek`]
+    /// with the same `dek` to drive the v2 -> v3 migration end to end.
+    pub fn build_v2_image(dek: &SecretBytes, records: &[(String, Vec<u8>)]) -> Vec<u8> {
+        let mut header = VaultHeader {
+            magic: MAGIC,
+            format_version: 2,
+            hardware_bound: false,
+            aead_id: 1,
+            kdf: Argon2Params {
+                mem_kib: Argon2Params::CAL_FLOOR_MEM_KIB,
+                time: Argon2Params::CAL_TIME,
+                parallelism: Argon2Params::CAL_PARALLELISM,
+                salt: [0u8; 16],
+            },
+            pcr_selection: Vec::new(),
+            tpm_wrap: None,
+            // Never unwrapped on this path: `unlock_with_dek` takes the DEK
+            // directly, so the envelope is irrelevant to what we are fuzzing.
+            dek_wrap: vec![0u8; 48],
+            recovery_wrap: None,
+            recovery_kdf: None,
+            header_mac: [0u8; 32],
+        };
+
+        let raws: Vec<RawRecordV2> = records
+            .iter()
+            .enumerate()
+            .map(|(i, (name, value))| {
+                // Ids must be distinct (they key the per-record subkey) but need
+                // not be random for fuzzing.
+                let id = i as u128 + 1;
+                let ct = crypto::aead_seal(&subkey(dek, b"record", id), &aad_v2(id, name), value)
+                    .expect("v2 seal over a fuzzer-supplied value");
+                RawRecordV2 { id, name: name.clone(), ct }
+            })
+            .collect();
+
+        header.header_mac = header.compute_mac_v2(dek, &raws);
+
+        let hb = header.to_bytes();
+        let mut f = Vec::new();
+        put_u32(&mut f, hb.len() as u32);
+        f.extend_from_slice(&hb);
+        put_u32(&mut f, raws.len() as u32);
+        for r in &raws {
+            f.extend_from_slice(&r.id.to_le_bytes());
+            put_bytes(&mut f, r.name.as_bytes());
+            put_bytes(&mut f, &r.ct);
+        }
+        f
+    }
+}
+
+/// Executable mirrors of the `verification` module's Kani proofs.
+///
+/// Kani does not run on Windows, which is this project's primary development
+/// and target platform, so on a developer's machine these are the ONLY check on
+/// the properties `verification` claims. They sample where Kani proves — but a
+/// sampled counterexample still falsifies a proof, and an unrunnable proof
+/// provides nothing at all. Keep the two in sync: a property added to
+/// `verification` without a mirror here is unverified on Windows.
+#[cfg(test)]
+mod kani_mirror {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn kani_mirror_padded_len_is_sound(
+            unpadded in 0usize..1_000_000,
+            bucket in prop::sample::select(vec![NAME_BUCKET, VALUE_BUCKET, COUNT_BUCKET]),
+        ) {
+            let padded = padded_len(unpadded, bucket);
+            prop_assert!(padded >= unpadded, "padding truncated: {padded} < {unpadded}");
+            prop_assert_eq!(padded % bucket, 0, "not a whole number of buckets");
+            prop_assert!(padded >= bucket, "the .max(1) floor was not applied");
+        }
+
+        #[test]
+        fn kani_mirror_cursor_take_never_over_reads(
+            data in proptest::collection::vec(any::<u8>(), 0..16),
+            start in 0usize..32,
+            n in 0usize..32,
+        ) {
+            let mut c = Cursor { d: &data, i: start };
+            let before = c.i;
+            match c.take(n) {
+                Ok(s) => {
+                    prop_assert_eq!(s.len(), n);
+                    prop_assert_eq!(c.i, before + n);
+                    prop_assert!(c.i <= c.d.len());
+                }
+                Err(_) => prop_assert_eq!(c.i, before, "a failed read moved the cursor"),
+            }
+        }
+
+        #[test]
+        fn kani_mirror_decode_name_plaintext_never_panics(
+            buf in proptest::collection::vec(any::<u8>(), 0..24),
+        ) {
+            if let Ok(Some(name)) = decode_name_plaintext(&buf) {
+                prop_assert!(name.len() <= MAX_NAME_LEN);
+                prop_assert!(name.len() + 5 <= buf.len());
+            }
+        }
+
+        #[test]
+        fn kani_mirror_decode_value_plaintext_never_panics(
+            buf in proptest::collection::vec(any::<u8>(), 0..24),
+        ) {
+            if let Ok(v) = decode_value_plaintext(&buf) {
+                prop_assert!(v.len() + 4 <= buf.len());
+            }
+        }
+    }
+
+    /// The extreme end of `padded_len`'s proven domain. The Kani harness assumes
+    /// `unpadded <= usize::MAX - bucket`; this pins the boundary itself, which
+    /// proptest's ranged strategies would never sample.
+    #[test]
+    fn padded_len_at_the_top_of_its_proven_domain() {
+        for bucket in [NAME_BUCKET, VALUE_BUCKET, COUNT_BUCKET] {
+            let unpadded = usize::MAX - bucket;
+            let padded = padded_len(unpadded, bucket);
+            assert!(padded >= unpadded);
+            assert_eq!(padded % bucket, 0);
         }
     }
 }
