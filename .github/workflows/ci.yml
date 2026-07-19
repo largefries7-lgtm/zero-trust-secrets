@@ -72,6 +72,9 @@ jobs:
     # manual procedures in VERIFICATION.md.
     steps:
       - uses: actions/checkout@v4
+      - name: Downgrade rust-version for Kani
+        run: sed -i 's/rust-version = "1.96"/rust-version = "1.93"/' Cargo.toml
+
       - name: Run Kani
         uses: model-checking/kani-github-action@v1
         with:
