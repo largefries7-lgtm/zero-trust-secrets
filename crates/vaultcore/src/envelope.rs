@@ -130,7 +130,7 @@ mod tests {
         // with the same key material, thanks to distinct AADs.
         let dek = SecretBytes::from_exact(&[6u8; 32]);
         let pass = SecretString::from_string("same".into());
-        let kdf = params(4);
+        let kdf = params(DEK_WRAP_AAD[0]);
         // Single-factor primary (no tpm) uses HKDF(pass_key); recovery uses
         // pass_key directly with a different AAD — cross-open must fail.
         let prim = wrap_dek(&dek, &pass, &kdf, None).unwrap();
