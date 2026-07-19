@@ -6,6 +6,13 @@ rust-version.workspace = true
 # Internal workspace crate only; never published to crates.io.
 publish = false
 
+[features]
+# Exposes `vault::fuzz_support`, which builds well-formed vault images (including
+# legacy-v2 ones, which production code can only READ) for the coverage-guided
+# fuzzer. Non-default and never enabled by vaultctl/vaultgui, so this cannot
+# reach a shipped binary. See fuzz/README.md.
+fuzzing = []
+
 [dependencies]
 zeroize.workspace = true
 chacha20poly1305.workspace = true

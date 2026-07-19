@@ -560,8 +560,21 @@ impl LockedVault {
     /// without authenticating or decrypting anything.
     pub fn load(path: &Path) -> Result<LockedVault> {
         let data = std::fs::read(path)?;
-        let fingerprint = file_fingerprint(&data);
-        let mut c = Cursor { d: &data, i: 0 };
+        Self::load_from_bytes(&data)
+    }
+
+    /// Parse a vault image already in memory. This is the real parser — [`load`]
+    /// is just `read` + this. Split out so the coverage-guided fuzzer can drive
+    /// the parser directly (see `fuzz/fuzz_targets/locked_vault_load.rs`) without
+    /// a filesystem round-trip per iteration.
+    ///
+    /// Parses untrusted input: it must return `Ok` or `Err` for ANY byte string
+    /// and never panic, over-read, or allocate from an unvalidated length.
+    ///
+    /// [`load`]: LockedVault::load
+    pub fn load_from_bytes(data: &[u8]) -> Result<LockedVault> {
+        let fingerprint = file_fingerprint(data);
+        let mut c = Cursor { d: data, i: 0 };
         let header_len = c.u32()? as usize;
         let header_bytes = c.take(header_len)?;
         let header = VaultHeader::from_bytes(header_bytes)?;
@@ -926,6 +939,84 @@ impl Vault {
             Some(dir) => dir.join(&file_name),
             None => std::path::PathBuf::from(&file_name),
         }
+    }
+}
+
+/// Builders that construct well-formed vault images for the coverage-guided
+/// fuzzer. Gated behind the non-default `fuzzing` feature so none of this — in
+/// particular the legacy-v2 *writer*, which production code deliberately does not
+/// have — can ever link into a shipped binary.
+///
+/// Why a builder rather than raw bytes: the v2 migration path sits behind a
+/// header MAC and then a per-record AEAD open. A byte-oriented fuzzer cannot
+/// forge either, so feeding it arbitrary v2 frames only ever exercises "MAC
+/// rejects garbage" — which the proptests already cover. Sealing fuzzer-chosen
+/// names/values under a known DEK puts arbitrary *semantic* content through the
+/// real migration logic, which is where the reachable bugs are.
+#[cfg(feature = "fuzzing")]
+pub mod fuzz_support {
+    use super::*;
+
+    /// A deterministic DEK. Fuzzing must be reproducible from a corpus input
+    /// alone, so this is fixed rather than random. It protects nothing.
+    pub fn fixed_dek() -> SecretBytes {
+        SecretBytes::from_exact(&[0x42u8; KEY_LEN])
+    }
+
+    /// Serialize a genuine, MAC-valid legacy-v2 vault image whose records carry
+    /// `records` as (name, value) pairs, each value sealed under the v2 scheme.
+    ///
+    /// The result is a complete file image: feed it to
+    /// [`LockedVault::load_from_bytes`] and then [`LockedVault::unlock_with_dek`]
+    /// with the same `dek` to drive the v2 -> v3 migration end to end.
+    pub fn build_v2_image(dek: &SecretBytes, records: &[(String, Vec<u8>)]) -> Vec<u8> {
+        let mut header = VaultHeader {
+            magic: MAGIC,
+            format_version: 2,
+            hardware_bound: false,
+            aead_id: 1,
+            kdf: Argon2Params {
+                mem_kib: Argon2Params::CAL_FLOOR_MEM_KIB,
+                time: Argon2Params::CAL_TIME,
+                parallelism: Argon2Params::CAL_PARALLELISM,
+                salt: [0u8; 16],
+            },
+            pcr_selection: Vec::new(),
+            tpm_wrap: None,
+            // Never unwrapped on this path: `unlock_with_dek` takes the DEK
+            // directly, so the envelope is irrelevant to what we are fuzzing.
+            dek_wrap: vec![0u8; 48],
+            recovery_wrap: None,
+            recovery_kdf: None,
+            header_mac: [0u8; 32],
+        };
+
+        let raws: Vec<RawRecordV2> = records
+            .iter()
+            .enumerate()
+            .map(|(i, (name, value))| {
+                // Ids must be distinct (they key the per-record subkey) but need
+                // not be random for fuzzing.
+                let id = i as u128 + 1;
+                let ct = crypto::aead_seal(&subkey(dek, b"record", id), &aad_v2(id, name), value)
+                    .expect("v2 seal over a fuzzer-supplied value");
+                RawRecordV2 { id, name: name.clone(), ct }
+            })
+            .collect();
+
+        header.header_mac = header.compute_mac_v2(dek, &raws);
+
+        let hb = header.to_bytes();
+        let mut f = Vec::new();
+        put_u32(&mut f, hb.len() as u32);
+        f.extend_from_slice(&hb);
+        put_u32(&mut f, raws.len() as u32);
+        for r in &raws {
+            f.extend_from_slice(&r.id.to_le_bytes());
+            put_bytes(&mut f, r.name.as_bytes());
+            put_bytes(&mut f, &r.ct);
+        }
+        f
     }
 }
 

@@ -38,6 +38,13 @@ jobs:
         run: cargo build -p vaultcore -p vaultctl -p dumper --locked
       - name: Test
         run: cargo test -p vaultcore -p vaultctl -p dumper --locked
+      # The `fuzzing` feature gates vault::fuzz_support (the legacy-v2 image
+      # builder the fuzz targets are built on). Its oracle test must run on
+      # stable too: if the builder ever stopped emitting a MAC-valid v2 image,
+      # every libFuzzer case would bail at the MAC and the fuzz job would still
+      # report "no crashes found" while exercising nothing.
+      - name: Test (fuzz-support oracle)
+        run: cargo test -p vaultcore --locked --features fuzzing --test fuzz_support_oracle
 
   test-windows:
     name: build & test (windows-latest, full workspace incl. vaultgui)
@@ -55,6 +62,57 @@ jobs:
       # is NOT run in CI — it stays a documented MANUAL step (see top of file).
       - name: Test
         run: cargo test --workspace --locked
+
+  fuzz:
+    name: "fuzz (libFuzzer, 60s per target)"
+    runs-on: ubuntu-latest
+    # Ubuntu, not Windows: cargo-fuzz needs nightly and does not support
+    # x86_64-pc-windows-msvc. No coverage is lost — every surface fuzzed here is
+    # platform-independent parser code; the #[cfg(windows)] FFI is unreachable
+    # from all three targets.
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust nightly (required by cargo-fuzz)
+        run: rustup toolchain install nightly --profile minimal
+      - name: Cache cargo-fuzz binary
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-fuzz
+          key: cargo-fuzz-${{ runner.os }}
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked || true
+      # Carry the corpus between runs so coverage compounds across PRs instead of
+      # each job restarting from zero. Without this, a 60s run barely gets past
+      # the magic-number check.
+      - name: Restore fuzz corpus
+        uses: actions/cache@v4
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}
+          restore-keys: fuzz-corpus-
+      # Compile all targets first so a build break is reported as a build break
+      # rather than as a fuzzing failure.
+      - name: Build fuzz targets
+        run: cargo +nightly fuzz build
+      # -rss_limit_mb is an assertion, not a guardrail: the parser's core DoS
+      # defense is that it never pre-allocates from an unvalidated length prefix,
+      # so a regression there surfaces as an RSS blowup.
+      # -timeout=10 catches hangs (unbounded parse loops).
+      - name: Fuzz vault_header_parse
+        run: cargo +nightly fuzz run vault_header_parse -- -max_total_time=60 -timeout=10 -rss_limit_mb=2048
+      - name: Fuzz locked_vault_load
+        run: cargo +nightly fuzz run locked_vault_load -- -max_total_time=60 -timeout=10 -rss_limit_mb=2048
+      - name: Fuzz v2_to_v3_migration
+        run: cargo +nightly fuzz run v2_to_v3_migration -- -max_total_time=60 -timeout=10 -rss_limit_mb=2048
+      # On a crash, upload the reproducer so it can be minimized locally with
+      # `cargo +nightly fuzz tmin <target> <artifact>`.
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
 
   supply-chain:
     name: cargo deny check (sole supply-chain gate)
