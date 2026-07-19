@@ -1,0 +1,148 @@
+name: Release
+
+# Builds the shipped Windows binaries, publishes them, and attaches two
+# INDEPENDENT pieces of evidence about them:
+#
+#   1. SLSA build provenance (slsa-github-generator) - a signed statement of
+#      WHICH source commit and WHICH workflow produced these exact bytes.
+#   2. A Sigstore/cosign signature over each binary - keyless, via GitHub OIDC,
+#      so no long-lived signing key exists anywhere to be stolen.
+#
+# They answer different questions and neither replaces the other: provenance
+# says "this came from that build"; the signature says "this artifact was
+# published by this repository's release workflow". VERIFICATION.md documents
+# how a downloader checks both, and is explicit about what they do NOT prove.
+
+on:
+  push:
+    tags: ["v*"]
+  # Allows a dry run against a branch without publishing anything: the build and
+  # hashing steps run, the publish/attest steps are skipped (see the `if:`s).
+  workflow_dispatch:
+
+# Least privilege by default; each job re-grants only what it needs.
+permissions: read-all
+
+jobs:
+  build:
+    name: build release binaries (windows)
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    outputs:
+      hashes: ${{ steps.hash.outputs.hashes }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable, pinned by rust-version)
+        run: rustup toolchain install stable --profile minimal
+
+      # --locked: build exactly the dependency versions in the committed
+      # Cargo.lock. Without it a release could silently pick up a different
+      # dependency tree than the one cargo-deny vetted on the same commit,
+      # which would make the provenance misleading.
+      - name: Build release binaries
+        run: cargo build --release --locked -p vaultctl -p vaultgui
+
+      # The subject list the SLSA generator will attest. It must be computed
+      # from the artifacts as built, in this job, before anything else can
+      # touch them.
+      - name: Compute artifact digests
+        id: hash
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd target/release
+          sha256sum vaultctl.exe vaultgui.exe > digests.txt
+          cat digests.txt
+          echo "hashes=$(base64 -w0 digests.txt)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries
+          path: |
+            target/release/vaultctl.exe
+            target/release/vaultgui.exe
+          if-no-files-found: error
+
+  release:
+    name: publish github release
+    needs: [build]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: binaries
+          path: dist
+      - name: Create release and attach binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "${GITHUB_REF_NAME}" \
+            --notes "See VERIFICATION.md for how to verify these binaries before running them." \
+            dist/vaultctl.exe dist/vaultgui.exe
+
+  provenance:
+    name: slsa build provenance
+    needs: [build, release]
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      # Required by the generator; documented at
+      # https://github.com/slsa-framework/slsa-github-generator
+      actions: read      # read the workflow run metadata it attests to
+      id-token: write    # mint the OIDC token that signs the provenance
+      contents: write    # attach the .intoto.jsonl to the release
+    # Pinned to a release tag rather than a branch: this workflow signs on our
+    # behalf, so an unpinned reference would let an upstream change alter what
+    # gets attested.
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
+    with:
+      base64-subjects: "${{ needs.build.outputs.hashes }}"
+      upload-assets: true
+
+  sign:
+    name: sigstore signatures (keyless, github oidc)
+    needs: [build, release]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # OIDC identity cosign binds the signature to
+      contents: write   # attach the .bundle files to the release
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: binaries
+          path: dist
+
+      - uses: sigstore/cosign-installer@v4.1.2
+
+      # Keyless: cosign exchanges the workflow's OIDC token for a short-lived
+      # (~10 min) certificate from Fulcio and records the signature in the
+      # Rekor transparency log. There is no private key to store, rotate, or
+      # leak - the tradeoff being that verification requires trusting the
+      # Sigstore public-good instance. VERIFICATION.md states this plainly.
+      #
+      # --bundle packages signature + certificate + Rekor inclusion proof into
+      # one file, so verification needs no network round-trip to Rekor.
+      - name: Sign binaries
+        run: |
+          set -euo pipefail
+          for f in dist/vaultctl.exe dist/vaultgui.exe; do
+            cosign sign-blob --yes \
+              --bundle "${f}.bundle" \
+              "${f}"
+          done
+
+      - name: Attach signature bundles to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            dist/vaultctl.exe.bundle dist/vaultgui.exe.bundle
