@@ -6,6 +6,12 @@ rust-version.workspace = true
 # Internal workspace crate only; never published to crates.io.
 publish = false
 
+# `cfg(kani)` is set by the Kani model checker, not by cargo, so rustc does not
+# know it on an ordinary build. Declare it rather than letting every build emit
+# an unexpected-cfg warning.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+
 [features]
 # Exposes `vault::fuzz_support`, which builds well-formed vault images (including
 # legacy-v2 ones, which production code can only READ) for the coverage-guided

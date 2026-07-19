@@ -177,6 +177,84 @@ impl fmt::Debug for ProtectedDek {
     }
 }
 
+/// Kani proof for the `ProtectedDek` block-padding arithmetic.
+///
+/// Same scope caveat as `vault::verification`: Kani sees pure Rust only. On the
+/// Linux host it requires, `hardening::protect_in_place` and `memlock::lock`
+/// are the non-Windows no-op stubs, so this proves the padding *arithmetic*,
+/// not the `CryptProtectMemory` FFI that consumes it.
+#[cfg(kani)]
+mod verification {
+    use super::*;
+
+    /// `ProtectedDek::new` computes `padded` and then does
+    /// `blob.expose_mut()[..len].copy_from_slice(...)`. That index panics unless
+    /// `padded >= len`, so the padding arithmetic is a memory-safety
+    /// precondition, not just a formatting detail.
+    #[kani::proof]
+    fn protected_dek_padding_covers_the_key() {
+        let len: usize = kani::any();
+        let block: usize = crate::hardening::BLOCK;
+
+        // Sufficient precondition for `* block` not to overflow. Real keys are
+        // 32 bytes; the bound exists to make the proof exact.
+        kani::assume(len <= usize::MAX - block);
+
+        let padded = len.div_ceil(block).max(1) * block;
+
+        // The precondition for the `[..len]` copy in `ProtectedDek::new`.
+        assert!(padded >= len);
+        // CryptProtectMemory rejects any length that is not a whole number of
+        // blocks, so a violation here would silently disable memory encryption.
+        assert!(padded % block == 0);
+        // A zero-length key still occupies one block rather than an empty buffer.
+        assert!(padded >= block);
+    }
+}
+
+/// Executable mirror of `verification::protected_dek_padding_covers_the_key`.
+/// See the note on `vault::kani_mirror`: Kani cannot run on Windows, so this is
+/// the only executable check of that property on the primary dev platform.
+#[cfg(test)]
+mod kani_mirror {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn padding_for(len: usize) -> usize {
+        let block = crate::hardening::BLOCK;
+        len.div_ceil(block).max(1) * block
+    }
+
+    proptest! {
+        #[test]
+        fn kani_mirror_protected_dek_padding_covers_the_key(len in 0usize..100_000) {
+            let block = crate::hardening::BLOCK;
+            let padded = padding_for(len);
+            prop_assert!(padded >= len, "the [..len] copy in ProtectedDek::new would panic");
+            prop_assert_eq!(padded % block, 0, "CryptProtectMemory would reject this length");
+            prop_assert!(padded >= block);
+        }
+    }
+
+    #[test]
+    fn padding_at_the_top_of_its_proven_domain() {
+        let block = crate::hardening::BLOCK;
+        let padded = padding_for(usize::MAX - block);
+        assert!(padded >= usize::MAX - block);
+        assert_eq!(padded % block, 0);
+    }
+
+    /// The real case: a 32-byte DEK must round up to exactly two 16-byte blocks,
+    /// with no wasted block and no shortfall.
+    #[test]
+    fn real_dek_length_pads_exactly() {
+        assert_eq!(padding_for(32), 32);
+        assert_eq!(padding_for(0), 16);
+        assert_eq!(padding_for(1), 16);
+        assert_eq!(padding_for(17), 32);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

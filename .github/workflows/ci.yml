@@ -63,6 +63,38 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked
 
+  formal-verification:
+    name: "kani (proofs: codec size arithmetic)"
+    runs-on: ubuntu-latest
+    # Ubuntu because Kani does not support Windows at all. Note the consequence:
+    # on this host every #[cfg(windows)] block compiles to its non-Windows stub,
+    # so these proofs cover the platform-independent arithmetic ONLY and say
+    # nothing about the CNG/TPM FFI. Kani cannot model extern calls in any case.
+    # FFI is covered by the manual procedures in VERIFICATION.md.
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (stable)
+        run: rustup toolchain install stable --profile minimal
+      - name: Cache Kani toolchain
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-kani
+            ~/.cargo/bin/kani
+            ~/.kani
+          key: kani-${{ runner.os }}-v1
+      # `kani setup` fetches CBMC and the model checker backend; it is a no-op
+      # when restored from cache.
+      - name: Install Kani
+        run: |
+          cargo install --locked kani-verifier
+          cargo kani setup
+      # Runs every #[kani::proof] in vaultcore. Each proof is mirrored by a
+      # proptest in the same module that runs on stable — if a mirror passes
+      # while the proof fails, trust the proof: it covers the whole domain.
+      - name: Run proof harnesses
+        run: cargo kani -p vaultcore
+
   fuzz:
     name: "fuzz (libFuzzer, 60s per target)"
     runs-on: ubuntu-latest
