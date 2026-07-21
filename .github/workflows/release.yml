@@ -74,6 +74,17 @@ jobs:
     permissions:
       contents: write
     steps:
+      # The license files ship WITH the release assets, not just in the repo:
+      # OSPS-LE-03.02 requires the license to accompany the released artifacts,
+      # and a downloader who only ever fetches the .exe files would otherwise
+      # never see the terms they are bound by.
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            LICENSE
+            LICENSE-APACHE
+            LICENSE-MIT
+          sparse-checkout-cone-mode: false
       - uses: actions/download-artifact@v4
         with:
           name: binaries
@@ -86,7 +97,8 @@ jobs:
             --repo "${GITHUB_REPOSITORY}" \
             --title "${GITHUB_REF_NAME}" \
             --notes "See VERIFICATION.md for how to verify these binaries before running them." \
-            dist/vaultctl.exe dist/vaultgui.exe
+            dist/vaultctl.exe dist/vaultgui.exe \
+            LICENSE LICENSE-APACHE LICENSE-MIT
 
   provenance:
     name: slsa build provenance

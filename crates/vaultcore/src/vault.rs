@@ -1046,12 +1046,36 @@ mod verification {
 
     /// As above for the value decoder. Note this one has no `MAX` ceiling — its
     /// only defense is the `4 + len > p.len()` check, so that check is load-bearing.
+    ///
+    /// WHY THE `mem::forget`: this is the only harness whose return value is a
+    /// `SecretBytes`, i.e. a `ZeroizeOnDrop` type. Dropping it runs
+    /// `zeroize::optimization_barrier`, which is `core::arch::asm!` — and Kani
+    /// cannot model inline assembly at all:
+    ///
+    ///   Check: zeroize::optimization_barrier::<[MaybeUninit<u8>]>.unsupported_construct
+    ///   "TerminatorKind::InlineAsm is not currently supported by Kani"
+    ///
+    /// That is a tool limitation, not a defect in the decoder — the four
+    /// harnesses that construct no zeroizing type all verify cleanly. Leaking
+    /// the buffer keeps the barrier unreachable so the proof covers what it is
+    /// actually about: the bounds arithmetic.
+    ///
+    /// The cost, stated so nobody reads more into this proof than it carries:
+    /// the `Drop`/zeroization path is NOT verified here, and cannot be by Kani.
+    /// Zeroization is evidenced empirically instead, by `verify/run.sh` dumping
+    /// a live process — see SECURITY.md, *Empirical verification*. Leaking in a
+    /// proof harness has no bearing on the shipped binary; the harness is
+    /// `#[cfg(kani)]` and never compiles into it.
     #[kani::proof]
     #[kani::unwind(13)]
     fn decode_value_plaintext_never_panics() {
         let buf: [u8; 12] = kani::any();
         if let Ok(v) = decode_value_plaintext(&buf) {
+            // The property under proof: a successful decode never reports more
+            // bytes than the input physically held, so the `&p[4..4 + len]`
+            // slice inside the decoder cannot be out of bounds.
             assert!(v.len() + 4 <= buf.len());
+            core::mem::forget(v);
         }
     }
 }

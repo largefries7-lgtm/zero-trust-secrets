@@ -3,6 +3,7 @@ name = "vaultctl"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 # Internal workspace crate only; never published to crates.io.
 publish = false
 

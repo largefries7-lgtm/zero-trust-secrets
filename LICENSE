@@ -1,0 +1,20 @@
+zero-trust-secrets is dual-licensed under either of
+
+  * Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE), or
+    http://www.apache.org/licenses/LICENSE-2.0)
+  * MIT license ([LICENSE-MIT](LICENSE-MIT), or
+    http://opensource.org/licenses/MIT)
+
+at your option.
+
+This is the convention used across the Rust ecosystem: Apache-2.0 supplies an
+explicit patent grant, MIT is maximally permissive, and downstream users may
+comply with whichever suits them.
+
+## Contribution
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in this work by you, as defined in the Apache-2.0 license, shall
+be dual-licensed as above, without any additional terms or conditions.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md).

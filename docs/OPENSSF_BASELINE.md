@@ -16,38 +16,40 @@ Best Practices Badge criterion. This document covers the Baseline only.
 
 | Status | Count |
 |---|---|
-| Met | 17 |
-| **Not met — blocking** | **6** |
+| Met | 21 |
+| **Not met — blocking** | **2** |
 | Not applicable | 1 |
 | Retired upstream | 1 |
 
-Six requirements fail, and they cluster into exactly two fixes: adding a
-license, and protecting the primary branch.
+Two requirements fail, and both are fixed by the same action: protecting the
+primary branch.
+
+---
+
+## Resolved
+
+### Licensing — OSPS-LE-02.01, LE-02.02, LE-03.01, LE-03.02 — **now met**
+
+The project is dual-licensed `MIT OR Apache-2.0`, the Rust ecosystem
+convention: Apache-2.0 supplies an explicit patent grant, MIT is maximally
+permissive, and downstream users comply with whichever suits them.
+
+- `LICENSE` — states the dual arrangement and the contribution terms
+- `LICENSE-APACHE`, `LICENSE-MIT` — full texts
+- `license = "MIT OR Apache-2.0"` in `[workspace.package]`, inherited by all
+  four crates via `license.workspace = true`
+
+This was the top-priority item in the previous revision of this document, and
+not only for the Baseline: without a license the code was all-rights-reserved by
+default, which a third-party auditor (OSTIF, Cure53) would have raised before
+starting work, since reviewing and quoting source requires a license permitting
+it. That blocker is cleared.
 
 ---
 
 ## Blocking gaps
 
-### 1. No license — fails OSPS-LE-02.01, LE-02.02, LE-03.01, LE-03.02
-
-There is no `LICENSE` file, and no `license` field in any `Cargo.toml`. GitHub
-reports `licenseInfo: null` for the repository.
-
-This is four of the six failures, and it is the single highest-priority item in
-this document — well beyond the Baseline. Without a license the code is "all
-rights reserved" by default: nobody may legally use, modify, or redistribute it,
-and **a third-party security auditor (OSTIF, Cure53) will raise this before they
-begin**, because reviewing and quoting the source requires a license that
-permits it.
-
-**Fix:** choose a license, add `LICENSE` at the repository root, and set
-`license = "..."` in each published crate manifest. The Rust ecosystem
-convention is `MIT OR Apache-2.0`; Apache-2.0 alone is common for security
-tooling because it carries an explicit patent grant.
-
-This is a decision for the repository owner, not a mechanical fix.
-
-### 2. `master` is unprotected — fails OSPS-AC-03.01, OSPS-AC-03.02
+### `master` is unprotected — fails OSPS-AC-03.01, OSPS-AC-03.02
 
 `GET /repos/.../branches/master/protection` returns `404 Branch not protected`.
 Direct commits to `master` are possible, and nothing marks branch deletion as
@@ -72,8 +74,8 @@ second person approve, which would deadlock a single-maintainer project.
 |---|---|---|
 | OSPS-AC-01.01 | MFA required for sensitive actions in the authoritative repo | **Unverified** — cannot be checked via API; confirm at [account security settings](https://github.com/settings/security). Enable it if it is not on. |
 | OSPS-AC-02.01 | New collaborators get lowest privilege by default | Met — GitHub default; no collaborators are configured |
-| OSPS-AC-03.01 | Enforcement prevents direct commits to the primary branch | **NOT MET** — see blocking gap 2 |
-| OSPS-AC-03.02 | Primary-branch deletion requires explicit confirmation | **NOT MET** — see blocking gap 2 |
+| OSPS-AC-03.01 | Enforcement prevents direct commits to the primary branch | **NOT MET** — see blocking gap |
+| OSPS-AC-03.02 | Primary-branch deletion requires explicit confirmation | **NOT MET** — see blocking gap |
 
 ### Build and Release
 
@@ -104,10 +106,10 @@ second person approve, which would deadlock a single-maintainer project.
 
 | ID | Requirement | Status |
 |---|---|---|
-| OSPS-LE-02.01 | Source code license meets the OSI/FSF definition | **NOT MET** — see blocking gap 1 |
-| OSPS-LE-02.02 | Released asset license meets the OSI/FSF definition | **NOT MET** — see blocking gap 1 |
-| OSPS-LE-03.01 | License maintained in `LICENSE`/`COPYING`/`LICENSES/` | **NOT MET** — see blocking gap 1 |
-| OSPS-LE-03.02 | License included alongside release assets | **NOT MET** — see blocking gap 1 |
+| OSPS-LE-02.01 | Source code license meets the OSI/FSF definition | Met — `MIT OR Apache-2.0`, both OSI-approved |
+| OSPS-LE-02.02 | Released asset license meets the OSI/FSF definition | Met — same dual license covers the release binaries |
+| OSPS-LE-03.01 | License maintained in `LICENSE`/`COPYING`/`LICENSES/` | Met — `LICENSE`, `LICENSE-APACHE`, `LICENSE-MIT` at the repo root |
+| OSPS-LE-03.02 | License included alongside release assets | Met — `release.yml` attaches `LICENSE`, `LICENSE-APACHE`, `LICENSE-MIT` to every release |
 
 ### Quality
 
@@ -132,18 +134,15 @@ second person approve, which would deadlock a single-maintainer project.
 
 Ordered by what actually blocks progress.
 
-1. **Choose and add a license.** Blocks four Baseline controls and, more
-   importantly, blocks third-party audit engagement.
-2. **Protect `master`.** Blocks two Baseline controls and weakens the SLSA
-   provenance claim. Steps in `CONTRIBUTING.md`.
-3. **Confirm MFA is enabled** on the owner account (AC-01.01). Not
+1. **Protect `master`.** The only remaining Baseline failure, and it also
+   weakens the SLSA provenance claim. Steps in `CONTRIBUTING.md`.
+2. **Confirm MFA is enabled** on the owner account (AC-01.01). Not
    API-verifiable; check manually.
-4. **Enable Private Vulnerability Reporting.** Not itself a Level 1 control, but
+3. **Enable Private Vulnerability Reporting.** Not itself a Level 1 control, but
    `SECURITY.md` now directs researchers to a URL that 404s until it is on.
    Steps in `CONTRIBUTING.md`.
-
-Items 1 and 2 are owner decisions or owner-only settings; nothing in the
-codebase blocks them.
+All three remaining items are owner-only settings; nothing in the codebase
+blocks them.
 
 ## Beyond Level 1
 
