@@ -143,6 +143,17 @@ would only verify the stubs. Kani also does not run on Windows, so on the Linux
 host it requires, every `#[cfg(windows)]` block compiles to its non-Windows
 no-op stub. Any claim that "the FFI is formally verified" would be false.
 
+They also say **nothing about zeroization**. `zeroize`'s optimization barrier is
+`core::arch::asm!`, and Kani cannot model inline assembly — any proof that drops
+a `ZeroizeOnDrop` value fails with
+`TerminatorKind::InlineAsm is not currently supported`. The one harness that
+returns a `SecretBytes` therefore leaks it deliberately (`mem::forget`) so the
+barrier stays unreachable and the proof covers the bounds arithmetic it is
+actually about. Zeroization is evidenced empirically instead — `verify/run.sh`
+dumps a live process and looks for surviving plaintext (see `SECURITY.md`,
+*Empirical verification*). Formal proof and memory-dump evidence cover different
+halves of this problem, and neither substitutes for the other.
+
 Because Kani cannot run on this project's primary development platform, each
 proof is mirrored by a `kani_mirror_*` proptest that runs on stable everywhere
 (`cargo test -p vaultcore kani_mirror`). The mirrors sample; the proofs are

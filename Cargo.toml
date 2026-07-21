@@ -6,6 +6,9 @@ default-members = ["crates/vaultcore", "crates/vaultctl", "verify/dumper"]
 [workspace.package]
 edition = "2021"
 rust-version = "1.96"
+# Dual-licensed per the Rust ecosystem convention; see LICENSE. Declared here so
+# every crate inherits it and `cargo deny check licenses` can see it.
+license = "MIT OR Apache-2.0"
 
 # Release-build hardening (hardening program, phase 2).
 #
